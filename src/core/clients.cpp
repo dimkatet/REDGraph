@@ -22,7 +22,8 @@ constexpr uint32_t kMaxEntries = 1024;
 
 const char* const kKindName[kKinds] = {
     "patch", "patch scope", "companion", "companion scope", "lease", "cbuffer", "cbuffer feed", "view", "RT library",
-    "RT variant", "pass", "subscription", "device_ready", "flow", "node", "node use", "node alloc", "wrap", "remove", "patch state"};
+    "RT variant", "pass", "subscription", "device_ready", "flow", "node", "node use", "node alloc", "wrap", "remove", "patch state", "wrap use", "draw subscription", "draw companion",
+    "draw companion scope"};
 
 struct Client {
   HMODULE module;
@@ -133,6 +134,8 @@ Space space_of(Kind k) {
     case kNode: return sNode;
     case kWrap: return sWrap;
     case kRemove: return sRemove;
+    case kDrawSubscribe: return sDrawSubscribe;
+    case kDrawCompanion: return sDrawCompanion;
     default: return kSpaces;
   }
 }
@@ -166,7 +169,7 @@ const char* error_name(int32_t r) {
 // Registrations that return a handle (> 0); the others (scope, feed, use, device_ready, state) return 0 / an index on success.
 bool returns_handle(Kind k) {
   return k != kPatchScope && k != kCompanionScope && k != kFeed && k != kNodeUse && k != kDeviceReady &&
-         k != kPatchState;
+         k != kPatchState && k != kWrapUse && k != kDrawCompanionScope;
 }
 
 bool failed(const Entry& e) { return e.result < 0; }
@@ -209,6 +212,15 @@ void live(const Entry& e, std::string* state, std::string* counters) {
                     static_cast<unsigned long long>(s.not_staged), s.ready ? "" : ", NOT READY");
       break;
     }
+    case kDrawCompanion: {
+      rg_patch_stats s{};
+      pso::draw_companion_stats(h, &s);
+      *state = state_name(s.state);
+      std::snprintf(b, sizeof b, "engine PSOs %u, draws %llu, out of scope %llu%s", s.engine_psos,
+                    static_cast<unsigned long long>(s.swaps), static_cast<unsigned long long>(s.out_of_scope),
+                    s.clone_failed ? ", builds FAILED" : "");
+      break;
+    }
     case kRtLib: {
       rg_rtlib_stats s{};
       rtlib::stats(h, &s);
@@ -235,8 +247,15 @@ void live(const Entry& e, std::string* state, std::string* counters) {
     case kWrap: {
       rg_wrap_stats s{};
       render_nodes::node_wrap_stats(h, &s);
-      std::snprintf(b, sizeof b, "%s, runs %llu", s.wrapped ? "wrapped" : "target not seen yet",
-                    static_cast<unsigned long long>(s.executes));
+      uint32_t uses = 0, group = 0;
+      uint64_t requests = 0;
+      render_nodes::node_wrap_uses(h, &uses, &requests, &group);
+      char d[96] = "";
+      if (uses)
+        std::snprintf(d, sizeof d, group ? ", %u declaration(s) NOT issued (a group)" : ", %u declaration(s), requests %llu",
+                      uses, static_cast<unsigned long long>(requests));
+      std::snprintf(b, sizeof b, "%s, runs %llu%s", s.wrapped ? "wrapped" : "target not seen yet",
+                    static_cast<unsigned long long>(s.executes), d);
       break;
     }
     case kRemove: {
@@ -263,6 +282,7 @@ void live(const Entry& e, std::string* state, std::string* counters) {
 // Targets several clients share: only what can collide (one engine shader / raygen / node, one register).
 bool collides(Kind k) {
   return k == kPatch || k == kCompanion || k == kRtLib || k == kRtVariant || k == kSubscribe || k == kWrap ||
+         k == kDrawSubscribe || k == kDrawCompanion ||
          k == kRemove || k == kNode || k == kLease;
 }
 
@@ -270,7 +290,7 @@ bool collides(Kind k) {
 const char* family(Kind k) {
   switch (k) {
     case kWrap: case kRemove: case kNode: return "node";
-    case kPatch: case kCompanion: case kSubscribe: return "shader";
+    case kPatch: case kCompanion: case kSubscribe: case kDrawSubscribe: case kDrawCompanion: return "shader";
     case kRtLib: case kRtVariant: return "RT";
     default: return kKindName[k];
   }
@@ -330,7 +350,7 @@ int32_t owner_check(const void* ret, Space s, rg_handle h, const char* call) {
   static const Range self = image_of(self_module());
   static const char* const kSpaceName[kSpaces] = {"patch", "companion", "cbuffer", "lease", "view", "RT library",
                                                    "RT variant", "pass", "subscription", "flow", "node", "wrap",
-                                                   "remove"};
+                                                   "remove", "draw subscription", "draw companion"};
   const uint8_t owner = s < kSpaces && h > 0 && static_cast<uint32_t>(h) <= kMaxHandle
                             ? g_owner[s][h].load(std::memory_order_acquire)
                             : 0;

@@ -11,6 +11,9 @@
 - A patch can also change how the game draws with a shader (culling, wireframe, depth test, blending, write masks,
   target formats), with or without replacing the shader itself.
 - The log lists which registers of the game's tables a lease can use, per shader stage.
+- A wrap of a game node can declare a texture it needs (`node_wrap_use`), so the game keeps it alive through that node.
+- Mods can react to the game's draws, not only its compute dispatches: run code right after a draw of a given shader,
+  draw the same thing again with another shader or pipeline state, or record their own work after it.
 
 ## 0.1.1
 

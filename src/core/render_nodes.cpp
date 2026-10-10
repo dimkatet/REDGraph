@@ -23,6 +23,8 @@
 // swapped (VirtualProtect, one aligned pointer store - a thread mid-call keeps the original) for wrap_execute: the
 // client's before, the original, the client's after - real run only. Every command-list group shares ONE vtable: a
 // vtable whose original is the group Execute is `shared` and wraps are matched by GetName per call.
+// A wrap's RenderFlow declarations (node_wrap_use, 2026-10-10) are M7's for an engine node: an RTUseBegin per
+// resource before the befores, an RTUseEnd after the afters, in both runs - class vtables only (wrap_declare).
 //
 // M9, a REMOVAL rides the same vtable slot: in the declaration run the original runs (it only declares) while the host
 // records its RenderFlow requests (render_flow's HandleRequest detour, this thread); in the real run the host replays
@@ -96,7 +98,7 @@ Node g_n[kMaxNodes];
 std::atomic<uint32_t> g_nn{0};
 std::once_flag g_names_once;
 
-constexpr uint32_t kMaxWraps = 8;
+constexpr uint32_t kMaxWraps = 32;  // wraps + removals, every client (the self-tests alone take ~10)
 struct Wrap {
   const char* name;
   uint64_t target;  // CName hash of the class / group name
@@ -105,6 +107,9 @@ struct Wrap {
   std::atomic<int32_t> vt{-1};  // index into g_vt once wrapped
   std::atomic<uint64_t> executes{0}, declares{0}, no_cmdlist{0}, restores{0}, jobs{0}, rebinds{0};
   int32_t rm = -1;  // a removal: index into g_rm
+  Use uses[kMaxUses];  // node_wrap_use: RTUseBegin / RTUseEnd around the node, both runs (never allocs)
+  uint32_t nuses = 0;  // fixed once registration closes
+  std::atomic<uint64_t> requests{0};
 };
 Wrap g_w[kMaxWraps];
 
@@ -310,6 +315,22 @@ bool wrap_matches(const Wrap& w, int32_t vt_index, bool shared, uint64_t name) {
   return w.vt.load(std::memory_order_acquire) == vt_index && (!shared || w.target == name);
 }
 
+// node_wrap_use: the declarations of every wrap on this class, in registration order - RTUseBegin before the befores
+// and the node's own work, RTUseEnd after the afters. Issued in BOTH runs, unconditionally (as declare_begin / _end:
+// phase 2 matches requests by their index on the flow thread). Never on a group's vtable (shared): a group's Execute
+// leaves no list bound and its members' requests are issued from other threads / jobs - the flag is fixed per vtable,
+// so both runs agree.
+void wrap_declare(uint32_t nw, int32_t vi, const uint8_t* ctx, bool begin) {
+  for (uint32_t i = 0; i < nw; ++i) {
+    Wrap& w = g_w[i];
+    if (!w.nuses || !wrap_matches(w, vi, false, 0)) continue;
+    for (uint32_t u = 0; u < w.nuses; ++u)
+      if (begin) render_flow::request(ctx, kFlowReqUseBegin, w.uses[u].hash, &w.uses[u].access, 4);
+      else render_flow::request(ctx, kFlowReqUseEnd, w.uses[u].hash, nullptr, 0);
+    w.requests.fetch_add(w.nuses, std::memory_order_relaxed);
+  }
+}
+
 // The flow thread's list id when no list is bound on this thread now, else 0.
 uint32_t flow_list_if_unbound(const uint8_t* ctx) {
   const uint8_t* lctx = g_get_ctx();
@@ -344,6 +365,8 @@ void wrap_execute(const uint8_t* self, const uint8_t* ctx, void* builder) {
     any = true;
     if (w.rm >= 0) rm = &g_rm[w.rm];
   }
+  const bool declare = any && !p->shared;
+  if (declare) wrap_declare(nw, vi, ctx, true);
   if (rm && (p->shared || reinterpret_cast<JobUsage_t>(vt[kNodeVtJobBuilderUsage])(self))) {
     rm->refused.fetch_add(1, std::memory_order_relaxed);
     rm = nullptr;
@@ -375,6 +398,7 @@ void wrap_execute(const uint8_t* self, const uint8_t* ctx, void* builder) {
     orig_execute(p, self, ctx, builder);
     render_flow::record_into(nullptr);
     if (in->rec.overflow) rm->overflows.fetch_add(1, std::memory_order_relaxed);
+    if (declare) wrap_declare(nw, vi, ctx, false);
     return;
   }
   if (ds && declaring) {
@@ -385,6 +409,7 @@ void wrap_execute(const uint8_t* self, const uint8_t* ctx, void* builder) {
     orig_execute(p, self, ctx, builder);
     render_flow::record_into(nullptr);
     if (ds->rec.overflow) ds->overflows.fetch_add(1, std::memory_order_relaxed);
+    if (declare) wrap_declare(nw, vi, ctx, false);
     return;
   }
   if (rm) {
@@ -409,7 +434,10 @@ void wrap_execute(const uint8_t* self, const uint8_t* ctx, void* builder) {
   } else {
     orig_execute(p, self, ctx, builder);
   }
-  if (!any || declaring) return;
+  if (!any || declaring) {
+    if (declare) wrap_declare(nw, vi, ctx, false);
+    return;
+  }
   // A group unbinds its list (BindCommandList(0) first in bit-1 mode, each member after itself): bind the list the
   // engine binds for a member on this flow thread, as CRenderNodeBase::Process does, and unbind it again after.
   const uint32_t rebind = flow_list_if_unbound(ctx);
@@ -421,6 +449,7 @@ void wrap_execute(const uint8_t* self, const uint8_t* ctx, void* builder) {
     run_fn(w.after, w.user, ctx, w.no_cmdlist, w.restores);
   }
   if (rebind) g_bind_cl(0);
+  if (declare) wrap_declare(nw, vi, ctx, false);
 }
 
 // The debug module: wrap the class of `engine_node` - not a group's vtable (a group is removed as its members), not ours.
@@ -452,6 +481,9 @@ void wrap_class(const void* engine_node, uint64_t h) {
                          w.name, static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(vt) - g_base),
                          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(p->orig) - g_base),
                          p->shared ? ", a group vtable: matched by name" : "");
+    if (p->shared && w.nuses)
+      g_sdk->logger->WarnF(g_handle, "render nodes: wrap '%s' - a GROUP: its %u node_wrap_use declaration(s) are NOT "
+                           "issued (declare them on a member)", w.name, w.nuses);
   }
 }
 
@@ -636,6 +668,31 @@ void node_wrap_stats(rg_handle h, rg_wrap_stats* out) {
   out->restores = w.restores.load();
   out->jobs = w.jobs.load();
   out->rebinds = w.rebinds.load();
+}
+
+int32_t node_wrap_use(rg_handle h, rg_handle flow, uint32_t access) {
+  if (!registration_open()) return RG_E_LATE;
+  if (h <= 0 || static_cast<uint32_t>(h) > g_nw.load()) return RG_E_ARG;
+  Wrap& w = g_w[h - 1];
+  if (w.rm >= 0) {  // a removal's handle lives in the same table: declare on a node_wrap of the class instead
+    clients::reason("a node_remove handle - declare on a node_wrap of the same class");
+    return RG_E_ARG;
+  }
+  const uint32_t hash = render_flow::flow_hash(flow);
+  if (!hash || !access || (access & ~(RG_FLOW_READ | RG_FLOW_WRITE | RG_FLOW_KEEP))) return RG_E_ARG;
+  if (w.nuses >= kMaxUses) return RG_E_FULL;
+  w.uses[w.nuses++] = Use{hash, access, false, {}};
+  return 0;  // node_wrap already wants render_flow: HandleRequest's entry is resolved at its attach
+}
+
+void node_wrap_uses(rg_handle h, uint32_t* uses, uint64_t* requests, uint32_t* group) {
+  *uses = 0, *requests = 0, *group = 0;
+  if (h <= 0 || static_cast<uint32_t>(h) > g_nw.load()) return;
+  const Wrap& w = g_w[h - 1];
+  const int32_t vi = w.vt.load();
+  *uses = w.nuses;
+  *requests = w.requests.load();
+  *group = vi >= 0 && g_vt[vi].shared ? 1u : 0u;
 }
 
 const void* original_execute(const void* const* vtable) {

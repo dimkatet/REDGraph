@@ -64,6 +64,19 @@ uint32_t bound_subs_take();
 // For bindings: the companion's blob; refuse = never mapped / dispatched from now on.
 bool companion_info(rg_handle h, rg_blob* cs);
 void companion_refuse(rg_handle h, const char* why);
+// The graphics wing of M4: draw companions, and which PSO drew on this thread.
+rg_handle draw_companion_register(const char* name, uint32_t stage, const uint8_t* hash16, rg_blob shader,
+                                  const rg_pso_state* state);
+int32_t draw_companion_scope(rg_handle h, const char* node);
+void draw_companion_stats(rg_handle h, rg_patch_stats* out);
+// [hot] false = the last graphics bind on this thread carries no draw subscription (the draw hooks stop here).
+bool draw_subs_pending();
+// The draw subscriptions of the draw just recorded on context `ctx` (0 = none / skipped / another PSO), with the
+// engine PSO and the PSO the engine drew with (a clone when a patch swapped it).
+uint32_t draw_bound(const uint8_t* ctx, ID3D12PipelineState** engine, ID3D12PipelineState** bound);
+// Companion `h`'s PSO for engine PSO `engine`, nullptr = not built for it / build failed / out of its scope.
+ID3D12PipelineState* draw_companion_of(ID3D12PipelineState* engine, rg_handle h);
+void draw_companion_count(rg_handle h);
 }  // namespace pso
 
 // bindings.cpp - M2 leases + the host's cbuffers
@@ -137,6 +150,12 @@ void detach();
 rg_handle subscribe(const char* name, const uint8_t* hash16, rg_dispatch_fn fn, void* user);
 uint32_t subs_for(const uint8_t* hash16);
 bool has_subs();
+// The graphics wing: draw subscriptions (keyed on a VS or a PS hash), companion draws and passes after a draw.
+rg_handle draw_subscribe(const char* name, uint32_t stage, const uint8_t* hash16, rg_draw_fn fn, void* user);
+uint32_t draw_subs_for(const uint8_t* vs16, const uint8_t* ps16);  // NULL = that stage has no bytecode
+bool has_draw_subs();
+uint32_t draw_companion_request(rg_handle h);
+uint32_t after_draw(rg_handle pass, rg_pass_fn fn, void* user);
 }  // namespace passes
 
 // render_flow.cpp - M5: the node context on the recording thread (CRenderNodeBase::Process) + resources by name
@@ -192,6 +211,9 @@ int32_t node_use(rg_handle node, rg_handle flow, uint32_t access);
 rg_handle node_alloc(rg_handle node, const char* name, const rg_flow_desc* desc);
 rg_handle node_wrap(const char* target, rg_node_fn before, rg_node_fn after, void* user);
 void node_wrap_stats(rg_handle h, rg_wrap_stats* out);
+int32_t node_wrap_use(rg_handle wrap, rg_handle flow, uint32_t access);
+// A wrap's declarations (node_wrap_use): how many, the requests issued, 1 = its target is a group (not issued).
+void node_wrap_uses(rg_handle h, uint32_t* uses, uint64_t* requests, uint32_t* group);
 rg_handle node_remove(const char* target, uint32_t on);
 void node_remove_set(rg_handle h, uint32_t on);
 void node_remove_stats(rg_handle h, rg_remove_stats* out);

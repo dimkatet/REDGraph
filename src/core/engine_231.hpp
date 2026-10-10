@@ -58,6 +58,41 @@ constexpr uintptr_t kRenderShaderComputeRet = 0x1f6ec3;  // CRenderShaderCompute
 constexpr uintptr_t kDispatchIndirectCompute = 0x6232ac;
 constexpr uintptr_t kRenderShaderComputeIndirectRet = 0x6232a5;
 constexpr uintptr_t kGetCommandListContext = 0x1f405c;   // thread-current CommandListContext*, no args
+// The graphics wing (2026-10-10): EVERY draw goes through GraphicsPSO::CreatePSO from one of two places - GpuApi::
+// SetupForDraw (its 7 callers below record the draw after it) or DrawIndexedPrimitive (SetupForDraw inlined). Each
+// records ONE D3D12 draw at its end, skipped when the PSO came back NULL (still compiling): the graphics-dirty byte
+// (kCtxGraphicsDirty) is then still 1. The bind is skipped too while that byte is 0 - a batch of draws resolves its PSO
+// once - so "which PSO drew" is ctx+0x3d0, not the last bind.
+//   DrawIndexedPrimitive(type, base_vertex, start_index, index_count, instances, start_instance) -> DrawIndexedInstanced
+//   DrawPrimitive(type, ?, count, ?) -> DrawInstanced(count, 1, 0, 0)       (its 3rd arg; SetupForDraw gets type 3)
+//   DrawPrimitiveNoBuffers(type, count, cu) -> DrawInstanced(count, 1, 0, 0) (DrawTriangleNoBuffers tail-jumps here)
+//   Draw[Indexed]Primitive[Indirect][NoBuffers](type, ?) -> ExecuteIndirect(device data + kCmdSig*, 1,
+//     GetD3DBuffer(ctx + kCtxIndirectArgs), [ctx + kCtxIndirectOffset], NULL, 0)
+//   DrawSystemPrimitive / DrawSystemIndexedPrimitive_Impl - vertices uploaded for the draw, then DrawInstanced /
+//     DrawIndexedInstanced (UI / debug)
+constexpr uintptr_t kDrawIndexedPrimitive = 0x1f2098;
+constexpr uintptr_t kDrawIndexedPrimitiveRet = 0x1f2013;  // CRenderGeometryBatcher::DrawMeshInstances -> it
+constexpr uintptr_t kDrawPrimitive = 0xbe4abc;
+constexpr uintptr_t kDrawPrimitiveRet = 0x1f6ba4;  // DrawSingle -> it
+constexpr uintptr_t kDrawPrimitiveNoBuffers = 0x20cc64;
+constexpr uintptr_t kDrawPrimitiveNoBuffersRet = 0x20cbc8;  // CMipmapGenerator::GenerateMipmaps_PS -> it
+constexpr uintptr_t kDrawIndexedIndirect = 0x623c58;  // DrawIndexedPrimitiveIndirect
+constexpr uintptr_t kDrawIndexedIndirectRet = 0x6238b0;  // CRenderTerrainCellCollector::RenderAutoSpawnMeshes -> it
+constexpr uintptr_t kDrawIndirectNoBuffers = 0x6245c0;  // DrawPrimitiveIndirectNoBuffers
+constexpr uintptr_t kDrawIndirectNoBuffersRet = 0x61bd6b;  // CRenderNode_RenderVolumetricClouds::Execute -> it
+constexpr uintptr_t kDrawIndexedIndirectNoBuffers = 0x6247c4;  // DrawIndexedPrimitiveIndirectNoBuffers
+constexpr uintptr_t kDrawIndexedIndirectNoBuffersRet = 0x77da22;  // CRenderDistantLightBatcher::RenderLights -> it
+constexpr uintptr_t kDrawSystemPrimitive = 0x1f677c;
+constexpr uintptr_t kDrawSystemPrimitiveRet = 0x783ae3;
+constexpr uintptr_t kDrawSystemIndexed = 0x9dc2ec;  // DrawSystemIndexedPrimitive_Impl
+constexpr uintptr_t kDrawSystemIndexedRet = 0x9dc2af;
+// GpuApi::GetD3DBuffer(const BufferRef*) -> ID3D12Resource* (device data + (id-1) * 0xb0 + 0x5c0b08)
+constexpr uintptr_t kGetD3DBuffer = 0x623ccc;
+constexpr uintptr_t kCtxIndirectArgs = 0x6c;    // BufferRef of the indirect arguments (BindIndirectArgs)
+constexpr uintptr_t kCtxIndirectOffset = 0x70;  // u32 byte offset into it
+constexpr uintptr_t kCmdSigDrawIndexed = 0x13bc678;  // in the device data: ID3D12CommandSignature*, one indexed draw
+constexpr uintptr_t kCmdSigDraw = 0x13bc670;         // ... one draw
+constexpr uintptr_t kCtxTopology = 0x628;  // u32 D3D_PRIMITIVE_TOPOLOGY set on the list (re-set when it differs)
 constexpr uintptr_t kRestoreState = 0x2a3e9d4;           // GpuApi::Hacks::RestoreState(cmdlist)
 // GpuApi::TransitionTexture(CommandListContext&, TextureRef, ResourceState, u32 subresource) - ResourceState IS a
 // D3D12_RESOURCE_STATES (CopyTextureData passes 0x400 = COPY_DEST), subresource -1 = all; the engine's state tracker

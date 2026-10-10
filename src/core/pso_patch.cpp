@@ -9,6 +9,10 @@
 // patch and a GS one (added) of different clients at once; a clone is built for every combination of their variants
 // (each stage also vanilla), and the bind picks the one where each patch is as it is now - selected, in scope, its
 // leases staged - independently of the others.
+// The graphics wing of M4 (2026-10-10): a graphics engine PSO also maps its DRAW subscriptions (mask) and its DRAW
+// COMPANIONS (a PSO each, built from the engine's desc); the bind funnel leaves {context, PSO it returned, engine PSO,
+// mask} in a thread_local, and passes' draw hooks check it against the PSO on the list (ctx+0x3d0) - a batch of draws
+// binds once.
 
 #include <Windows.h>
 #include <d3d12.h>
@@ -104,6 +108,21 @@ struct Comp {
 Comp g_c[kMaxComps];
 std::atomic<uint32_t> g_nc{0};
 
+// Draw companions: a graphics PSO per engine PSO whose `stage` shader has the hash - that stage's bytecode replaced
+// (bytes NULL = the engine's) and / or its pipeline state edited.
+constexpr uint32_t kMaxDrawComps = 8;
+struct DrawComp {
+  const char* name;
+  uint32_t stage;
+  dxil_hash::Hash hash;
+  rg_blob shader;
+  rg_pso_state st;  // st.set 0 = none
+  Counters c;
+  Scope scope;
+};
+DrawComp g_dc[kMaxDrawComps];
+std::atomic<uint32_t> g_ndc{0};
+
 // engine PSO -> clones, open addressing: a writer (Create, rare, under g_insert_lock) stores the value, then publishes
 // the key with release; the bind detours read lock-free. A tree VS pairs with many PS / states.
 // The key is the engine PSO's ADDRESS, and the engine frees PSOs: GpuApi::Destroy(ShaderRef) ->
@@ -130,7 +149,12 @@ struct Mapping {
   uint32_t np = 0;
   uint32_t idx[kMaxStages] = {};
   uint32_t stride[kMaxStages] = {};
-  uint32_t subs = 0;  // passes' subscription mask for the shader (compute)
+  uint32_t subs = 0;  // passes' subscription mask: dispatch subscriptions (compute) / draw subscriptions (graphics)
+  // Draw companions of this (graphics) engine PSO: dc[i] = the PSO of g_dc[dc_idx[i]], nullptr = its build failed.
+  static constexpr uint32_t kMaxDc = 4;
+  uint32_t ndc = 0;
+  uint32_t dc_idx[kMaxDc] = {};
+  ID3D12PipelineState* dc[kMaxDc] = {};
 };
 struct Slot {
   std::atomic<uintptr_t> engine{0};
@@ -204,6 +228,9 @@ void sweep_locked() {
     if (s.m.clone) g_retired_arrays.push_back(s.m.clone);  // a reader that found the slot may still index it
     s.m.clone = nullptr;
     s.m.nclone = 0;
+    for (uint32_t i = 0; i < s.m.ndc; ++i)
+      if (s.m.dc[i]) g_retired.push_back(s.m.dc[i]);
+    s.m.ndc = 0;
     p->Release();  // ours, the last: the engine's PSO goes now
     g_entries.fetch_sub(1, std::memory_order_relaxed);
     ++removed;
@@ -229,6 +256,15 @@ std::atomic<bool> g_composed_logged{false};
 std::atomic<bool> g_state_overlap_logged{false};
 std::atomic<bool> g_first_create{false};
 thread_local uint32_t t_bound_subs = 0;
+// The graphics wing: the last graphics bind on this thread (every bind while draw subscriptions exist).
+struct GfxBind {
+  const uint8_t* ctx;
+  ID3D12PipelineState* bound;   // what the funnel returned = what the engine sets at ctx+0x3d0
+  ID3D12PipelineState* engine;  // the engine's own PSO (the key of its mapping)
+  uint32_t subs;                // its draw subscriptions, 0 = none
+};
+thread_local GfxBind t_gfx{};
+bool g_track_draws = false;  // set at attach: draw subscriptions exist
 
 std::atomic<uint64_t> g_creates[2] = {}, g_creates_unhashed{0};
 std::atomic<uint64_t> g_calls[2] = {}, g_cycles[2] = {};
@@ -251,7 +287,9 @@ struct Match {
   uint32_t kind = kPatch;
   uint32_t n = 0;               // 0 = not ours; kPatch: the patches (one per stage), kComp: 1
   int32_t idx[kMaxStages] = {};  // their indices
-  uint32_t subs = 0;            // dispatch subscriptions on the (compute) shader, whatever n says
+  uint32_t subs = 0;            // dispatch / draw subscriptions on the shader, whatever n says
+  uint32_t ndc = 0;             // graphics: draw companions matching
+  uint32_t dc[Mapping::kMaxDc] = {};
 };
 
 // The lease test of patch i - before the engine's own creation, so a refusal is final before anyone asks
@@ -307,6 +345,16 @@ Match identify(Pipe pipe, const void* desc_v) {
   }
   for (const int32_t p : found)
     if (p >= 0 && lease_test(pipe, desc_v, p)) m.idx[m.n++] = p;
+  // The graphics wing: draw subscriptions and draw companions keyed on the VS or the PS.
+  const uint32_t ndc = g_ndc.load(std::memory_order_acquire);
+  if (passes::has_draw_subs() || ndc) {
+    const auto vs = hash_of(g->VS), ps = hash_of(g->PS);
+    m.subs = passes::draw_subs_for(vs ? vs->data() : nullptr, ps ? ps->data() : nullptr);
+    for (uint32_t i = 0; i < ndc && m.ndc < Mapping::kMaxDc; ++i) {
+      const auto& h = g_dc[i].stage == RG_STAGE_VS ? vs : ps;
+      if (h && *h == g_dc[i].hash) m.dc[m.ndc++] = i;
+    }
+  }
   return m;
 }
 
@@ -362,6 +410,38 @@ void apply_state(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, const rg_pso_state& s, u
 }
 
 const char* stage_label(uint32_t s) { return s == RG_STAGE_VS ? "VS" : s == RG_STAGE_PS ? "PS" : s == RG_STAGE_GS ? "GS" : "CS"; }
+
+// The draw companions of a graphics engine PSO, into `map` (before it is inserted).
+void build_draw_comps(ID3D12PipelineState* engine, const void* desc_v, const Match& m, Mapping& map) {
+  if (!m.ndc) return;
+  ID3D12Device* dev = nullptr;
+  if (FAILED(engine->GetDevice(IID_PPV_ARGS(&dev)))) return;
+  for (uint32_t i = 0; i < m.ndc; ++i) {
+    DrawComp& c = g_dc[m.dc[i]];
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d = *static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc_v);
+    if (c.shader.bytes) (c.stage == RG_STAGE_VS ? d.VS : d.PS) = {c.shader.bytes, c.shader.size};
+    uint32_t done = 0;
+    apply_state(d, c.st, done, c.name);
+    d.CachedPSO = {};
+    ID3D12PipelineState* pso = nullptr;
+    const HRESULT hr = dev->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso));
+    map.dc_idx[map.ndc] = m.dc[i];
+    map.dc[map.ndc++] = SUCCEEDED(hr) ? pso : nullptr;
+    const uint32_t k = c.c.engine_psos.fetch_add(1) + 1;
+    if (SUCCEEDED(hr)) {
+      c.c.clones.fetch_add(1);
+      if (k == 1 || (k <= 3 && verbose()))
+        g_sdk->logger->InfoF(g_handle, "pso swap: draw companion '%s' engine PSO %p -> %p (#%u for it)", c.name,
+                             static_cast<void*>(engine), static_cast<void*>(pso), k);
+    } else {
+      c.c.clone_failed.fetch_add(1);
+      c.c.last_hr.store(static_cast<uint32_t>(hr));
+      g_sdk->logger->ErrorF(g_handle, "pso swap: draw companion '%s' build FAILED (engine PSO %p), hr 0x%08x - never "
+                            "issued for it", c.name, static_cast<void*>(engine), static_cast<unsigned>(hr));
+    }
+  }
+  dev->Release();
+}
 
 // Every combination of the matched patches' variants (combo 0 = all vanilla = the engine PSO itself), or the companion.
 void build(Pipe pipe, ID3D12PipelineState* engine, const void* desc_v, const Match& m) {
@@ -428,6 +508,7 @@ void build(Pipe pipe, ID3D12PipelineState* engine, const void* desc_v, const Mat
                           "for that combination", what, static_cast<void*>(engine), static_cast<unsigned>(vhr));
   }
   if (dev) dev->Release();
+  if (pipe == kGraphics) build_draw_comps(engine, desc_v, m, map);
   uint32_t k[kMaxStages] = {};
   for (uint32_t i = 0; i < m.n; ++i) {
     Counters& c = m.kind == kComp ? g_c[m.idx[i]].c : g_p[m.idx[i]].c;
@@ -438,6 +519,8 @@ void build(Pipe pipe, ID3D12PipelineState* engine, const void* desc_v, const Mat
   if (!insert(reinterpret_cast<uintptr_t>(engine), map)) {
     for (uint32_t i = 0; i < map.nclone; ++i)
       if (map.clone[i]) map.clone[i]->Release();  // a duplicate Create for a PSO we already map, or the table is full
+    for (uint32_t i = 0; i < map.ndc; ++i)
+      if (map.dc[i]) map.dc[i]->Release();
     delete[] map.clone;
     g_sdk->logger->WarnF(g_handle, "pso swap: %s engine PSO %p not mapped (duplicate or table full, %u entries)", name,
                          static_cast<void*>(engine), g_entries.load());
@@ -475,12 +558,16 @@ void on_create(Pipe pipe, void** out, const void* desc, const Match& m) {
   g_creates[pipe].fetch_add(1, std::memory_order_relaxed);
   if (m.n) {
     build(pipe, static_cast<ID3D12PipelineState*>(*out), desc, m);
-  } else if (m.subs) {
+  } else if (m.subs || m.ndc) {
     Mapping sub;
     sub.kind = kSubOnly;
     sub.subs = m.subs;
-    if (!insert(reinterpret_cast<uintptr_t>(*out), sub))
+    if (pipe == kGraphics) build_draw_comps(static_cast<ID3D12PipelineState*>(*out), desc, m, sub);
+    if (!insert(reinterpret_cast<uintptr_t>(*out), sub)) {
+      for (uint32_t i = 0; i < sub.ndc; ++i)
+        if (sub.dc[i]) sub.dc[i]->Release();
       g_sdk->logger->WarnF(g_handle, "pso swap: subscribed engine PSO %p not mapped (duplicate or table full)", *out);
+    }
   }
 }
 
@@ -533,6 +620,7 @@ bool in_node(Scope& sc, const char* who, const char* what) {
 ID3D12PipelineState* swap(Pipe pipe, const void* state, ID3D12PipelineState* engine) {
   const uint64_t t0 = __rdtsc();
   ID3D12PipelineState* out = engine;
+  uint32_t draw_subs = 0;
   if (engine && graph_probe::census()) graph_probe::on_bind(pipe, engine);
   // The graph debug module's shader skip: NULL is the engine's own "still compiling" answer - it skips the draw.
   if (engine && graph_debug::skip(pipe, engine)) out = nullptr;
@@ -540,6 +628,7 @@ ID3D12PipelineState* swap(Pipe pipe, const void* state, ID3D12PipelineState* eng
     if (const Slot* s = find(reinterpret_cast<uintptr_t>(engine))) {
       const Mapping& m = s->m;
       if (pipe == kCompute) t_bound_subs = m.subs;
+      else draw_subs = m.subs;
       if (m.kind == kSubOnly) {
         // subscriptions only - the engine PSO stays bound
       } else if (m.kind == kComp) {
@@ -569,6 +658,9 @@ ID3D12PipelineState* swap(Pipe pipe, const void* state, ID3D12PipelineState* eng
       }
     }
   }
+  // Every graphics bind, mapped or not: a stale entry would match a new PSO at a freed address.
+  if (pipe == kGraphics && g_track_draws)
+    t_gfx = {static_cast<const uint8_t*>(state) - kCtxGraphicsState, out, engine, out ? draw_subs : 0u};
   const uint64_t dt = __rdtsc() - t0;
   t_cycles[pipe] += dt;
   if (prof::g_on.load(std::memory_order_relaxed)) prof::add(prof::kBind, dt);
@@ -724,7 +816,8 @@ int32_t companion_scope(rg_handle h, const char* node) {
 }
 
 bool needed() {
-  return g_np.load() != 0 || g_nc.load() != 0 || passes::has_subs() || device_ready_wanted() || graph_probe::census();
+  return g_np.load() != 0 || g_nc.load() != 0 || passes::has_subs() || passes::has_draw_subs() || g_ndc.load() != 0 ||
+         device_ready_wanted() || graph_probe::census();
 }
 bool has_companions() { return g_nc.load() != 0; }
 
@@ -732,7 +825,9 @@ bool attach() {
   const uint32_t np = g_np.load();
   for (uint32_t i = 0; i < np; ++i) g_want_stage[g_p[i].stage] = true;
   g_want[kCompute] = g_want_stage[RG_STAGE_CS] || g_nc.load() != 0 || passes::has_subs() || device_ready_wanted();
-  g_want[kGraphics] = g_want_stage[RG_STAGE_VS] || g_want_stage[RG_STAGE_PS] || g_want_stage[RG_STAGE_GS];
+  g_want[kGraphics] = g_want_stage[RG_STAGE_VS] || g_want_stage[RG_STAGE_PS] || g_want_stage[RG_STAGE_GS] ||
+                      passes::has_draw_subs() || g_ndc.load() != 0;
+  g_track_draws = passes::has_draw_subs();
   if (graph_probe::census()) g_want[kCompute] = g_want[kGraphics] = true;  // the census sees every PSO
   // Create first: an engine PSO must be mapped before a bind detour can recognise it.
   struct H {
@@ -859,6 +954,88 @@ void companion_refuse(rg_handle h, const char* why) {
 
 void companion_count(rg_handle h) {
   if (Comp* c = comp_of(h)) c->c.swaps.fetch_add(1, std::memory_order_relaxed);
+}
+
+// ---- the graphics wing ----
+
+namespace {
+DrawComp* draw_comp_of(rg_handle h) {
+  return h > 0 && static_cast<uint32_t>(h) <= g_ndc.load(std::memory_order_acquire) ? &g_dc[h - 1] : nullptr;
+}
+}  // namespace
+
+rg_handle draw_companion_register(const char* name, uint32_t stage, const uint8_t* hash16, rg_blob shader,
+                                  const rg_pso_state* st) {
+  if (!registration_open()) return RG_E_LATE;
+  if (!hash16 || (stage != RG_STAGE_VS && stage != RG_STAGE_PS)) return RG_E_ARG;
+  if (shader.bytes ? !is_dxbc(shader) : shader.size != 0) return RG_E_BLOB;
+  if (st && (st->struct_size < sizeof(rg_pso_state) || (st->set & ~127u))) return RG_E_ARG;
+  if (!shader.bytes && !(st && st->set)) {
+    clients::reason("neither a shader nor a pipeline-state edit - the companion would draw the same thing again");
+    return RG_E_ARG;
+  }
+  const uint32_t n = g_ndc.load();
+  if (n >= kMaxDrawComps) return RG_E_FULL;
+  DrawComp& c = g_dc[n];
+  c.name = name ? name : "?";
+  c.stage = stage;
+  std::memcpy(c.hash.data(), hash16, 16);
+  c.shader = shader;
+  c.st = st ? *st : rg_pso_state{};
+  c.st.struct_size = sizeof(rg_pso_state);
+  g_ndc.store(n + 1, std::memory_order_release);
+  return static_cast<rg_handle>(n + 1);
+}
+
+int32_t draw_companion_scope(rg_handle h, const char* node) {
+  if (!registration_open()) return RG_E_LATE;
+  DrawComp* c = draw_comp_of(h);
+  if (!c) return RG_E_ARG;
+  if (const int32_t r = c->scope.add(node)) return r;
+  render_flow::want();
+  g_sdk->logger->InfoF(g_handle, "host: draw companion '%s' scoped to node '%s' (M11)", c->name, node);
+  return 0;
+}
+
+void draw_companion_stats(rg_handle h, rg_patch_stats* out) {
+  if (!out) return;
+  *out = {};
+  DrawComp* c = draw_comp_of(h);
+  if (!c) return;
+  out->state = g_attached[kGraphics] ? RG_STATE_OK : RG_STATE_PENDING;
+  c->c.fill(out);
+  out->out_of_scope = c->scope.out_of_scope.load();
+}
+
+uint32_t draw_bound(const uint8_t* ctx, ID3D12PipelineState** engine, ID3D12PipelineState** bound) {
+  const GfxBind& b = t_gfx;
+  if (!b.subs || b.ctx != ctx || !ctx) return 0;
+  // The PSO on the list is still the one bound for this thread's last graphics bind, and the draw was not skipped (a
+  // NULL PSO - still compiling, a debug skip - leaves the graphics-dirty byte set and records nothing).
+  if (*reinterpret_cast<ID3D12PipelineState* const*>(ctx + e231::kCtxPso) != b.bound || ctx[e231::kCtxGraphicsDirty]) return 0;
+  *engine = b.engine;
+  *bound = b.bound;
+  return b.subs;
+}
+
+bool draw_subs_pending() { return t_gfx.subs != 0; }
+
+ID3D12PipelineState* draw_companion_of(ID3D12PipelineState* engine, rg_handle h) {
+  DrawComp* c = draw_comp_of(h);
+  if (!c || !engine) return nullptr;
+  const Slot* s = find(reinterpret_cast<uintptr_t>(engine));
+  if (!s) return nullptr;
+  for (uint32_t i = 0; i < s->m.ndc; ++i)
+    if (s->m.dc_idx[i] + 1 == static_cast<uint32_t>(h)) {
+      if (!s->m.dc[i]) return nullptr;
+      if (c->scope.any() && !in_node(c->scope, c->name, "draw")) return nullptr;
+      return s->m.dc[i];
+    }
+  return nullptr;
+}
+
+void draw_companion_count(rg_handle h) {
+  if (DrawComp* c = draw_comp_of(h)) c->c.swaps.fetch_add(1, std::memory_order_relaxed);
 }
 
 void bound_subs_reset() { t_bound_subs = 0; }

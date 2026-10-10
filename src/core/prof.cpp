@@ -21,7 +21,7 @@ constexpr uint32_t kFlush = 16;  // calls per thread between two adds to the tot
 
 const char* const kName[kPoints] = {"bind funnel", "UpdateRootParams", "Dispatch", "node Process", "RunJob",
                                     "RenderFlow request", "wrapped Execute", "DispatchRays", "GetShaderGroupId",
-                                    "engine blocks"};
+                                    "engine blocks", "Draw"};
 
 // A thread's partial sums belong to one measurement: a new one (epoch) drops what an earlier one left unflushed.
 std::atomic<uint32_t> g_epoch{0};

@@ -263,6 +263,35 @@ subscription):
 
 A request whose context (or, for a companion, bound PSO) changed before the engine's Dispatch returned is dropped.
 
+### The graphics wing (draws)
+
+2026-10-10, hardware-confirmed 21:48 (`DrawTest` 5 / 5 phases PASS: companion draws exactly per request, 0 refused;
+600 / 600 passes after a draw; the visible sky 5f079e10 is a SYSTEM draw, 4 vertices x 1). Every draw resolves its PSO through `GraphicsPSO::CreatePSO`
+from exactly two places: `GpuApi::SetupForDraw` (callers: `DrawPrimitive`, `DrawPrimitiveNoBuffers` - the full-screen
+passes, `DrawTriangleNoBuffers` tail-jumps there -, the three indirect draws, the two system-primitive draws) and
+`DrawIndexedPrimitive` (SetupForDraw inlined; the world's meshes, decals, skinned meshes, light volumes). Each records
+one D3D12 draw at its end; the host post-hooks all eight (attached only with a draw subscription;
+`engine_231.hpp` "The graphics wing" has the RVAs, call sites and argument maps).
+
+The bind is NOT per draw: `CreatePSO` runs only while the graphics-dirty byte (`ctx+0x120`) is set - `SetShader` sets
+it, a batch of instances binds once (compute is per dispatch: `CRenderShaderCompute::Dispatch` calls `SetShader`
+every time). So the funnel leaves `{context, the PSO it returned, the engine PSO, its draw-subscription mask}` in a
+thread_local at EVERY graphics bind, and a draw hook reports a draw iff that PSO is still the one on the list
+(`ctx+0x3d0`) and the dirty byte is clear (a NULL PSO - still compiling, a debug skip - leaves it set: nothing drawn).
+Every other draw costs one thread-local load.
+
+* **draw subscription** (`draw_subscribe(name, stage VS / PS, hash, fn)`): `rg_draw_info` = the D3D12 call made
+  (instanced / indexed with its counts; indirect with counts 0; `RG_DRAW_SYSTEM` for uploaded primitives - the visible sky's bottom layer 5f079e10 is one, UI, debug; such an
+  entry returns without drawing on a zero count, which is therefore not reported).
+* **draw companion** (`draw_companion_register(name, stage, hash, shader, state)` / `_request`): a PSO per engine PSO
+  carrying the hash, from the engine's desc with that stage's bytecode and / or `rg_pso_state` applied; recorded as
+  `SetPipelineState(companion) -> the same draw -> SetPipelineState(what the engine drew with)` (indirect: the
+  engine's command signature at device data `+0x13bc678` / `+0x13bc670`, `GetD3DBuffer(ctx+0x6c)`, offset
+  `ctx+0x70` - still bound). No leases (v1). `draw_companion_scope` as `companion_scope`.
+* **pass after a draw** (`pass_after_draw`): as after a dispatch, plus the topology cache (`ctx+0x628`) cleared on a
+  restore. NOT restored: render targets, viewports, scissors, VB / IB, stencil ref, blend factor - the next draw of the
+  batch re-sets none of them.
+
 ## Engine constant blocks
 
 `rg_engine_block` (`cbuffer_feed`, `engine_block`): copies of constant data the engine writes, caught at the write -
@@ -368,6 +397,16 @@ befores, the original, afters - the fns in the real run only. A vtable shared by
 matched by `GetName` per call. After a group nothing is bound, so for `after` the host binds the list the group's
 members recorded into and unbinds after (`rebinds`). Several wraps on one node run in registration order.
 
+**Declarations** (`node_wrap_use(wrap, flow, access)`, 2026-10-10, hardware-confirmed 21:48 - `WrapUseTest` PASS: the
+declared PostFX node read our Lighting transient 1796 / 1796 intact, the group declaration logged NOT issued): M7's `node_use` for an engine node. The host issues
+an `RTUseBegin` per declared resource before the befores (and before the node's own requests), an `RTUseEnd` after the
+afters, in BOTH runs, unconditionally - on the removal paths too (outside the recorded window, so a replay is
+bracketed the same way). The engine then extends the resource's lifetime to the node: a transient whose last engine
+user ran earlier is not aliased before it, and `flow_texture` / a `view_create_texture` lease scoped there resolve it.
+Class vtables only: on a group's (shared) vtable nothing is issued - its `Execute` leaves no list bound and its
+members' requests come from other threads - logged once when the target turns out to be a group. Not tested: a
+declaration of a resource the wrapped node ITSELF begins / ends (nested uses on one tag in one node).
+
 ### Removing an engine node
 
 M9, `node_remove(target, on)`. Skipping `Register` would leave the engine a node handle that does not exist (top-level
@@ -470,6 +509,8 @@ under `__try`: the engine's crash handler freezes the game on any first-chance A
 | `PatchScopeTest = 1` / `2` | M11: the game's own PS 0c359133 swapped for itself, scoped inside / outside its node | `scope test ... swaps` / `out_of_scope` grow |
 | `ComposeTest = true` | M1 composition: VS 69090ccd (2 variants) and PS 0c359133 (1), the game's own bytecode swapped for itself, on the sky pass's PSO; four phases of 600 sky runs: VS only, both, PS only, none | `engine PSO ... carries 2 patches ... 5 of 5 combination(s) built`, then per phase `compose test A/B/C/D ... -> PASS` (swaps grow exactly for the patches switched on). Nothing on screen; takes CRT's sky patch for the session |
 | `StateTest = true` | M1 pipeline state: the visible sky's PS 5f079e10 with two state-only variants (no bytecode): wireframe, RT0 write mask 0; phases of 600 sky runs; bad fill mode and a variant out of range refused at registration | `state test: registered ... (expected 0 0 -1 -1)`, then `state test phase 'wireframe' / 'write mask 0': swaps +N -> PASS`, `'vanilla': +0 -> PASS`. ON SCREEN only where nothing covers the sky's bottom layer (5f079e10 lies under the volumetric clouds, fog and aerial composite): far off, near the horizon |
+| `DrawTest = true` | M4 graphics wing: draw subscriptions on the visible sky's PS 5f079e10 and the sky-scattering VS 69090ccd, a draw companion of 5f079e10 that only sets FILL_MODE_WIREFRAME, a pass after the sky draw that returns `RG_PASS_TOUCHED_STATE` touching nothing; phases of 600 sky draws: none / companion / pass; refusals (stage CS, a companion with nothing to change) | `draw test: registered ... PASS`, host `first subscribed draw ... kind N`, `first companion draw`, `first pass after a draw`, then per phase `draw test phase '...': companion draws +N (requests +N+1 ...) ... -> PASS`; the line names the draw kinds the sky goes through. On screen only far off: wireframe sky edges in the companion phase |
+| `WrapUseTest = true` | M8 declarations: our transient `rgwrapuse/tmp` written in Lighting (`RgNode_WrapUseWriter` after ClassifyMaterials), declared by a wrap of `CRenderNode_ApplyBloomAndTonemapping` (PostFX) with `node_wrap_use` and copied in its `before`; a wrap of `DrawHUD` without the declaration as an informational control; registration refusals (access 0, no such flow, a 9th declaration) and a group target | `wrap use test: registered ... PASS`, host `wrap 'PostFX' - a GROUP: its 1 node_wrap_use declaration(s) are NOT issued`, then every 1800 frames `wrap use test #N ... DECLARED: ok N (exact M) stale 0 bad 0 ... miss 0 ... -> PASS` (ok = the pattern with a counter within 2 of the writer's: PostFX may record on the CPU before this frame's Lighting). Nothing on screen |
 | `LeaseTexTest = true` | M2 texture sources: a companion of the tonemapping-LUT CS 88c57ef1 (scoped to `CRenderNode_GenerateTonemappingLUT`, after the frame's third dispatch) reads our 4x4x2 R32_UINT texture through a 2D_ARRAY view of slice 1 (t64) and the engine's LUT `2ae9f45c` by name through a 3D UAV view (u16) into our raw buffer (u17); the registration checks (a raw view at a Texture2DArray refused, a cube UAV refused, a buffer into a texture view / a resource into a flow view refused) | `lease tex test: registered`, `views set`, then every 300 frames `lease tex test #N ... client texture 16/16 = slice 1 ... LUT texels 2/2 equal to the copy ... PASS`. Nothing on screen |
 
 RtVariantTest, RtSwapTest, PatchScopeTest and ComposeTest need game bytecode, which this repository does not carry: CMake builds it from the
@@ -497,9 +538,9 @@ validates an item; it does not set the order.
 | replace the shader, live variants | yes | yes (VS / PS, GS added) | raygen only (`rt_variant`) |
 | scope to a node | yes | yes | yes |
 | lease a register | yes | yes | yes (one per register) |
-| subscription (callback after it) | yes | **no** | **no** |
-| companion (again, with every root argument bound) | yes | **no** | **no** |
-| raw pass after it | yes | **no** | **no** |
+| subscription (callback after it) | yes | yes (`draw_subscribe`) | **no** |
+| companion (again, with every root argument bound) | yes | yes (`draw_companion_*`) | **no** |
+| raw pass after it | yes | yes (`pass_after_draw`) | **no** |
 | pipeline state beyond bytecode | - | **no** | - |
 
 0. ~~The engine-PSO map is keyed by pointer and insert-only~~ - FIXED 2026-10-10, hardware-confirmed 13:12 (`48 engine PSO(s) released by the engine` two minutes into a
@@ -510,9 +551,9 @@ validates an item; it does not set the order.
 1. ~~**Lease sources: textures.**~~ DONE 2026-10-10, hardware-confirmed 20:25 (`LeaseTexTest` 19/19 PASS: client
    texture 16/16 = slice 1, LUT texels 2/2 = the copy incl. across a scene change, flow hits 16569 misses 0): `view_create_texture`
    - a client texture or an engine one by name (`desc.flow`, resolved per stage), a NULL of the view's dimension, and
-   the owners' declared ResourceKind checked against the view at registration (buffers too: raw vs structured). Left
-   open: a flow source declares nothing to the engine (gap 6, `node_wrap` + `node_use`) - its lifetime and state are
-   the client's.
+   the owners' declared ResourceKind checked against the view at registration (buffers too: raw vs structured). A flow
+   source declares nothing by itself: its lifetime comes from `node_wrap_use` on the scoped node (gap 6), its state
+   stays the client's.
 2. ~~**Several clients' patches on one PSO.**~~ DONE 2026-10-10, hardware-confirmed 20:38 (`ComposeTest` 5/5 PASS;
    both on: VS +909, PS +185 swaps; `5 of 5 combination(s) built, 0 failed`): VS, PS
    and an added GS patch compose on one engine PSO, a clone per combination of their variants, each switched alone
@@ -522,13 +563,14 @@ validates an item; it does not set the order.
    sky, the volumetric clouds, fog and aerial composite cover most of it): `patch_state` -
    rasterizer (cull, fill, depth bias), depth, blend / write mask per target, formats, per variant; state-only
    variants (no bytecode). Not covered: stencil, sample desc, input layout, topology.
-4. **The graphics wing of M4.** Draw subscriptions (after every draw of an engine PSO carrying shader X, on the
-   recording thread), then a companion draw and a raw pass after a draw. Needs the `GpuApi::Draw*` entry points found
-   and call-site-checked, near-zero cost for unsubscribed shaders.
+4. ~~**The graphics wing of M4.**~~ DONE 2026-10-10, hardware-confirmed 21:48 (`DrawTest` 5/5 PASS): draw subscriptions, draw companions,
+   passes after a draw over the eight `GpuApi` draw entries ("The graphics wing (draws)"; `DrawTest`). Left: leases
+   for draw companions.
 5. **The RT wing of M4.** An RT companion: the engine's `DispatchRays` issued again (same state object and tables,
    another raygen, a leased output). The raygen record is built per dispatch in the upload ring
    (`GpuApi::DispatchRays` 0x2a406e4), so the second dispatch needs its own record.
-6. Smaller: `node_wrap` cannot declare resources (`node_use`) as `node_register` can; subscriptions have no stats;
+6. Smaller: ~~`node_wrap` cannot declare resources~~ DONE 2026-10-10, hardware-confirmed 21:48: `node_wrap_use`
+   (Wrapping an engine node, "Declarations"; `WrapUseTest`); subscriptions have no stats;
    resources that outlive a frame cannot be published (only `node_alloc` transients) - whether the engine's RenderFlow
    has persistent resources to hang them on is not checked; a client loading BEFORE REDGraph cannot log through the
    host until the host's Load.

@@ -307,6 +307,39 @@ __declspec(noinline) rg_handle w_node_wrap(const char* target, rg_node_fn before
   return r;
 }
 
+__declspec(noinline) int32_t w_node_wrap_use(rg_handle wrap, rg_handle flow, uint32_t access) {
+  int32_t r = clients::owner_check(_ReturnAddress(), clients::sWrap, wrap, "node_wrap_use");
+  if (!r) r = clients::owner_check(_ReturnAddress(), clients::sFlow, flow, "node_wrap_use");
+  if (!r) r = render_nodes::node_wrap_use(wrap, flow, access);
+  clients::note(_ReturnAddress(), clients::kWrapUse, r, wrap, clients::target_of(clients::kWrap, wrap).c_str(),
+                clients::name_of(clients::kFlow, flow).c_str());
+  return r;
+}
+
+__declspec(noinline) rg_handle w_draw_subscribe(const char* name, uint32_t stage, const uint8_t* hash16,
+                                                rg_draw_fn fn, void* user) {
+  const rg_handle r = passes::draw_subscribe(name, stage, hash16, fn, user);
+  clients::note(_ReturnAddress(), clients::kDrawSubscribe, r, 0, name,
+                (std::string(stage == RG_STAGE_VS ? "VS " : "PS ") + hex(hash16)).c_str());
+  return r;
+}
+
+__declspec(noinline) rg_handle w_draw_companion_register(const char* name, uint32_t stage, const uint8_t* hash16,
+                                                         rg_blob shader, const rg_pso_state* state) {
+  const rg_handle r = pso::draw_companion_register(name, stage, hash16, shader, state);
+  clients::note(_ReturnAddress(), clients::kDrawCompanion, r, 0, name,
+                (std::string(stage == RG_STAGE_VS ? "VS " : "PS ") + hex(hash16)).c_str());
+  return r;
+}
+
+__declspec(noinline) int32_t w_draw_companion_scope(rg_handle comp, const char* node) {
+  int32_t r = clients::owner_check(_ReturnAddress(), clients::sDrawCompanion, comp, "draw_companion_scope");
+  if (!r) r = pso::draw_companion_scope(comp, node);
+  clients::note(_ReturnAddress(), clients::kDrawCompanionScope, r, comp,
+                clients::name_of(clients::kDrawCompanion, comp).c_str(), node);
+  return r;
+}
+
 __declspec(noinline) rg_handle w_node_remove(const char* target, uint32_t on) {
   const rg_handle r = render_nodes::node_remove(target, on);
   clients::note(_ReturnAddress(), clients::kRemove, r, 0, nullptr, target);
@@ -316,6 +349,15 @@ __declspec(noinline) rg_handle w_node_remove(const char* target, uint32_t on) {
 // ---- the [hot] entries that take a handle: the owner check, then the core (the *_stats calls go straight through) ----
 bool own(const void* ret, clients::Space space, rg_handle h, const char* call) {
   return clients::owner_check(ret, space, h, call) == 0;
+}
+
+uint32_t h_draw_companion_request(rg_handle comp) {
+  return own(_ReturnAddress(), clients::sDrawCompanion, comp, "draw_companion_request")
+             ? passes::draw_companion_request(comp)
+             : 0u;
+}
+uint32_t h_after_draw(rg_handle pass, rg_pass_fn fn, void* user) {
+  return own(_ReturnAddress(), clients::sPass, pass, "pass_after_draw") ? passes::after_draw(pass, fn, user) : 0u;
 }
 
 void h_patch_select(rg_handle patch, int32_t variant) {
@@ -400,6 +442,13 @@ const rg_host kHost = {
     &rtlib::stats,
     &w_view_create_texture,
     &w_patch_state,
+    &w_node_wrap_use,
+    &w_draw_subscribe,
+    &w_draw_companion_register,
+    &h_draw_companion_request,
+    &w_draw_companion_scope,
+    &pso::draw_companion_stats,
+    &h_after_draw,
 };
 
 }  // namespace

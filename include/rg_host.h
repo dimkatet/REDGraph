@@ -223,6 +223,25 @@ typedef struct rg_dispatch_info {
   uint32_t flags;      /* RG_DISPATCH_* */
 } rg_dispatch_info;
 typedef void (*rg_dispatch_fn)(void* user, const rg_dispatch_info* info);
+
+/* ---- M4, the graphics wing (2026-10-10): draw subscriptions, draw companions, passes after a draw ----
+ * rg_draw_info.kind: which GpuApi draw recorded it - the D3D12 call it made. */
+enum rg_draw_kind {
+  RG_DRAW_INSTANCED = 0,         /* DrawInstanced(count, instances, start, start_instance) */
+  RG_DRAW_INDEXED = 1,           /* DrawIndexedInstanced(count, instances, start, base_vertex, start_instance) */
+  RG_DRAW_INDIRECT = 2,          /* ExecuteIndirect of one draw - the counts are on the GPU (0 here) */
+  RG_DRAW_INDEXED_INDIRECT = 3   /* ... of one indexed draw */
+};
+#define RG_DRAW_SYSTEM 1u /* rg_draw_info.flags: vertices the engine uploaded for this draw (GpuApi::DrawSystem*: the
+                             visible sky's bottom layer, UI, debug primitives); start / base_vertex are 0 */
+typedef struct rg_draw_info {
+  uint32_t kind;  /* rg_draw_kind */
+  uint32_t flags; /* RG_DRAW_* */
+  uint32_t count, instances, start;  /* vertices / indices per instance, instances, the first vertex / index */
+  int32_t base_vertex;               /* indexed */
+  uint32_t start_instance;
+} rg_draw_info;
+typedef void (*rg_draw_fn)(void* user, const rg_draw_info* info);
 typedef void (*rg_device_fn)(void* user, void* d3d12_device);
 
 typedef struct rg_host_stats {
@@ -460,8 +479,8 @@ typedef struct rg_host {
    * so flow_texture / flow_transition work inside them as in a node of ours. The host patches slot [1] of the class
    * vtable the first time the engine registers such a node. A group's Execute leaves no list bound - for `after` the
    * host binds the list its members record into (rg_wrap_stats.rebinds); it ends after its members' jobs, a plain
-   * node's job-builder work records after `after` (rg_wrap_stats.jobs). No RenderFlow declarations of its own (v1):
-   * use only what the wrapped node or the group's members keep alive. Register-time only. */
+   * node's job-builder work records after `after` (rg_wrap_stats.jobs). A resource the wrapped node does not keep
+   * alive: declare it with node_wrap_use. Register-time only. */
   rg_handle (*node_wrap)(const char* target, rg_node_fn before, rg_node_fn after, void* user);
   void (*node_wrap_stats)(rg_handle wrap, rg_wrap_stats* out);
 
@@ -527,14 +546,60 @@ typedef struct rg_host {
    * of what it finds (once per resource per frame). Where it does not resolve - outside a node, or not alive at that
    * point of the frame - the lease does not stage: the patch stays vanilla for that draw, the companion is not
    * dispatched, an RT lease stages a NULL descriptor of the view's dimension (reads 0). The engine knows nothing of the
-   * read: scope the lease's owners (patch_scope / companion_scope) to nodes where the texture is alive, and put it in
-   * a state your shader may read it in (flow_transition in a node_wrap `before`) unless the engine already left it so.
+   * read: scope the lease's owners (patch_scope / companion_scope) to nodes where the texture is alive - or make it
+   * alive there: node_wrap + node_wrap_use on that node - and put it in a state your shader may read it in
+   * (flow_transition in a node_wrap `before`) unless the engine already left it so.
    * view_set_resource on such a view is RG_E_ARG. */
   rg_handle (*view_create_texture)(uint32_t kind, const rg_texture_view_desc* desc, uint32_t ring);
 
   /* M1 (2026-10-10): variant `variant` of a VS / PS / GS patch also changes the engine PSO's pipeline state
    * (rg_pso_state). Register-time; once per variant (a second call replaces the first). 0 = ok. */
   int32_t (*patch_state)(rg_handle patch, uint32_t variant, const rg_pso_state* state);
+
+  /* M8 (2026-10-10): node_use for a WRAP - the wrapped node also declares `flow` (flow_register; an engine name or a
+   * name another client publishes) with RG_FLOW_* access, as a node of ours does: the host issues an RTUseBegin per
+   * resource before the wraps' `before` and the node's own work, and an RTUseEnd after the `after`s, in BOTH runs of
+   * the graph, identically. The engine then keeps the resource alive (and its memory un-aliased) through the node - a
+   * transient reaches the node even when its last engine user ran earlier - so flow_texture / flow_transition in
+   * before / after and a lease of it (view_create_texture) scoped to the node (patch_scope / companion_scope) see it
+   * with no lifetime of their own to manage. A transient's ALLOC must run before the node in frame order (a use before
+   * it is ignored by the engine). Up to 8 per wrap; declarations of several wraps on one node add up, in registration
+   * order. Not for a GROUP target ("Lighting"): its Execute leaves no list bound - the declarations are not issued
+   * there (logged when the target turns out to be a group). Register-time. 0 = ok. */
+  int32_t (*node_wrap_use)(rg_handle wrap, rg_handle flow, uint32_t access);
+
+  /* M4, the graphics wing (2026-10-10). A DRAW SUBSCRIPTION: fn runs right after every draw of an engine PSO whose
+   * `stage` shader (RG_STAGE_VS or RG_STAGE_PS) has the DXIL HASH - every GpuApi draw entry: DrawIndexedPrimitive (the
+   * world's meshes, decals, skinned), DrawPrimitive, DrawPrimitiveNoBuffers (full-screen passes), the three indirect
+   * draws (terrain auto-spawn grass, the clouds, distant lights) and the system-primitive draws - on the recording thread,
+   * the engine's draw already recorded, with what it drew (rg_draw_info). A draw the engine skipped (its PSO still
+   * compiling, a debug shader skip) is not reported. Also when a patch swapped that PSO for a clone: the hash is the
+   * ENGINE's shader. From inside fn: draw_companion_request, pass_after_draw, cbuffer_write (reaches the NEXT draw).
+   * Several subscriptions on one shader run in registration order. Unsubscribed draws cost one thread-local load.
+   * Register-time only. */
+  rg_handle (*draw_subscribe)(const char* name, uint32_t stage, const uint8_t* hash16, rg_draw_fn fn, void* user);
+  /* A DRAW COMPANION: a second graphics PSO built from the engine's desc of every PSO whose `stage` (VS / PS) shader
+   * has the hash - `shader` in that stage ({NULL, 0} = the engine's bytecode stays) and `state` (rg_pso_state, NULL =
+   * none) applied, as a patch variant would. Issued by draw_companion_request from inside a draw subscription of the same
+   * engine PSO: the host records the SAME draw again (the same counts / indirect arguments) with the companion PSO, every
+   * root argument, render target, viewport and vertex / index buffer still the engine's, then sets back the PSO the
+   * engine drew with. Leases cannot name a draw companion (v1): it reads what the
+   * engine's draw has bound. Register-time only. */
+  rg_handle (*draw_companion_register)(const char* name, uint32_t stage, const uint8_t* hash16, rg_blob shader,
+                                       const rg_pso_state* state);
+  /* From inside a draw subscription: 1 = the companion is recorded right after the subscriptions return (before any
+   * pass_after_draw). 0 = not this draw's PSO, out of scope, or its build failed. [hot] */
+  uint32_t (*draw_companion_request)(rg_handle companion);
+  /* M11 for a draw companion: requested only inside a node named `node` (as patch_scope; up to 4). Register-time. */
+  int32_t (*draw_companion_scope)(rg_handle companion, const char* node);
+  /* engine_psos, clones (built), clone_failed, swaps = companion draws recorded, out_of_scope. [hot] */
+  void (*draw_companion_stats)(rg_handle companion, rg_patch_stats* out);
+  /* From inside a draw subscription: fn(user, cmdlist) runs after the draw (and after a companion). Returning
+   * RG_PASS_TOUCHED_STATE makes the host restore the engine's root signatures, heaps and PSO and re-set the topology
+   * at the next draw. Render targets, viewports, scissors, vertex / index buffers, stencil ref and blend factor are NOT
+   * restored - the engine's NEXT draw may be in the same batch and re-sets none of them: leave them as you found them.
+   * 1 = accepted. [hot] */
+  uint32_t (*pass_after_draw)(rg_handle pass, rg_pass_fn fn, void* user);
 } rg_host;
 
 RG_HOST_EXPORT const rg_host* rg_host_get(uint32_t version);

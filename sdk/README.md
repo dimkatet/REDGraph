@@ -98,12 +98,15 @@ The header documents each call in detail. This table is the map: which call you 
 | an extra compute pass right after an engine dispatch, with all its bindings | `companion_register` + `companion_request` (M4a), `companion_scope` | the companion reads exactly what the engine's dispatch had bound |
 | to know when an engine CS dispatches | `dispatch_subscribe` (M4c) | direct and indirect dispatches |
 | raw D3D12 work after a dispatch | `pass_register` + `pass_after_dispatch` (M4b) | |
+| to know when an engine VS / PS draws, and what it drew | `draw_subscribe` (M4, graphics) | every GpuApi draw entry; a batch of instances reports each draw |
+| the same draw again with another VS / PS and / or pipeline state | `draw_companion_register` + `draw_companion_request` (from a draw subscription), `draw_companion_scope` | every root argument, render target and vertex buffer stays the engine's; no leases yet |
+| raw D3D12 work after a draw | `pass_register` + `pass_after_draw` | leave render targets, viewports, vertex / index buffers as you found them: the next draw of the batch does not re-set them |
 | a whole RT library replaced | `rtlib_register` (M3), `rtlib_stats` | baked into the engine's state object at creation, not switchable |
 | an RT raygen variant, switchable live, per node | `rtlib_register` + `rt_variant` + `rt_variant_set` (M12) | the engine's library stays byte-identical. See section 6 |
 | an engine texture by name | `flow_register` + `flow_texture` (M5), `flow_transition` | valid only inside a node's recording |
 | your own node in the render graph | `node_register` (M6), `node_use` / `node_alloc` (M7) | the engine schedules it; transients are aliased by the engine; a transient's name is `"<yourmod>/<name>"` |
 | another mod's transient | `flow_register("<theirmod>/<name>", 0)` + `node_use` | the only way clients share a resource - see section 8 |
-| code before / after an engine node | `node_wrap` (M8) | any number of wraps per node |
+| code before / after an engine node | `node_wrap` (M8), `node_wrap_use` | any number of wraps per node; `node_wrap_use` declares a resource on the wrapped node (not on a group) |
 | an engine node's work switched off (or replaced) | `node_remove` + `node_remove_set` (M9), plus a wrap for a replacement | **one** removal per node class across all clients |
 | shader-visible descriptors for your own pass | `gpu_descriptors` (M10) | from the engine's per-frame ring: allocate per use, never keep |
 | the engine's `ID3D12Device*` | `device`, `device_ready` | create your objects on THIS device (it is ReShade's proxy when ReShade is loaded) |
@@ -165,8 +168,8 @@ Notes:
    * A texture: `view_create_texture(kind, &desc, ring)`. With `desc.flow = 0` it is yours (`view_set_resource(view,
      texture, 0)`; its states are yours). With `desc.flow` = a `flow_register` handle it is the ENGINE's texture by
      name, resolved at every draw / dispatch: where it is not alive the patch stays vanilla for that draw. Scope the
-     patch to nodes where it lives, and make sure it is in a readable state there (`flow_transition` in a `node_wrap`
-     `before`) - the engine does not know your shader reads it.
+     patch to nodes where it lives - or make it live there: `node_wrap` that node and declare the texture on the wrap
+     with `node_wrap_use` - and make sure it is in a readable state there (`flow_transition` in the wrap's `before`).
 4. **Assemble.** `python tools/rg_dxil.py asm edited.ll patch.dxil` assembles and validates the container, and writes
    its checksum. Without the checksum, D3D12 silently ignores the shader.
 5. **Embed.** `python tools/rg_dxil.py header patch.dxil patch.hpp --symbol MyPatch` creates the header (or load the
@@ -227,7 +230,9 @@ host->rt_variant_set(v, 1);   /* live, any thread; 0 = the engine's raygen */
 ## 7. Workflow: the render graph
 
 * **Wrap** (`node_wrap`): `before` / `after` run on the command list the engine bound for that node, in the real run
-  only. `flow_texture` and `flow_transition` work inside them.
+  only. `flow_texture` and `flow_transition` work inside them. A resource the node itself does not use - a transient
+  whose last engine reader ran earlier, another mod's published one: `node_wrap_use(wrap, flow, access)`, and the
+  engine keeps it alive through the node as for a node of yours. Not on a group target (declare on a member).
 * **Remove** (`node_remove`): the node stays in the graph and its resource declarations are replayed, so lifetimes and
   barriers stay intact. Only its GPU work is gone. Add a wrap on the same node to put your own pass in its place.
   Groups and job-builder nodes cannot be removed (`rg_remove_stats.refused`).

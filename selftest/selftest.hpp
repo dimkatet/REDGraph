@@ -35,4 +35,12 @@ namespace state_test {  // [Tests] StateTest: M1 pipeline-state edits (state-onl
 void register_with(const rg_host* host, bool on);
 }  // namespace state_test
 
+namespace wrap_use_test {  // [Tests] WrapUseTest: M8 declarations (node_wrap_use keeps a transient alive into a wrap)
+void register_with(const rg_host* host, bool on);
+}  // namespace wrap_use_test
+
+namespace draw_test {  // [Tests] DrawTest: the graphics wing of M4 (draw subscriptions, a draw companion, a pass after)
+void register_with(const rg_host* host, bool on);
+}  // namespace draw_test
+
 }  // namespace selftest

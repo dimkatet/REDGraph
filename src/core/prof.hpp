@@ -25,6 +25,7 @@ enum Point : uint8_t {
   kRays,       // rt_lib: DispatchRays (variant choice)
   kGsgi,       // rt_lib: GetShaderGroupIdentifier
   kEngineBlock,// cb_hooks: the engine constant-block copies (UpdateBuffer / SetComputeShaderConstsRaw)
+  kDraw,       // passes: around every GpuApi draw (draw subscriptions, draw companions, passes after a draw)
   kPoints
 };
 
