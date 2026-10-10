@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1
 
 - A GPU crash is now written to the log (the reason and, with `Dred = true`, where on the GPU) before the game
   closes - before, the game closed first and the log said nothing.
