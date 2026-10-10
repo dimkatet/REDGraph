@@ -72,7 +72,11 @@ native part out (for a bisect).
 * **A handle belongs to the module that made it.** `clients.cpp` records the owner of every handle (the module the
   registering call returned to) and each client's image range; every entry that takes a handle - the registering
   wrappers and the `[hot]` ones (`h_*` in `host.cpp`: a scan of the client ranges, no lock) - refuses another
-  module's with `RG_E_FOREIGN`, logged. The `*_stats` calls are read-only and take any handle.
+  module's with `RG_E_FOREIGN`, logged. The `*_stats` calls are read-only and take any handle. A client's call in
+  TAIL position returns straight into the host, so its return address names the host: while the host runs client
+  code on a thread (a waiting init, and since 2026-10-10 every callback - subscription, pass, node / wrap fn,
+  device_ready; `clients::Running`) such a call is that code's module's. Before that, a tail-called
+  `pass_after_dispatch` from a subscription was refused as "an unknown module".
 * **Clients share resources only through the engine's graph, by name.** A `node_alloc` transient is PUBLISHED under
   `"<mod>/<name>"` (one publisher per name); another client reads it with `flow_register(name, 0)` + `node_use`, and
   the engine owns its lifetime, barriers and frame order - the host brokers no raw D3D12 objects between clients. A
@@ -138,7 +142,10 @@ dispatch) copies every dirty table into the engine's shader-visible ring and set
 when the bound shader is one of the lease's owners, and gives the engine's handle back at the next other draw.
 
 The register inventory comes from the engine's root-signature DEFINITION (`fr+0x68`): per stage, CBV b0-b13, SRV
-t0-t127, UAV u0-u18 in space0; a byte map gives each register's bucket, `0xff` = not covered. A lease is granted only if:
+t0-t127, UAV u0-u18 in space0; a byte map gives each register's bucket, `0xff` = not covered. What it COVERS (logged
+once, `native table: XS covers`; 2.31, 2026-10-10): VS / PS b0-b13 t0-t126 u0-u18, CS b0-b13 **t0-t92** u0-u18. A CS
+register past t92 is not even in the root signature: a companion reading it fails to build (`E_INVALIDARG`) - the first
+LeaseTexTest run leased t120 and lost its companion that way. A lease is granted only if:
 
 | check | when | failure |
 |---|---|---|
@@ -157,9 +164,25 @@ stages a NULL descriptor. Hence **one RT lease per register in the process** - a
 **Companions' leases** stage at every dispatch of the engine shader they accompany (inert for the vanilla shader);
 `companion_request` is accepted only when the descriptors sit in that dispatch's table.
 
-What a lease binds today: a host cbuffer (`cbuffer_create` / `_write` / `_feed`, a ring on the engine's device; UPLOAD,
-or GPU_UPLOAD when available) or a view of a client-owned **buffer** (`view_create` / `view_set_resource`). Textures:
-see [Known gaps](#known-gaps).
+What a lease binds: a host cbuffer (`cbuffer_create` / `_write` / `_feed`, a ring on the engine's device; UPLOAD, or
+GPU_UPLOAD when available), a view of a client-owned **buffer** (`view_create` / `view_set_resource`), or - since
+2026-10-10 - a **texture** view (`view_create_texture`): of a client-owned texture, or of an ENGINE RenderFlow texture
+by name (`desc.flow`). Every owner must declare the register as the view's kind - the `PSV0` entry's `ResKind` (16 ->
+24-byte entries, PSV version 2+; the game's blobs and ours carry it) or the `RDAT` resource record's `kind`, both the
+DXIL `ResourceKind`; `rg_tex_dim` uses the same numbers. Checked at registration; a blob without the field is accepted.
+A texture view keeps a NULL descriptor of its own dimension after its ring - what an RT lease stages while the source
+is not there (the shared NULLs are raw buffers).
+
+**A flow source** has no resource to set: at the stage, inside `UpdateRootParams` on the recording thread, the host
+resolves the name exactly as `flow_texture` does (the node context of that thread) and writes a view of what it finds
+into the next ring slot - once per (resource, engine id, frame): a transient is a new resource every frame and its
+address can come back for another. A slot is overwritten only when the ring comes round, long after the engine copied
+it into its shader-visible table (the copy happens in the same `UpdateRootParams`). Not resolved (outside a node, not
+alive at that point) = not staged: the patch keeps the engine's shader for that draw, the companion is not dispatched,
+an RT lease stages the view's NULL. The engine does not know the shader reads it - no lifetime extension, no barrier:
+the client scopes the owners to nodes where it is alive and puts it in a readable state (`flow_transition` in a
+`node_wrap` before) unless the engine's own use already leaves it so. A resolved texture that does not fit the view
+(dimension, samples, a TYPELESS format with none named) is logged once and the view never stages again.
 
 ## RT libraries (M3)
 
@@ -425,6 +448,7 @@ under `__try`: the engine's crash handler freezes the game on any first-chance A
 | `RtSwapTest = 1` | M3 swap: 318cee44 WHOLE, `rgs_shadow_main` "lit" in place (no variant: swapped in the subobject list) | `rt swap test ... swapped N ... PASS` every 600 GlobalShadow runs; on screen: RT sun shadows gone for the session (switch off a client's variant of that raygen, e.g. CRT's grass shadow) |
 | `RtVariantTest = 1` / `2` | M12: 318cee44 + `rgtest_rgs_shadow_lit` (RT sun shadows "lit"), live in GlobalShadow / scoped to a foreign node; a duplicate variant name refused | `rt variant test ... swapped` grows (1: shadows vanish every other 10 s) / `out_of_scope` grows (2) |
 | `PatchScopeTest = 1` / `2` | M11: the game's own PS 0c359133 swapped for itself, scoped inside / outside its node | `scope test ... swaps` / `out_of_scope` grow |
+| `LeaseTexTest = true` | M2 texture sources: a companion of the tonemapping-LUT CS 88c57ef1 (scoped to `CRenderNode_GenerateTonemappingLUT`, after the frame's third dispatch) reads our 4x4x2 R32_UINT texture through a 2D_ARRAY view of slice 1 (t64) and the engine's LUT `2ae9f45c` by name through a 3D UAV view (u16) into our raw buffer (u17); the registration checks (a raw view at a Texture2DArray refused, a cube UAV refused, a buffer into a texture view / a resource into a flow view refused) | `lease tex test: registered`, `views set`, then every 300 frames `lease tex test #N ... client texture 16/16 = slice 1 ... LUT texels 2/2 equal to the copy ... PASS`. Nothing on screen |
 
 RtVariantTest, RtSwapTest and PatchScopeTest need game bytecode, which this repository does not carry: CMake builds it from the
 installed game (`scripts/make_selftest_blobs.py`, `RG_GAME_DIR` + `RG_DXC_DIR`). Without them those tests are
@@ -460,10 +484,13 @@ validates an item; it does not set the order.
    drive, 32 left mapped; no `duplicate`): the engine
    frees PSOs (`GpuApi::Destroy(ShaderRef)` -> `PSOSubCache::ShaderDestroyed`, material streaming); the host now holds
    a reference on every engine PSO it maps and drops entries the engine released every 64 frames (`pso_patch.cpp`
-   `sweep_locked`; clones released one sweep later). 1. **Lease sources: textures.** `view_create` makes buffer views only (`D3D12_SRV/UAV_DIMENSION_BUFFER` in
-   `bindings.cpp`); a texture needs a dimension (the NULL descriptor must match the shader's). And an engine texture
-   found BY NAME (M5) cannot be a lease's source - a patched shader cannot read a RenderFlow texture the vanilla one
-   does not.
+   `sweep_locked`; clones released one sweep later).
+1. ~~**Lease sources: textures.**~~ DONE 2026-10-10, hardware-confirmed 20:25 (`LeaseTexTest` 19/19 PASS: client
+   texture 16/16 = slice 1, LUT texels 2/2 = the copy incl. across a scene change, flow hits 16569 misses 0): `view_create_texture`
+   - a client texture or an engine one by name (`desc.flow`, resolved per stage), a NULL of the view's dimension, and
+   the owners' declared ResourceKind checked against the view at registration (buffers too: raw vs structured). Left
+   open: a flow source declares nothing to the engine (gap 6, `node_wrap` + `node_use`) - its lifetime and state are
+   the client's.
 2. **Several clients' patches on one PSO.** One patched stage per engine PSO: a client's VS patch and another's PS
    patch of the same PSO conflict (the second loses). A clone with both stages (variants: the product) would compose.
 3. **PSO desc edits beyond bytecode.** A clone changes one stage's bytecode only - no rasterizer (cull mode), depth,

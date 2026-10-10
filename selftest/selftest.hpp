@@ -23,4 +23,8 @@ namespace scope_test {  // [Tests] PatchScopeTest 1 / 2: M11 (the game's own 0c3
 void register_with(const rg_host* host, int mode);
 }  // namespace scope_test
 
+namespace lease_tex_test {  // [Tests] LeaseTexTest: M2 texture sources (a client texture, an engine one by name)
+void register_with(const rg_host* host, bool on);
+}  // namespace lease_tex_test
+
 }  // namespace selftest

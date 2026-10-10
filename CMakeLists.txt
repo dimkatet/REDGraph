@@ -116,7 +116,9 @@ if(RG_BUILD_SELFTEST)
     selftest/rt_variant_test.cpp
     selftest/rt_swap_test.cpp
     selftest/scope_test.cpp
+    selftest/lease_tex_test.cpp
     selftest/sky_paint_shader.hpp
+    selftest/lease_tex_shader.hpp
   )
   target_compile_features(redgraph_selftest PRIVATE cxx_std_20)
   target_compile_definitions(redgraph_selftest PRIVATE ${rg_common_defs})

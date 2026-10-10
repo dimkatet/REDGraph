@@ -214,6 +214,19 @@ __declspec(noinline) rg_handle w_view_create(uint32_t kind, uint32_t stride, uin
   return r;
 }
 
+__declspec(noinline) rg_handle w_view_create_texture(uint32_t kind, const rg_texture_view_desc* d, uint32_t ring) {
+  rg_handle r = d && d->flow > 0 ? clients::owner_check(_ReturnAddress(), clients::sFlow, d->flow, "view_create_texture")
+                                 : 0;
+  if (!r) r = bindings::view_create_texture(kind, d, ring);
+  char t[96] = "";
+  if (d)
+    std::snprintf(t, sizeof t, "%s texture (dim %u, format %u), ring %u%s%s", kind == RG_KIND_UAV ? "UAV" : "SRV",
+                  d->dimension, d->format, ring, d->flow > 0 ? ", of " : "",
+                  d->flow > 0 ? clients::name_of(clients::kFlow, d->flow).c_str() : "");
+  clients::note(_ReturnAddress(), clients::kView, r, 0, nullptr, t);
+  return r;
+}
+
 __declspec(noinline) rg_handle w_rtlib_register(const char* name, const uint8_t* hash16, rg_blob lib,
                                                  int32_t priority) {
   const rg_handle r = rtlib::add(name, hash16, lib, priority);
@@ -376,6 +389,7 @@ const rg_host kHost = {
     &rtlib::variant_stats,
     &w_companion_scope,
     &rtlib::stats,
+    &w_view_create_texture,
 };
 
 }  // namespace
@@ -397,7 +411,10 @@ void fire_device_ready() {
     return;
   }
   g_sdk->logger->InfoF(g_handle, "host: device %p ready at the engine's first PSO - %u device_ready callback(s)", dev, n);
-  for (uint32_t i = 0; i < n; ++i) g_device_fns[i].fn(g_device_fns[i].user, dev);
+  for (uint32_t i = 0; i < n; ++i) {
+    clients::Running running(reinterpret_cast<const void*>(g_device_fns[i].fn));
+    g_device_fns[i].fn(g_device_fns[i].user, dev);
+  }
 }
 
 bool attach_hook(uintptr_t rva, uintptr_t ret_rva, void* detour, void** orig, const char* what) {

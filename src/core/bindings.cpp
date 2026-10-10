@@ -15,7 +15,13 @@
 // (checked at the first UpdateRootParams - failure: never staged, the patch never swaps, the companion never runs).
 // Leases on the same register of DIFFERENT shaders share one slot group: staging is per draw, so they never meet.
 //
-// What a lease binds: a host cbuffer (CBV) or a VIEW of a client-owned buffer (SRV / UAV / CBV, view_set_resource).
+// What a lease binds: a host cbuffer (CBV) or a VIEW - of a client-owned buffer (SRV / UAV / CBV, view_set_resource),
+// of a client-owned texture (SRV / UAV, view_create_texture + view_set_resource), or of an ENGINE RenderFlow texture by
+// name (view_create_texture with a flow handle): that one is resolved at every stage on the recording thread (M5's
+// flow_texture) and a descriptor written into the view's ring once per resource per frame; not resolved = not staged.
+// Every owner must DECLARE the register as the view's kind (PSV0 / RDAT ResourceKind) - a raw view for a
+// ByteAddressBuffer, a Texture2DArray view for a Texture2DArray - checked at registration. A texture view has a NULL
+// descriptor of its own dimension after its ring (what an RT lease stages while its source is not there).
 //
 // RT leases (owners = RT libraries, 2026-10-06): UpdateRootParams with rays = 1 (GpuApi::DispatchRays) clears the VS / PS
 // "bound" flags and forces the CS one (0x141e3d3ae: r14b = 1), so the CS tables are what the raygens get. A DispatchRays
@@ -94,17 +100,26 @@ struct Cb {
 Cb g_cb[kMaxCb];
 std::atomic<uint32_t> g_ncb{0};
 
-// ---- views of client-owned buffers (SRV / UAV) ----
-constexpr uint32_t kMaxViews = 8;
+// ---- views: of client-owned buffers / textures, or of an engine RenderFlow texture (flow) ----
+constexpr uint32_t kMaxViews = 16;
 constexpr uint32_t kMaxViewRing = 8;
 struct View {
   uint32_t kind = 0, stride = 0, ring = 0;
   uint32_t first = 0;
   std::atomic<uint32_t> cur{0};
-  std::atomic<bool> valid{false};  // a descriptor of a live resource sits at `cur`
+  std::atomic<bool> valid{false};  // a descriptor of a live resource sits at `cur` (a flow view: the heap is built)
   ID3D12Resource* res = nullptr;   // AddRef'd
   uint64_t bytes = 0;
   uint32_t written = 0;  // descriptors written so far (the first goes to slot 0)
+  bool tex = false;      // a texture view: `td`, and a NULL descriptor of its dimension at first + ring
+  rg_texture_view_desc td{};
+  // A flow view: the resource (and its engine id) the descriptor at `cur` was written for, and in which frame -
+  // a transient is a new resource every frame, and an address may come back for another one.
+  SRWLOCK flock = SRWLOCK_INIT;
+  void* fres = nullptr;
+  uint32_t fid = 0;
+  uint64_t fframe = ~0ull;
+  std::atomic<uint32_t> fbad{0};  // the resolved texture does not fit the view (logged once) - never staged again
 };
 View g_view[kMaxViews];
 std::atomic<uint32_t> g_nview{0};
@@ -165,10 +180,21 @@ struct LeaseOfInit {
   }
 } g_lease_of_init;
 
-// The source a lease binds: its current descriptor, whether a handle is one of its ring, whether it is usable.
+std::atomic<uint64_t> g_frame{0};  // frame_tick()
+
+uint64_t flow_handle(View& v, uint32_t vi);
+
+// The source a lease binds: the descriptor to stage now (0 = none: a flow texture not resolved here), whether a handle
+// is one of its ring, whether it is usable at all, the NULL descriptor an RT lease stages instead.
 uint64_t src_handle(const Lease& l) {
   if (l.cb >= 0) return handle_at(g_cb[l.cb].first + g_cb[l.cb].cur.load(std::memory_order_acquire));
-  return handle_at(g_view[l.view].first + g_view[l.view].cur.load(std::memory_order_acquire));
+  View& v = g_view[l.view];
+  if (v.td.flow > 0) return flow_handle(v, static_cast<uint32_t>(l.view));
+  return handle_at(v.first + v.cur.load(std::memory_order_acquire));
+}
+uint64_t null_handle(const Lease& l) {
+  if (l.view >= 0 && g_view[l.view].tex) return handle_at(g_view[l.view].first + g_view[l.view].ring);
+  return handle_at(g_null_first + l.kind);
 }
 bool src_owns(const Lease& l, uint64_t h) {
   return l.cb >= 0 ? in_ring(h, g_cb[l.cb].first, g_cb[l.cb].ring) : in_ring(h, g_view[l.view].first, g_view[l.view].ring);
@@ -287,11 +313,39 @@ void restore(uint8_t* fr, uint32_t gi, int32_t idx) {
   g.restores.fetch_add(1, std::memory_order_relaxed);
 }
 
+// Once, at the first UpdateRootParams with a definition: which space0 registers the engine's tables cover, per stage
+// and kind - what a lease can take (the header's b0-b13 / t0-t127 / u0-u18 is the definition's SIZE, not its coverage).
+std::atomic<bool> g_coverage_logged{false};
+void log_coverage(const uint8_t* fr) {
+  const auto* def = *reinterpret_cast<const uint8_t* const*>(fr + kFrDef);
+  if (!def || g_coverage_logged.exchange(true)) return;
+  for (uint32_t stage = 0; stage < 3; ++stage) {
+    char line[400];
+    int n = std::snprintf(line, sizeof line, "native table: %s covers", stage_name(stage));
+    for (uint32_t kind = 0; kind < 3; ++kind) {
+      const KindInfo& k = kKinds[kind];
+      for (uint32_t r = 0; r < k.regs && n < static_cast<int>(sizeof line) - 24;) {
+        if (def[k.map + stage * k.stride + r * 2] == 0xff) {
+          ++r;
+          continue;
+        }
+        uint32_t e = r;
+        while (e + 1 < k.regs && def[k.map + stage * k.stride + (e + 1) * 2] != 0xff) ++e;
+        n += e == r ? std::snprintf(line + n, sizeof line - n, " %c%u", k.letter, r)
+                    : std::snprintf(line + n, sizeof line - n, " %c%u-%c%u", k.letter, r, k.letter, e);
+        r = e + 1;
+      }
+    }
+    g_sdk->logger->Info(g_handle, line);
+  }
+}
+
 // Before the engine's own UpdateRootParams: the dirty bit BindDescriptor sets makes THIS call copy our handle.
 uint64_t d_update_root_params(void* fr_v, void* ctx_v, uint8_t rays) {
   prof::Scope prof_scope(prof::kUrp);
   if (g_ready.load(std::memory_order_relaxed) && fr_v && ctx_v) {
     auto* fr = static_cast<uint8_t*>(fr_v);
+    if (!g_coverage_logged.load(std::memory_order_relaxed)) log_coverage(fr);
     const auto* ctx = static_cast<const uint8_t*>(ctx_v);
     const uint64_t baked = rays ? rtlib::baked_mask() : 0;
     for (uint32_t gi = 0; gi < g_ngroups; ++gi) {
@@ -333,12 +387,12 @@ uint64_t d_update_root_params(void* fr_v, void* ctx_v, uint8_t rays) {
                                   letter(g.kind), g.reg, p);
           continue;
         }
-        if (src_valid(*hit)) {
-          stage(fr, gi, idx, *hit, src_handle(*hit));
-        } else {
+        uint64_t h = src_valid(*hit) ? src_handle(*hit) : 0;
+        if (!h) {
           hit->null_stages.fetch_add(1, std::memory_order_relaxed);
-          stage(fr, gi, idx, *hit, handle_at(g_null_first + g.kind));
+          h = null_handle(*hit);
         }
+        stage(fr, gi, idx, *hit, h);
         continue;
       }
       const uint32_t ref = *reinterpret_cast<const uint32_t*>(ctx + stage_ref_offset(g.stage));
@@ -347,8 +401,9 @@ uint64_t d_update_root_params(void* fr_v, void* ctx_v, uint8_t rays) {
           Lease& l = g_leases[g.leases[k]];
           if (is_ref(l, ref) && lease_enabled(l) && src_valid(l)) hit = &l;
         }
-      if (hit)
-        stage(fr, gi, idx, *hit, src_handle(*hit));
+      const uint64_t h = hit ? src_handle(*hit) : 0;
+      if (h)
+        stage(fr, gi, idx, *hit, h);
       else
         restore(fr, gi, idx);
     }
@@ -357,9 +412,203 @@ uint64_t d_update_root_params(void* fr_v, void* ctx_v, uint8_t rays) {
   return g_orig_urp(fr_v, ctx_v, rays);
 }
 
+const char* dim_name(uint32_t d) {
+  static const char* const k[] = {"?", "1D", "2D", "2DMS", "3D", "CUBE", "1D_ARRAY", "2D_ARRAY", "2DMS_ARRAY",
+                                  "CUBE_ARRAY", "typed buffer", "raw buffer", "structured buffer", "cbuffer"};
+  return d < sizeof(k) / sizeof(k[0]) ? k[d] : "?";
+}
+
+bool typeless(DXGI_FORMAT f) {
+  switch (f) {
+    case DXGI_FORMAT_UNKNOWN:
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+    case DXGI_FORMAT_R32G32B32_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R32G32_TYPELESS:
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R16G16_TYPELESS:
+    case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_R8G8_TYPELESS:
+    case DXGI_FORMAT_R16_TYPELESS:
+    case DXGI_FORMAT_R8_TYPELESS:
+    case DXGI_FORMAT_BC1_TYPELESS:
+    case DXGI_FORMAT_BC2_TYPELESS:
+    case DXGI_FORMAT_BC3_TYPELESS:
+    case DXGI_FORMAT_BC4_TYPELESS:
+    case DXGI_FORMAT_BC5_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+    case DXGI_FORMAT_BC6H_TYPELESS:
+    case DXGI_FORMAT_BC7_TYPELESS:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Does texture `r` fit texture view `v`? false + why.
+bool tex_fits(const View& v, const D3D12_RESOURCE_DESC& r, char* why, size_t n) {
+  const uint32_t d = v.td.dimension;
+  const D3D12_RESOURCE_DIMENSION want = (d == RG_TEX_1D || d == RG_TEX_1D_ARRAY) ? D3D12_RESOURCE_DIMENSION_TEXTURE1D
+                                        : d == RG_TEX_3D                         ? D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                                                                                 : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  const bool ms = d == RG_TEX_2DMS || d == RG_TEX_2DMS_ARRAY;
+  const uint32_t mips = r.MipLevels ? r.MipLevels : 1u;
+  const uint32_t slices = d == RG_TEX_3D ? (r.DepthOrArraySize >> (v.td.mip < 16 ? v.td.mip : 15)) : r.DepthOrArraySize;
+  const char* bad = nullptr;
+  if (r.Dimension != want)
+    bad = "its D3D12 dimension does not fit";
+  else if (ms != (r.SampleDesc.Count > 1))
+    bad = ms ? "it is not multisampled" : "it is multisampled";
+  else if ((d == RG_TEX_CUBE || d == RG_TEX_CUBE_ARRAY) && r.DepthOrArraySize % 6)
+    bad = "its array size is not a multiple of 6";
+  else if (!ms && v.td.mip >= mips)
+    bad = "it has no such mip";
+  else if (v.td.first_slice && v.td.first_slice >= slices)
+    bad = "it has no such slice";
+  else if (!v.td.format && typeless(r.Format))
+    bad = "its format is TYPELESS and the view names none";
+  if (!bad) return true;
+  std::snprintf(why, n, "%s (%s view of a %llux%ux%u texture, %u mip(s), %u sample(s), DXGI format %u)", bad,
+                dim_name(d), static_cast<unsigned long long>(r.Width), r.Height, r.DepthOrArraySize, mips,
+                r.SampleDesc.Count, static_cast<unsigned>(r.Format));
+  return false;
+}
+
+// A texture view's descriptor of `res` (nullptr: the NULL descriptor of its dimension) at `handle`.
+void write_tex(const View& v, ID3D12Resource* res, uint64_t handle) {
+  const D3D12_CPU_DESCRIPTOR_HANDLE h{static_cast<SIZE_T>(handle)};
+  const rg_texture_view_desc& t = v.td;
+  D3D12_RESOURCE_DESC r{};
+  if (res) r = res->GetDesc();
+  const DXGI_FORMAT fmt = t.format ? static_cast<DXGI_FORMAT>(t.format)
+                          : res    ? r.Format
+                                   : DXGI_FORMAT_R8G8B8A8_UNORM;  // a NULL descriptor reads 0 whatever its format
+  const uint32_t slices = res ? r.DepthOrArraySize : 1u;
+  const uint32_t rest = slices > t.first_slice ? slices - t.first_slice : 1u;
+  const UINT count = t.slice_count ? t.slice_count : rest;
+  if (v.kind == RG_KIND_UAV) {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
+    d.Format = fmt;
+    switch (t.dimension) {
+      case RG_TEX_1D:
+        d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+        d.Texture1D.MipSlice = t.mip;
+        break;
+      case RG_TEX_1D_ARRAY:
+        d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+        d.Texture1DArray = {t.mip, t.first_slice, count};
+        break;
+      case RG_TEX_2D:
+        d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        d.Texture2D = {t.mip, t.plane};
+        break;
+      case RG_TEX_2D_ARRAY:
+        d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+        d.Texture2DArray = {t.mip, t.first_slice, count, t.plane};
+        break;
+      default:  // RG_TEX_3D (view_create_texture admits no other UAV dimension)
+        d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        d.Texture3D = {t.mip, t.first_slice, t.slice_count ? t.slice_count : UINT(-1)};
+        break;
+    }
+    g_dev->CreateUnorderedAccessView(res, nullptr, &d, h);
+    return;
+  }
+  D3D12_SHADER_RESOURCE_VIEW_DESC d{};
+  d.Format = fmt;
+  d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  const UINT mips = t.mip_count ? t.mip_count : UINT(-1);
+  switch (t.dimension) {
+    case RG_TEX_1D:
+      d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+      d.Texture1D = {t.mip, mips, 0.f};
+      break;
+    case RG_TEX_1D_ARRAY:
+      d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+      d.Texture1DArray = {t.mip, mips, t.first_slice, count, 0.f};
+      break;
+    case RG_TEX_2D:
+      d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      d.Texture2D = {t.mip, mips, t.plane, 0.f};
+      break;
+    case RG_TEX_2D_ARRAY:
+      d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+      d.Texture2DArray = {t.mip, mips, t.first_slice, count, t.plane, 0.f};
+      break;
+    case RG_TEX_2DMS:
+      d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+      break;
+    case RG_TEX_2DMS_ARRAY:
+      d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+      d.Texture2DMSArray = {t.first_slice, count};
+      break;
+    case RG_TEX_3D:
+      d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+      d.Texture3D = {t.mip, mips, 0.f};
+      break;
+    case RG_TEX_CUBE:
+      d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+      d.TextureCube = {t.mip, mips, 0.f};
+      break;
+    default:  // RG_TEX_CUBE_ARRAY
+      d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+      d.TextureCubeArray = {t.mip, mips, t.first_slice, t.slice_count ? t.slice_count : rest / 6, 0.f};
+      break;
+  }
+  g_dev->CreateShaderResourceView(res, &d, h);
+}
+
+// A flow view's descriptor for the texture its name resolves to on this recording thread now, 0 = none. Written into
+// the next ring slot when the resource (or the frame) differs from the last one written: the slot a context staged
+// before is overwritten only when the ring comes round, long after the engine copied it into its own table.
+uint64_t flow_handle(View& v, uint32_t vi) {
+  if (v.fbad.load(std::memory_order_relaxed)) return 0;
+  uint32_t id = 0;
+  auto* res = static_cast<ID3D12Resource*>(render_flow::flow_texture(v.td.flow, &id));
+  if (!res) return 0;
+  const uint64_t frame = g_frame.load(std::memory_order_relaxed);
+  AcquireSRWLockShared(&v.flock);
+  bool same = v.fres == res && v.fid == id && v.fframe == frame;
+  uint32_t cur = v.cur.load(std::memory_order_relaxed);
+  ReleaseSRWLockShared(&v.flock);
+  if (same) return handle_at(v.first + cur);
+  AcquireSRWLockExclusive(&v.flock);
+  same = v.fres == res && v.fid == id && v.fframe == frame;
+  cur = v.cur.load(std::memory_order_relaxed);
+  if (!same) {
+    char why[200];
+    if ((v.fres != res || v.fid != id) && !tex_fits(v, res->GetDesc(), why, sizeof why)) {
+      if (v.fbad.exchange(1) == 0)
+        g_sdk->logger->ErrorF(g_handle, "native table: view #%u - the engine texture it names does not fit: %s; its "
+                              "leases never stage again", vi + 1, why);
+      ReleaseSRWLockExclusive(&v.flock);
+      return 0;
+    }
+    cur = v.written ? (cur + 1) % v.ring : 0;
+    write_tex(v, res, handle_at(v.first + cur));
+    if (v.written++ == 0)
+      g_sdk->logger->InfoF(g_handle, "native table: view #%u first resolved - engine texture id %u (%p), %s %s", vi + 1,
+                           id, static_cast<void*>(res), dim_name(v.td.dimension), v.kind == RG_KIND_UAV ? "UAV" : "SRV");
+    v.fres = res;
+    v.fid = id;
+    v.fframe = frame;
+    v.cur.store(cur, std::memory_order_release);
+  }
+  ReleaseSRWLockExclusive(&v.flock);
+  return handle_at(v.first + cur);
+}
+
 // One view descriptor into ring slot `slot` (heap built, g_view_lock held).
 bool write_view(View& v, uint32_t slot) {
   const D3D12_CPU_DESCRIPTOR_HANDLE h{static_cast<SIZE_T>(handle_at(v.first + slot))};
+  if (v.tex) {  // view_set_resource checked that it fits
+    write_tex(v, v.res, h.ptr);
+    return true;
+  }
   if (v.kind == RG_KIND_CBV) {  // view_set_resource checked: 256-aligned size within the buffer, <= 64 KB
     const D3D12_CONSTANT_BUFFER_VIEW_DESC cv{v.res->GetGPUVirtualAddress(), static_cast<UINT>((v.bytes + 255) & ~255ull)};
     g_dev->CreateConstantBufferView(&cv, h);
@@ -401,7 +650,10 @@ void publish_view(View& v, uint32_t vi) {
   ++v.written;
   v.cur.store(next, std::memory_order_release);
   v.valid.store(true, std::memory_order_release);
-  if (v.written == 1)
+  if (v.written == 1 && v.tex)
+    g_sdk->logger->InfoF(g_handle, "native table: view #%u ready - %s %s of texture %p", vi + 1, dim_name(v.td.dimension),
+                         v.kind == RG_KIND_UAV ? "UAV" : "SRV", static_cast<void*>(v.res));
+  else if (v.written == 1)
     g_sdk->logger->InfoF(g_handle, "native table: view #%u ready - %s of %p, %llu bytes, %s", vi + 1,
                          v.kind == RG_KIND_UAV ? "UAV" : v.kind == RG_KIND_CBV ? "CBV" : "SRV", static_cast<void*>(v.res),
                          static_cast<unsigned long long>(v.bytes), v.stride ? "structured" : "raw");
@@ -457,7 +709,7 @@ void build() {
   }
   for (uint32_t i = 0; i < nview; ++i) {
     g_view[i].first = total;
-    total += g_view[i].ring;
+    total += g_view[i].ring + (g_view[i].tex ? 1u : 0u);  // a texture view: its NULL descriptor after the ring
   }
   g_null_first = total;  // rg_kind order: CBV, SRV, UAV - what an RT lease stages while its source is not ready
   total += 3;
@@ -498,8 +750,14 @@ void build() {
     AcquireSRWLockExclusive(&g_view_lock);
     g_dev = dev;  // keeps the reference: views set later are created on it
     dev = nullptr;
-    for (uint32_t i = 0; i < nview; ++i)
-      if (g_view[i].res) publish_view(g_view[i], i);
+    for (uint32_t i = 0; i < nview; ++i) {
+      View& v = g_view[i];
+      if (v.tex) write_tex(v, nullptr, handle_at(v.first + v.ring));
+      if (v.td.flow > 0)
+        v.valid.store(true, std::memory_order_release);  // resolved per stage (flow_handle)
+      else if (v.res)
+        publish_view(v, i);
+    }
     g_ready.store(true, std::memory_order_release);
     ReleaseSRWLockExclusive(&g_view_lock);
     g_sdk->logger->InfoF(g_handle, "native table: %u cbuffer(s) + %u view(s) ready - CPU heap %u descriptors, cbuffers "
@@ -537,15 +795,35 @@ void refuse_lease(Lease& l, const char* why) {
 
 // Registration of one owner of a lease being registered: its blobs must read the register, it may not hold it twice.
 // An RT library owner: its library must declare the register (RDAT - a library has no PSV0).
+// The DXIL ResourceKind an owner must declare at the leased register for this source (13 = cbuffer).
+uint32_t want_kind(const rg_lease_desc* d) {
+  if (d->kind == RG_KIND_CBV) return 13;
+  const View& v = g_view[d->view - 1];
+  return v.tex ? v.td.dimension : v.stride ? 12u : 11u;
+}
+
+// A declaration of another kind than the source: refused, logged. rk 0 = the blob does not record it (accepted).
+int32_t kind_mismatch(uint32_t rk, uint32_t want, const char* name, const char* owner, rg_handle h,
+                      const rg_lease_desc* d) {
+  if (!rk || rk == want) return 0;
+  char why[160];
+  std::snprintf(why, sizeof why, "%s #%d declares %c%u as a %s, the lease's source is a %s", owner, h, letter(d->kind),
+                d->reg, dim_name(rk), dim_name(want));
+  g_sdk->logger->ErrorF(g_handle, "host: lease '%s' REFUSED - %s", name, why);
+  clients::reason(why);
+  return RG_E_BLOB;
+}
+
 int32_t check_rt_owner(rg_handle h, const rg_lease_desc* d, const char* name) {
   rg_blob lib{};
   if (h <= 0 || h > 64 || d->stage != RG_STAGE_CS || !rtlib::info(h, &lib)) return RG_E_ARG;
-  if (dxbc::lib_binds(lib.bytes, lib.size, d->kind, 0, d->reg) != dxbc::Bound::kYes) {
+  uint32_t rk = 0;
+  if (dxbc::lib_binds(lib.bytes, lib.size, d->kind, 0, d->reg, &rk) != dxbc::Bound::kYes) {
     g_sdk->logger->ErrorF(g_handle, "host: lease '%s' REFUSED - RT library #%d does not declare %c%u (space0)", name, h,
                           letter(d->kind), d->reg);
     return RG_E_BLOB;
   }
-  return 0;
+  return kind_mismatch(rk, want_kind(d), name, "RT library", h, d);
 }
 
 int32_t check_owner(bool comp, rg_handle h, const rg_lease_desc* d, const char* name) {
@@ -568,13 +846,16 @@ int32_t check_owner(bool comp, rg_handle h, const rg_lease_desc* d, const char* 
     if (o.stage == d->stage && o.kind == d->kind && o.reg == d->reg) return RG_E_TAKEN;  // that register, twice
   }
   if (held == kMaxLeasesPerOwner) return RG_E_FULL;
-  for (uint32_t k = 0; k < count; ++k)
-    if (dxbc::binds(v[k].bytes, v[k].size, d->kind, 0, d->reg) != dxbc::Bound::kYes) {
+  for (uint32_t k = 0; k < count; ++k) {
+    uint32_t rk = 0;
+    if (dxbc::binds(v[k].bytes, v[k].size, d->kind, 0, d->reg, &rk) != dxbc::Bound::kYes) {
       g_sdk->logger->ErrorF(g_handle, "host: lease '%s' REFUSED - %s #%d%s does not read %s %c%u (space0)", name,
                             comp ? "companion" : "patch", h, comp ? "" : " (a variant)", stage_name(d->stage),
                             letter(d->kind), d->reg);
       return RG_E_BLOB;
     }
+    if (const int32_t e = kind_mismatch(rk, want_kind(d), name, comp ? "companion" : "patch", h, d)) return e;
+  }
   return 0;
 }
 
@@ -665,13 +946,45 @@ rg_handle view_create(uint32_t kind, uint32_t stride, uint32_t ring) {
   return static_cast<rg_handle>(n + 1);
 }
 
+rg_handle view_create_texture(uint32_t kind, const rg_texture_view_desc* d, uint32_t ring) {
+  if (!registration_open()) return RG_E_LATE;
+  if (!d || (kind != RG_KIND_SRV && kind != RG_KIND_UAV) || ring == 0 || ring > kMaxViewRing ||
+      d->dimension < RG_TEX_1D || d->dimension > RG_TEX_CUBE_ARRAY || d->flow < 0)
+    return RG_E_ARG;
+  if (kind == RG_KIND_UAV && d->dimension != RG_TEX_1D && d->dimension != RG_TEX_1D_ARRAY &&
+      d->dimension != RG_TEX_2D && d->dimension != RG_TEX_2D_ARRAY && d->dimension != RG_TEX_3D) {
+    clients::reason("a UAV texture view is 1D, 1D_ARRAY, 2D, 2D_ARRAY or 3D");
+    return RG_E_ARG;
+  }
+  if (d->flow > 0 && !render_flow::flow_hash(d->flow)) return RG_E_ARG;
+  const uint32_t n = g_nview.load();
+  if (n >= kMaxViews) return RG_E_FULL;
+  View& v = g_view[n];
+  v.kind = kind;
+  v.ring = ring;
+  v.tex = true;
+  v.td = *d;
+  g_nview.store(n + 1, std::memory_order_release);
+  return static_cast<rg_handle>(n + 1);
+}
+
 int32_t view_set_resource(rg_handle h, void* resource, uint64_t bytes) {
   if (h <= 0 || static_cast<uint32_t>(h) > g_nview.load(std::memory_order_acquire)) return RG_E_ARG;
   auto* res = static_cast<ID3D12Resource*>(resource);
   View& v = g_view[h - 1];
+  if (v.td.flow > 0) return RG_E_ARG;  // the engine's texture, resolved per stage
+  if (v.tex) {
+    char why[200];
+    if (res && !tex_fits(v, res->GetDesc(), why, sizeof why)) {
+      g_sdk->logger->ErrorF(g_handle, "native table: view #%d - view_set_resource refused: %s", h, why);
+      return RG_E_ARG;
+    }
+    bytes = 0;
+  }
   const uint64_t need = v.kind == RG_KIND_CBV ? (bytes + 255) & ~255ull : bytes;
-  if (res && (bytes == 0 || res->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
-              res->GetDesc().Width < need || (v.kind == RG_KIND_CBV && need > 65536)))
+  if (res && !v.tex &&
+      (bytes == 0 || res->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || res->GetDesc().Width < need ||
+       (v.kind == RG_KIND_CBV && need > 65536)))
     return RG_E_ARG;
   AcquireSRWLockExclusive(&g_view_lock);
   if (res == v.res && bytes == v.bytes) {
@@ -840,6 +1153,8 @@ bool rtlib_may_bake(rg_handle lib) {
 }
 
 bool needed() { return g_nleases.load() != 0; }
+
+void frame_tick() { g_frame.fetch_add(1, std::memory_order_relaxed); }
 
 bool attach() {
   g_bind = reinterpret_cast<BindDescriptor_t>(g_base + kBindDescriptor);

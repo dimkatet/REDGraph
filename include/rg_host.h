@@ -109,14 +109,17 @@ typedef struct rg_patch_stats {
   uint64_t out_of_scope;  /* M11: binds OUTSIDE the patch's node (patch_scope) - the engine's shader stayed */
 } rg_patch_stats;
 
-/* ---- M2: a buffer of ours bound into a register the ENGINE's descriptor tables cover (0 root DWORDs) ----
+/* ---- M2: a buffer or texture of ours bound into a register the ENGINE's descriptor tables cover (0 root DWORDs) ----
  * A lease = (stage, kind, register) in space0, scoped to a set of patches and / or companions. Granted only if every
  * variant of every patch (and every companion's blob) reads exactly that register (checked at register time), the
  * vanilla shader does NOT read it (checked when the engine creates its first PSO - a failure REFUSES the patch /
  * companion: it stays vanilla / is never dispatched), and the engine's root-signature definition covers it (checked
  * at the first bind - a failure leaves the patch vanilla and the companion undispatched).
- * What is bound: a CBV lease takes a cbuffer (rg_host::cbuffer_create) or a CBV view; an SRV / UAV lease takes a view
- * (rg_host::view_create) of a resource the client owns.
+ * What is bound: a CBV lease takes a cbuffer (rg_host::cbuffer_create) or a CBV view; an SRV / UAV lease takes a view -
+ * of a buffer the client owns (rg_host::view_create), or of a texture the client owns or the engine's render graph
+ * holds by name (rg_host::view_create_texture). The view must be what every owner DECLARES at that register (checked
+ * at register time, from the blob's PSV0 / RDAT): a raw view for a ByteAddressBuffer, a structured one for a
+ * StructuredBuffer, a texture view of the declared dimension.
  * For a COMPANION the descriptor is staged at every dispatch of the engine's shader it accompanies (the vanilla shader
  * does not read the register, so it is inert there), and the companion is dispatched only if the descriptor sat in
  * the engine's table for that dispatch.
@@ -131,7 +134,9 @@ typedef struct rg_lease_desc {
   const char* name;
   uint32_t stage;               /* rg_stage */
   uint32_t kind;                /* rg_kind */
-  uint32_t reg;                 /* the register, space0: CBV b0-b13, SRV t0-t127, UAV u0-u18 */
+  uint32_t reg;                 /* the register, space0, as the engine's tables cover it (2.31, logged at the first
+                                   bind as "native table: XS covers"): b0-b13, u0-u18; SRV t0-t126 for VS / PS,
+                                   t0-t92 for CS (and RT) - outside it the owner never runs */
   const rg_handle* patches;   /* a patch / companion may hold several leases (different registers) */
   uint32_t patch_count;
   rg_handle cbuffer;           /* CBV: what is bound there */
@@ -264,6 +269,33 @@ typedef struct rg_flow_desc {
   uint8_t pad[2];
 } rg_flow_desc;
 
+/* ---- M2 (2026-10-10): a TEXTURE view as a lease's source (rg_host::view_create_texture) ----
+ * The dimension = the DXIL ResourceKind the shader declares (Texture2D -> RG_TEX_2D, RWTexture3D -> RG_TEX_3D ...):
+ * lease_register refuses an owner whose declaration of the register is another kind. UAV: 1D, 1D_ARRAY, 2D, 2D_ARRAY,
+ * 3D only. */
+enum rg_tex_dim {
+  RG_TEX_1D = 1,
+  RG_TEX_2D = 2,
+  RG_TEX_2DMS = 3,
+  RG_TEX_3D = 4,
+  RG_TEX_CUBE = 5,
+  RG_TEX_1D_ARRAY = 6,
+  RG_TEX_2D_ARRAY = 7,
+  RG_TEX_2DMS_ARRAY = 8,
+  RG_TEX_CUBE_ARRAY = 9
+};
+typedef struct rg_texture_view_desc {
+  uint32_t dimension;   /* rg_tex_dim */
+  uint32_t format;      /* DXGI_FORMAT of the view; 0 = the resource's own (which then must not be TYPELESS) */
+  uint32_t mip;         /* SRV: the most detailed mip; UAV: the mip slice */
+  uint32_t mip_count;   /* SRV: 0 = every mip from `mip` on; UAV: unused */
+  uint32_t first_slice; /* arrays: the first slice (a cube array: the first 2D face); 3D UAV: the first W slice */
+  uint32_t slice_count; /* 0 = every slice from first_slice on (a cube array: whole cubes) */
+  uint32_t plane;       /* 2D / 2D_ARRAY: the plane slice */
+  rg_handle flow;       /* 0 = a texture the client owns (view_set_resource); > 0 = an ENGINE RenderFlow texture
+                           (flow_register handle), resolved at every stage - see view_create_texture */
+} rg_texture_view_desc;
+
 /* ---- M10: shader-visible descriptors from the ENGINE's per-frame ring (docs/internals.md "Descriptors") ---- */
 typedef struct rg_descriptors {
   uint64_t cpu;       /* D3D12_CPU_DESCRIPTOR_HANDLE.ptr of the first: write views here (CreateShaderResourceView ...) */
@@ -319,7 +351,8 @@ typedef struct rg_host {
    * first `bytes` rounded up to 256, at most 65536 and within the buffer. view_create at registration (kind
    * RG_KIND_SRV / UAV / CBV; ring = descriptor slots for resource changes, 1..8). NOT READY until view_set_resource - its
    * leases stage nothing until then. view_set_resource may be called at any time, from any thread; the host AddRefs
-   * the resource and releases the previous one; NULL = not ready again. Its state transitions stay the client's. */
+   * the resource and releases the previous one; NULL = not ready again. Its state transitions stay the client's.
+   * A view_create_texture view of a client texture takes the texture here, bytes 0. */
   rg_handle (*view_create)(uint32_t kind, uint32_t stride, uint32_t ring);
   int32_t (*view_set_resource)(rg_handle view, void* d3d12_resource, uint64_t bytes);
 
@@ -448,6 +481,20 @@ typedef struct rg_host {
 
   /* M3 (2026-10-10): where an RT library went (rg_rtlib_stats). [hot] */
   void (*rtlib_stats)(rg_handle lib, rg_rtlib_stats* out);
+
+  /* M2 (2026-10-10): a TEXTURE view for a lease (kind RG_KIND_SRV / UAV; ring = descriptor slots, 1..8). Register-time.
+   * desc->flow = 0: a texture the client owns, set with view_set_resource(view, resource, 0) as for a buffer view - its
+   * D3D12 dimension must fit desc->dimension (a 2DMS / 2DMS_ARRAY one multisampled, the others not; a cube's array a
+   * multiple of 6), its state transitions stay the client's.
+   * desc->flow > 0: an ENGINE texture by name (flow_register; your handle). Nothing to set: at every draw / dispatch a
+   * lease of it stages for, the host resolves it on the recording thread exactly as flow_texture would and writes a view
+   * of what it finds (once per resource per frame). Where it does not resolve - outside a node, or not alive at that
+   * point of the frame - the lease does not stage: the patch stays vanilla for that draw, the companion is not
+   * dispatched, an RT lease stages a NULL descriptor of the view's dimension (reads 0). The engine knows nothing of the
+   * read: scope the lease's owners (patch_scope / companion_scope) to nodes where the texture is alive, and put it in
+   * a state your shader may read it in (flow_transition in a node_wrap `before`) unless the engine already left it so.
+   * view_set_resource on such a view is RG_E_ARG. */
+  rg_handle (*view_create_texture)(uint32_t kind, const rg_texture_view_desc* desc, uint32_t ring);
 } rg_host;
 
 RG_HOST_EXPORT const rg_host* rg_host_get(uint32_t version);

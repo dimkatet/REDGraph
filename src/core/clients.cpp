@@ -47,7 +47,7 @@ uint32_t g_nclients = 0;
 Entry g_entries[kMaxEntries];
 uint32_t g_nentries = 0;
 uint32_t g_dropped = 0;
-thread_local const void* t_init = nullptr;
+thread_local const void* t_init = nullptr;  // the client code the host runs on this thread (init / callback)
 thread_local char t_why[120] = "";
 
 // Ownership: the owner of every handle (client index + 1, 0 = none) and each client's module image, readable without
@@ -140,7 +140,7 @@ Space space_of(Kind k) {
 // Caller holds g_mu. Which client a call returning to `ret` belongs to.
 int32_t caller(const void* ret) {
   HMODULE m = module_of(ret);
-  if (m == self_module() && t_init) m = module_of(t_init);  // a tail call out of a waiting client's init
+  if (m == self_module() && t_init) m = module_of(t_init);  // a tail call out of client code (init / callback)
   return client_of(m);
 }
 
@@ -297,6 +297,9 @@ void skipped(const void* fn, uint32_t api_version) {
 
 void running_init(const void* fn) { t_init = fn; }
 
+Running::Running(const void* fn) : prev(t_init) { t_init = fn; }
+Running::~Running() { t_init = prev; }
+
 void note(const void* ret_addr, Kind kind, int32_t result, rg_handle parent, const char* name, const char* target) {
   std::lock_guard<std::mutex> g(g_mu);
   const int32_t c = caller(ret_addr);
@@ -331,7 +334,7 @@ int32_t owner_check(const void* ret, Space s, rg_handle h, const char* call) {
                             ? g_owner[s][h].load(std::memory_order_acquire)
                             : 0;
   uintptr_t a = reinterpret_cast<uintptr_t>(ret);
-  if (a >= self.lo && a < self.hi && t_init) a = reinterpret_cast<uintptr_t>(t_init);  // a tail call out of an init
+  if (a >= self.lo && a < self.hi && t_init) a = reinterpret_cast<uintptr_t>(t_init);  // a tail call out of client code
   int32_t c = -1;
   const uint32_t n = g_nranges.load(std::memory_order_acquire);
   for (uint32_t i = 0; i < n && c < 0; ++i)

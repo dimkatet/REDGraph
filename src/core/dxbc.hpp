@@ -21,8 +21,11 @@ inline int kind_of(uint32_t type) {
   return -1;
 }
 
-// Does the shader bind register `reg` of `kind` in `space`?
-inline Bound binds(const void* code, size_t size, uint32_t kind, uint32_t space, uint32_t reg) {
+// Does the shader bind register `reg` of `kind` in `space`? On kYes, *res_kind (optional) = the declaration's DXIL
+// ResourceKind (1 Texture1D .. 9 TextureCubeArray, 10 typed / 11 raw / 12 structured buffer, 13 cbuffer), 0 = not
+// recorded (a PSV0 older than version 2 has 16-byte entries without it).
+inline Bound binds(const void* code, size_t size, uint32_t kind, uint32_t space, uint32_t reg,
+                   uint32_t* res_kind = nullptr) {
   const auto* b = static_cast<const uint8_t*>(code);
   auto u32 = [&](size_t off, uint32_t& v) {
     if (off + 4 > size) return false;
@@ -55,7 +58,13 @@ inline Bound binds(const void* code, size_t size, uint32_t kind, uint32_t space,
       std::memcpy(&sp, b + p + 4, 4);
       std::memcpy(&lo, b + p + 8, 4);
       std::memcpy(&hi, b + p + 12, 4);
-      if (kind_of(type) == static_cast<int>(kind) && sp == space && reg >= lo && reg <= hi) return Bound::kYes;
+      if (kind_of(type) == static_cast<int>(kind) && sp == space && reg >= lo && reg <= hi) {
+        if (res_kind) {
+          *res_kind = 0;
+          if (esz >= 24) std::memcpy(res_kind, b + p + 16, 4);
+        }
+        return Bound::kYes;
+      }
     }
     return Bound::kNo;
   }
@@ -64,10 +73,12 @@ inline Bound binds(const void* code, size_t size, uint32_t kind, uint32_t space,
 
 // The same for a LIBRARY (lib_6_x - no PSV0): its RDAT chunk's resource table (DxilRuntimeData.h, version 0x10):
 //   u32 version, u32 part_count, u32 part_offsets[]; part = {u32 type, u32 size, data}; type 3 = ResourceTable =
-//   {u32 count, u32 stride, records {u32 class, kind, id, space, lower, upper, ...}}, class 0 SRV 1 UAV 2 CBV 3 sampler.
+//   {u32 count, u32 stride, records {u32 class, kind, id, space, lower, upper, ...}}, class 0 SRV 1 UAV 2 CBV 3 sampler;
+//   kind = the DXIL ResourceKind, as binds() reports it.
 // Checked offline 2026-10-06: all 68 RT libraries of staticshader_final.cache carry it (stride 32), and our
 // space0_rebind'ed libraries declare the moved registers there.
-inline Bound lib_binds(const void* code, size_t size, uint32_t kind, uint32_t space, uint32_t reg) {
+inline Bound lib_binds(const void* code, size_t size, uint32_t kind, uint32_t space, uint32_t reg,
+                       uint32_t* res_kind = nullptr) {
   const auto* b = static_cast<const uint8_t*>(code);
   auto u32 = [&](size_t off, uint32_t& v) {
     if (off + 4 > size) return false;
@@ -94,12 +105,16 @@ inline Bound lib_binds(const void* code, size_t size, uint32_t kind, uint32_t sp
       size_t p = base + po + 16;
       if (p + static_cast<size_t>(count) * stride > end) return Bound::kUnknown;
       for (uint32_t r = 0; r < count; ++r, p += stride) {
-        uint32_t cls, sp, lo, hi;
+        uint32_t cls, rk, sp, lo, hi;
         std::memcpy(&cls, b + p, 4);
+        std::memcpy(&rk, b + p + 4, 4);
         std::memcpy(&sp, b + p + 12, 4);
         std::memcpy(&lo, b + p + 16, 4);
         std::memcpy(&hi, b + p + 20, 4);
-        if (cls == kClassOf[kind] && sp == space && reg >= lo && reg <= hi) return Bound::kYes;  // hi ~0u = unbounded
+        if (cls == kClassOf[kind] && sp == space && reg >= lo && reg <= hi) {  // hi ~0u = unbounded
+          if (res_kind) *res_kind = rk;
+          return Bound::kYes;
+        }
       }
       return Bound::kNo;
     }

@@ -25,6 +25,16 @@ void skipped(const void* fn, uint32_t api_version);
 // The init of a waiting client is running on this thread (nullptr = done): calls from the host's own module made
 // meanwhile (a tail call in the client's init) are the client's.
 void running_init(const void* fn);
+// The same around every client CALLBACK the host runs (subscription, pass, node / wrap fn, device_ready): a client's
+// call in tail position returns straight into the host, so its return address names the host, not the client - while
+// `fn` (the client's code) runs, such a call is attributed to fn's module. Nests.
+struct Running {
+  explicit Running(const void* fn);
+  ~Running();
+  Running(const Running&) = delete;
+  Running& operator=(const Running&) = delete;
+  const void* prev;
+};
 
 // One registering call, after it returned `result` (a handle, 0 = ok, or a RG_E_*). `parent` = the handle the call
 // was about (scope: the patch; node_use: the node; rt_variant: the library), 0 = none. `target` = what it attaches

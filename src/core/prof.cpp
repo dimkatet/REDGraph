@@ -187,6 +187,7 @@ void frame() {
 void d_execute_parallel(const void* graph, const void* ctx, void* builder) {
   frame();
   pso::frame_tick();
+  bindings::frame_tick();
   g_orig(graph, ctx, builder);
 }
 
@@ -220,6 +221,7 @@ void on_graph_execute() {
   if (g_own_hook) return;
   frame();
   pso::frame_tick();
+  bindings::frame_tick();
 }
 
 void attach_frames() {

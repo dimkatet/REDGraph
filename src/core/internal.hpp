@@ -74,12 +74,15 @@ void on_engine_block(uint32_t which, const void* data, uint32_t size);
 void cbuffer_write(rg_handle h, uint32_t offset, const void* data, uint32_t size);
 rg_handle lease_register(const rg_lease_desc* d);
 rg_handle view_create(uint32_t kind, uint32_t stride, uint32_t ring);
+rg_handle view_create_texture(uint32_t kind, const rg_texture_view_desc* d, uint32_t ring);
 int32_t view_set_resource(rg_handle h, void* resource, uint64_t bytes);
 void lease_stats(rg_handle h, rg_lease_stats* out);
 bool needed();
 bool attach();
 void detach();
 bool attached();
+// Once per frame (the frame hook, prof.cpp): a flow view rewrites its descriptor at most once per resource per frame.
+void frame_tick();
 // From pso's Create detour, BEFORE the engine creates the PSO: patch `patch` matched with vanilla bytecode `code`.
 // false = a lease of this patch is refused (the vanilla shader reads its register) - the patch is refused too.
 bool on_patch_matched(rg_handle patch, const void* code, size_t size);

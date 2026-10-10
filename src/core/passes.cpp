@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cstring>
 
+#include "core/clients.hpp"
 #include "core/engine_231.hpp"
 #include "core/internal.hpp"
 #include "core/prof.hpp"
@@ -102,6 +103,7 @@ void run_after(uint8_t* ctx) {
   uint32_t touched;
   {
     prof::Pause client;
+    clients::Running running(reinterpret_cast<const void*>(a.fn));
     touched = a.fn(a.user, cl);
   }
   if (!(touched & RG_PASS_TOUCHED_STATE)) return;
@@ -126,6 +128,7 @@ void run_subs(uint32_t mask, const rg_dispatch_info& info) {
     if (indirect && s.indirect.fetch_add(1, std::memory_order_relaxed) == 0 && s.calls.load() > 1)
       g_sdk->logger->InfoF(g_handle, "host: first INDIRECT subscribed dispatch '%s'", s.name);
     prof::Pause client;
+    clients::Running running(reinterpret_cast<const void*>(s.fn));
     s.fn(s.user, &info);
   }
 }

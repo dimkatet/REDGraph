@@ -92,7 +92,7 @@ The header documents each call in detail. This table is the map: which call you 
 |---|---|---|
 | your bytecode instead of an engine shader (VS / PS / CS) | `patch_register` (M1) | up to 4 variants, `patch_select` switches live (-1 = vanilla). Two clients on one shader: the higher `priority` wins |
 | ... only inside one node | `patch_scope` (M11) | up to 4 nodes; elsewhere the engine's shader stays |
-| data into your patched shader | `cbuffer_create` / `cbuffer_write`, `view_create` / `view_set_resource`, `lease_register` (M2) | binds into a **free space0 register of the engine's own tables**, so it costs 0 root-signature DWORDs. See section 5 |
+| data into your patched shader | `cbuffer_create` / `cbuffer_write`, `view_create` / `view_create_texture` / `view_set_resource`, `lease_register` (M2) | binds into a **free space0 register of the engine's own tables**, so it costs 0 root-signature DWORDs. See section 5 |
 | the engine's own constants | `cbuffer_feed`, `engine_block` | fog, clouds, `cb12` (the shared per-frame constants) |
 | an extra compute pass right after an engine dispatch, with all its bindings | `companion_register` + `companion_request` (M4a), `companion_scope` | the companion reads exactly what the engine's dispatch had bound |
 | to know when an engine CS dispatches | `dispatch_subscribe` (M4c) | direct and indirect dispatches |
@@ -149,15 +149,23 @@ Notes:
 2. **Edit the `.ll`.** Edit the vanilla shader's own DXIL rather than recompiling HLSL: the result keeps the engine's
    resource layout and signature exactly.
 3. **Your data, if any: lease a free register.** Your edit reads a buffer at a register the vanilla shader does not
-   use: space0, CBV `b0-b13`, SRV `t0-t127`, UAV `u0-u18`, and inside the range the engine's table for that stage
-   covers.
+   use: space0, CBV `b0-b13`, UAV `u0-u18`, SRV `t0-t126` for VS / PS but only **`t0-t92` for CS and RT** - what
+   the engine's tables cover (the log's `native table: CS covers ...` line). Outside it the patch stays vanilla and a
+   companion's PSO does not even build.
    * If you wrote the edit against other registers (another space, say), `space0_rebind.py in.ll out.ll b0/space6=b3`
      moves the binding.
    * REDGraph grants the lease only when all of these hold:
-     * every variant reads that register;
+     * every variant reads that register, and declares it as what the view is (a raw view for a
+       `ByteAddressBuffer`, a structured one for a `StructuredBuffer`, a `RG_TEX_2D_ARRAY` view for a
+       `Texture2DArray` ...);
      * the vanilla shader does **not** read it (checked at the first PSO);
      * the engine's root signature covers it (checked at the first bind).
    * Otherwise the patch stays vanilla, and the log says why.
+   * A texture: `view_create_texture(kind, &desc, ring)`. With `desc.flow = 0` it is yours (`view_set_resource(view,
+     texture, 0)`; its states are yours). With `desc.flow` = a `flow_register` handle it is the ENGINE's texture by
+     name, resolved at every draw / dispatch: where it is not alive the patch stays vanilla for that draw. Scope the
+     patch to nodes where it lives, and make sure it is in a readable state there (`flow_transition` in a `node_wrap`
+     `before`) - the engine does not know your shader reads it.
 4. **Assemble.** `python tools/rg_dxil.py asm edited.ll patch.dxil` assembles and validates the container, and writes
    its checksum. Without the checksum, D3D12 silently ignores the shader.
 5. **Embed.** `python tools/rg_dxil.py header patch.dxil patch.hpp --symbol MyPatch` creates the header (or load the

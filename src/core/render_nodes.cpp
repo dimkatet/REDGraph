@@ -234,6 +234,7 @@ void run_fn(rg_node_fn fn, void* user, const uint8_t* ctx, std::atomic<uint64_t>
   uint32_t touched;
   {
     prof::Pause client;
+    clients::Running running(reinterpret_cast<const void*>(fn));
     touched = fn(user, &info);
   }
   if (!(touched & RG_PASS_TOUCHED_STATE)) return;

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Leases can bind textures: your own, or one of the game's by name.
+- A lease whose shader declares the register as a different kind of resource than the one you bind is refused, with
+  the reason in the log.
+- A mod's call made from inside one of its callbacks is no longer mistaken for another module's (and refused).
+- The log lists which registers of the game's tables a lease can use, per shader stage.
+
 ## 0.1.1
 
 - Ray-tracing shader variants cost less CPU: about 2 us less per ray-tracing dispatch that runs one.
