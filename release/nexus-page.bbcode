@@ -26,8 +26,9 @@ For the curious: with [font=Courier New]RenderGraphDebug = true[/font] in [font=
 [color=#D4D4D8]REDGraph is open source (MIT): [url=https://github.com/dimkatet/REDGraph]github.com/dimkatet/REDGraph[/url]. The [b]SDK[/b] is in the Files tab as a separate download - a guide, one plain-C header, Python tools that extract and patch the game's shaders, a reference of every render-graph node with its shaders, and an example plugin.
 
 A client plugin can:
-• replace any engine shader (vertex, pixel, compute) with its own version and switch between versions [b]live[/b] - optionally only inside one pass of the frame;
-• feed its own data into that shader through the engine's own descriptor tables - no root-signature changes, so it stays out of other mods' way;
+• replace any engine shader (vertex, pixel, compute) with its own version and switch between versions [b]live[/b] - optionally only inside one pass of the frame; change how the game draws with it (culling, wireframe, depth, blending, write masks); several mods can patch different stages of the same draw;
+• feed its own data - buffers, its own textures or the game's - into that shader through the engine's own descriptor tables - no root-signature changes, so it stays out of other mods' way;
+• react to the game's compute dispatches and draws: run code right after one, issue the same dispatch or draw again with its own shader, or record its own work after it;
 • add [b]ray-tracing[/b] raygen variants next to the game's own and switch them live, per pass;
 • wrap, remove, replace or add passes of the engine's [b]render graph[/b], and record its own D3D12 work on the engine's command lists, with the engine's textures (by name), its transients and its descriptors;
 • run next to other clients: one target, one winner, by priority; resources are shared only through the render graph, by name.

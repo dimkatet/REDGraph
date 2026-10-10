@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - Leases can bind textures: your own, or one of the game's by name.
 - A lease whose shader declares the register as a different kind of resource than the one you bind is refused, with
