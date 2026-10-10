@@ -2,6 +2,9 @@
 
 #include <Windows.h>
 #include <d3d12.h>
+#include <intrin.h>
+
+#include "core/engine_231.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -29,6 +32,11 @@ std::atomic<bool> g_removed_reported{false};
 constexpr DWORD kWatchMs = 500;
 HANDLE g_watch_stop = nullptr;
 HANDLE g_watch_thread = nullptr;
+// The engine's GPU-crash path (e231::kGpuCrashReport): its fatal error ends the process within the watchdog's period.
+using GpuCrashReportFn = void (*)(bool);
+GpuCrashReportFn g_orig_gpu_crash = nullptr;
+bool g_gpu_crash_hooked = false;
+std::atomic<bool> g_gpu_crash_seen{false};
 
 void line(const char* text) {
   if (g_sdk) g_sdk->logger->Error(g_handle, text);
@@ -216,6 +224,19 @@ LONG CALLBACK on_exception(EXCEPTION_POINTERS* ep) {
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// The engine found the device lost (a failed Present / HRESULT): report removal + DRED BEFORE its own crash report,
+// whose fatal error ends the process. Observe only - the engine's path then runs unchanged.
+void d_gpu_crash_report(bool arg) {
+  if (!g_gpu_crash_seen.exchange(true)) {
+    char from[300];
+    describe(reinterpret_cast<uint64_t>(_ReturnAddress()), from, sizeof(from));
+    linef("[gpu] the ENGINE reports a GPU crash (GpuApi::GpuCrashReport from %s)", from);
+    check_device("the engine's GPU crash report");
+    if (!g_removed_reported.load()) line("[gpu] ...but the device still answers S_OK - no removal reason, no DRED");
+  }
+  g_orig_gpu_crash(arg);
+}
+
 // DRED is a process-wide setting the D3D12 runtime reads at device creation - at Load the engine has not created its
 // device yet (that is 9+ s later, the first PSO). Not a device call.
 void arm_dred() {
@@ -259,7 +280,28 @@ void set_device(void* device) {
                                                                                   : "FAILED to start");
 }
 
+void attach_engine() {
+  if (g_gpu_crash_hooked || g_sdk == nullptr) return;
+  using core::e231::call_site_ok;
+  const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+  const bool sites = call_site_ok(base, core::e231::kPresentCrashReportRet, core::e231::kGpuCrashReport) &&
+                     call_site_ok(base, core::e231::kCheckHrCrashReportRet, core::e231::kGpuCrashReport);
+  g_gpu_crash_hooked =
+      sites && g_sdk->hooking->Attach(g_handle, reinterpret_cast<void*>(base + core::e231::kGpuCrashReport),
+                                      reinterpret_cast<void*>(&d_gpu_crash_report),
+                                      reinterpret_cast<void**>(&g_orig_gpu_crash));
+  g_sdk->logger->InfoF(g_handle, "crash log: the engine's GPU crash report %s",
+                       g_gpu_crash_hooked ? "HOOKED (removal + DRED logged before it)"
+                       : sites            ? "did NOT attach"
+                                          : "- the call sites are not game 2.31's, NOT attached");
+}
+
 void close() {
+  if (g_gpu_crash_hooked) {
+    g_sdk->hooking->Detach(g_handle, reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) +
+                                                            core::e231::kGpuCrashReport));
+    g_gpu_crash_hooked = false;
+  }
   bool watch_done = true;
   if (g_watch_thread) {
     SetEvent(g_watch_stop);

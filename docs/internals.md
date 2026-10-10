@@ -494,6 +494,12 @@ and a watchdog thread (`GetDeviceRemovedReason` every 500 ms). Once the device i
 the allocations around it, the breadcrumbs of unfinished command lists. DRED must be enabled before the engine creates
 its device: `[Diagnostics] Dred = true`.
 
+The engine has its own GPU-crash path, `GpuApi::GpuCrashReport` (from `Present` on DEVICE_REMOVED / _RESET and from
+`CheckHR_Internal`): breadcrumbs, Aftermath, then the fatal error "Gpu Crash for unknown reasons!"
+(`gpuApiDX12Error.cpp:42`) that ends the process - inside the watchdog's 500 ms, so a GPU crash used to leave nothing
+in our log. It is hooked at the host's attach (after every plugin's Load): `[gpu] the ENGINE reports a GPU crash`,
+then the removal reason and DRED, then the engine's path unchanged.
+
 A first-chance access violation is logged even when an SEH handler elsewhere will catch it. Never read engine memory
 under `__try`: the engine's crash handler freezes the game on any first-chance AV.
 

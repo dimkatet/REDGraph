@@ -39,6 +39,13 @@ constexpr uintptr_t kDeviceInData = 0x13bc4a8;
 constexpr uintptr_t kGpuInitDevice = 0x7e0bb4;
 constexpr uintptr_t kGpuInitDeviceRet = 0x7e26b6;  // CRenderInterface::Init -> it
 
+// GpuApi::GpuCrashReport(bool) - the engine's own GPU-crash path (breadcrumbs, Aftermath, then its fatal error
+// "Gpu Crash for unknown reasons!", gpuApiDX12Error.cpp:42), which ends the process before the crash log's 500 ms
+// watchdog sees the removed device. Two callers: Present on DXGI_ERROR_DEVICE_REMOVED / _RESET, and CheckHR_Internal.
+constexpr uintptr_t kGpuCrashReport = 0x2a43d98;
+constexpr uintptr_t kPresentCrashReportRet = 0x21c7ef;  // GpuApi::Present -> it
+constexpr uintptr_t kCheckHrCrashReportRet = 0x18a9e8f;  // GpuApi::CheckHR_Internal -> it
+
 // ---- RT state objects (M3, feasibility 0.7 / 0.7b) ----
 constexpr uintptr_t kCreateStateObject = 0x315f68;   // bool(StateObjectData* out, const u32* blob id)
 constexpr uintptr_t kContainerCreateRet = 0x31510a;  // ResourceContainer<StateObject>::Create -> it (the only caller)

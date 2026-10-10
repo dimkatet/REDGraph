@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- A GPU crash is now written to the log (the reason and, with `Dred = true`, where on the GPU) before the game
+  closes - before, the game closed first and the log said nothing.
+
 ## 0.2.0
 
 - Leases can bind textures: your own, or one of the game's by name.

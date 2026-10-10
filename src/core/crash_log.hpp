@@ -23,6 +23,9 @@ namespace crash_log {
 
 // At Load, after settings::load(): installs the handler; arms DRED when `dred`.
 void open(RED4ext::v1::PluginHandle handle, const RED4ext::v1::Sdk* sdk, bool dred);
+// At the host's attach (GpuApi::InitDevice, after every plugin's Load): hooks the engine's GPU-crash path
+// (GpuApi::GpuCrashReport), whose fatal error ends the process before the watchdog's next poll.
+void attach_engine();
 // The engine's ID3D12Device*, once known (core's device_ready).
 void set_device(void* device);
 // At Unload: a game that quits on its own after losing the GPU never crashes - ask once more, then remove the handler.

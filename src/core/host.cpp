@@ -541,6 +541,7 @@ void drain_clients() {
 void attach() {
   g_open.store(false, std::memory_order_release);
   g_sdk->logger->InfoF(g_handle, "host: registration CLOSED - clients: %s", clients::summary().c_str());
+  crash_log::attach_engine();  // after every plugin's Load (some compare the prologues of what they hook)
 #if RG_NATIVE_HOST
   if (flag_file(L"no_pso_swap")) {
     g_sdk->logger->Info(g_handle, "host: NOT attached (flag file no_pso_swap) - every shader stays vanilla");
