@@ -1,0 +1,58 @@
+[size=4][b][color=#FF6B6B]Description[/color][/b][/size]
+
+[color=#D4D4D8]REDGraph is a [b]render host[/b] for Cyberpunk 2077: a RED4ext plugin that lets other mods change how the game renders - from inside the engine, without ReShade and without touching any game files.
+
+[b]On its own it changes nothing.[/b] You install it because a mod you use needs it - [b]Cyberpunk Render Tweaks[/b] is the first one. Mods built on REDGraph share it: several of them can run at once, and REDGraph keeps them from stepping on each other.
+
+This is the first release. It runs every day under Cyberpunk Render Tweaks and is tested on real hardware, but on few machines - reports are very welcome.[/color]
+
+[size=4][b][color=#FF6B6B]Installation instructions[/color][/b][/size]
+
+[color=#D4D4D8]1. Install [b]RED4ext[/b] (and [b]Cyber Engine Tweaks[/b] if you want the window - see Requirements).
+2. [b]Manual:[/b] extract the archive into your Cyberpunk 2077 game folder (the one containing [font=Courier New]bin[/font]). It holds the plugin in [font=Courier New]red4ext\plugins\REDGraph[/font] and its window in [font=Courier New]bin\x64\plugins\cyber_engine_tweaks\mods\REDGraph[/font].
+[b]Mod manager:[/b] install it like any other mod (Vortex, Mod Organizer 2).
+3. Install the mod that needs it. Load order does not matter.
+
+[b]Uninstall:[/b] delete the two folders from step 2, or remove the mod in your mod manager. Mods that need REDGraph then simply do nothing - they do not crash.[/color]
+
+[size=4][b][color=#FF6B6B]The window[/color][/b][/size]
+
+[color=#D4D4D8]Open the Cyber Engine Tweaks overlay: the [b]REDGraph[/b] window shows which mods use it and what each of them changed - every patched shader, every engine node they hook, and anything that was refused, with the reason. When something looks wrong, this is the first place to check which mod touches what.
+
+For the curious: with [font=Courier New]RenderGraphDebug = true[/font] in [font=Courier New]red4ext\plugins\REDGraph\REDGraph.ini[/font] (restart the game), a second window lists every pass the game renders in the current frame, with its shaders - and lets you switch any of them off live. Fun to explore, not something to leave on.[/color]
+
+[size=4][b][color=#FF6B6B]For modders[/color][/b][/size]
+
+[color=#D4D4D8]REDGraph is open source (MIT): [url=https://github.com/dimkatet/REDGraph]github.com/dimkatet/REDGraph[/url]. The [b]SDK[/b] is in the Files tab as a separate download - a guide, one plain-C header, Python tools that extract and patch the game's shaders, a reference of every render-graph node with its shaders, and an example plugin.
+
+A client plugin can:
+• replace any engine shader (vertex, pixel, compute) with its own version and switch between versions [b]live[/b] - optionally only inside one pass of the frame;
+• feed its own data into that shader through the engine's own descriptor tables - no root-signature changes, so it stays out of other mods' way;
+• add [b]ray-tracing[/b] raygen variants next to the game's own and switch them live, per pass;
+• wrap, remove, replace or add passes of the engine's [b]render graph[/b], and record its own D3D12 work on the engine's command lists, with the engine's textures (by name), its transients and its descriptors;
+• run next to other clients: one target, one winner, by priority; resources are shared only through the render graph, by name.
+
+How it works inside is in [font=Courier New]docs/internals.md[/font] on GitHub - issues and pull requests welcome.[/color]
+
+[size=4][b][color=#FF6B6B]Requirements[/color][/b][/size]
+
+[color=#D4D4D8]• [b]Cyberpunk 2077[/b] 2.31
+• [b][url=https://www.nexusmods.com/cyberpunk2077/mods/2380]RED4ext[/url][/b]
+• [b][url=https://www.nexusmods.com/cyberpunk2077/mods/107]Cyber Engine Tweaks[/url][/b] - only for the window. Without it REDGraph and the mods using it run as usual.[/color]
+
+[size=4][b][color=#FF6B6B]Compatibility[/color][/b][/size]
+
+[color=#D4D4D8]Works together with [b]Ultra+[/b], [b]RenoDX[/b], [b]ReShade[/b], [b]OptiScaler[/b] and [b]Film Grain Fix[/b]. With no mod using it, REDGraph changes nothing in what the game renders.[/color]
+
+[size=4][b][color=#FF6B6B]Reporting a problem[/color][/b][/size]
+
+[color=#D4D4D8]Please attach REDGraph's log [b]and[/b] the log of the mod that uses it: both are in [font=Courier New]red4ext\logs[/font] in your game folder ([font=Courier New]redgraph-*.log[/font]; with Mod Organizer 2 they are in the [font=Courier New]overwrite[/font] folder). Only the latest ones are kept, so copy them right after the problem, before starting the game again. Quit the game normally if you can - the log then ends with a status report.
+
+For a [b]GPU crash or freeze[/b], set [font=Courier New]Dred = true[/font] under [font=Courier New][Diagnostics][/font] in [font=Courier New]red4ext\plugins\REDGraph\REDGraph.ini[/font] and [b]restart the game[/b]: the log then also says where on the GPU it failed. It costs a little GPU time, so set it back to false afterwards.[/color]
+
+[size=4][b][color=#FF6B6B]Shout outs[/color][/b][/size]
+
+[color=#D4D4D8]• [b]WopsS[/b] and the [b]RED4ext[/b] contributors - RED4ext and its SDK, which REDGraph runs on.
+• The [b]Cyber Engine Tweaks[/b] team - the window lives in CET.
+• [b]bartmoss[/b] and [b]cp2077-symbols[/b] - the game's function names by address, which is how REDGraph finds the engine functions it works with.
+• [b]clshortfuse[/b] and [b]RenoDX[/b] - RenoDX pioneered replacing game shaders, and its code was my main reference for learning how any of this works.[/color]

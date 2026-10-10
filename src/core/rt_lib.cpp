@@ -358,9 +358,13 @@ bool create(void* out, const uint32_t* in) {
 
 // The census (graph_probe) maps a DispatchRays to the library it runs: every successful creation reports its
 // container entry, the library hash and the export names (UTF-16, consecutive, from [+0x10]; count = byte +6).
+void forget_slot(const void* slot);  // below, with the identifier cache
+
 bool d_create(void* out, const uint32_t* in) {
   t_baked = 0;
+  forget_slot(out);  // `out` is the state-object slot DispatchRays reads (rt_entry): its cached identifiers go
   const bool ok = create(out, in);
+  forget_slot(out);  // and anything cached while it was being built
   if (ok) note_entry(out, t_baked);
   if (!ok || !graph_probe::census()) return ok;
   const BlobEntry* e = in ? entry_of(*in) : nullptr;
@@ -512,6 +516,44 @@ void d_rays(uint32_t so, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5, uin
   t_ovr.set = false;
 }
 
+// The variant's shader identifier per (state-object slot, props, variant): GetShaderIdentifier is a lookup by NAME in
+// the driver (~1.9 us measured 2026-10-10), on every dispatch that runs a variant. The pointer it returns lives as long
+// as the state object; the engine re-creates objects in the same slot, so every creation through the creator drops
+// that slot's entries (forget_slot, from d_create), and a different props pointer misses too.
+struct IdEntry {
+  const void* slot;
+  const void* props;
+  const Var* var;
+  const void* ident;
+};
+constexpr uint32_t kIdCache = 256;
+IdEntry g_ids[kIdCache];
+uint32_t g_nids = 0;
+SRWLOCK g_ids_lock = SRWLOCK_INIT;
+
+void forget_slot(const void* slot) {
+  AcquireSRWLockExclusive(&g_ids_lock);
+  for (uint32_t i = 0; i < g_nids;)
+    if (g_ids[i].slot == slot) g_ids[i] = g_ids[--g_nids];
+    else ++i;
+  ReleaseSRWLockExclusive(&g_ids_lock);
+}
+
+const void* identifier(const void* slot, ID3D12StateObjectProperties* props, const Var& v) {
+  AcquireSRWLockShared(&g_ids_lock);
+  const void* ident = nullptr;
+  for (uint32_t i = 0; i < g_nids && !ident; ++i)
+    if (g_ids[i].slot == slot && g_ids[i].props == props && g_ids[i].var == &v) ident = g_ids[i].ident;
+  ReleaseSRWLockShared(&g_ids_lock);
+  if (ident) return ident;
+  ident = props->GetShaderIdentifier(v.variant);
+  if (!ident) return nullptr;
+  AcquireSRWLockExclusive(&g_ids_lock);
+  if (g_nids < kIdCache) g_ids[g_nids++] = {slot, props, &v, ident};  // full: no cache, still correct
+  ReleaseSRWLockExclusive(&g_ids_lock);
+  return ident;
+}
+
 const void* d_gsgi(uint32_t id, uint32_t group) {
   prof::Scope prof_scope(prof::kGsgi);
   Override& o = t_ovr;
@@ -519,10 +561,10 @@ const void* d_gsgi(uint32_t id, uint32_t group) {
     o.set = false;
     Var& v = *o.v;
     auto* dev = *reinterpret_cast<uint8_t* const*>(g_base + kDeviceData);
+    const uint8_t* slot = dev ? dev + kRtStateObjects + size_t(id - 1) * kRtStateObjectStride : nullptr;
     ID3D12StateObjectProperties* props = nullptr;
-    if (dev)
-      std::memcpy(&props, dev + kRtStateObjects + size_t(id - 1) * kRtStateObjectStride + kRtEntryProps, sizeof props);
-    const void* ident = props ? props->GetShaderIdentifier(v.variant) : nullptr;
+    if (slot) std::memcpy(&props, slot + kRtEntryProps, sizeof props);
+    const void* ident = props ? identifier(slot, props, v) : nullptr;
     if (ident) {
       if (v.swapped.fetch_add(1, std::memory_order_relaxed) == 0)
         g_sdk->logger->InfoF(g_handle, "rt variant: %s - first dispatch RUNS the variant (state object %u, group %u)",

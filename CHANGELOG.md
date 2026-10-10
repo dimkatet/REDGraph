@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.1.1
+
+- Ray-tracing shader variants cost less CPU: about 2 us less per ray-tracing dispatch that runs one.
+
 ## 0.1.0
 
 First release as a standalone project (it started inside Cyberpunk Render Tweaks, its first client).
