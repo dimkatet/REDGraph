@@ -1,0 +1,46 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      # RED4ext.SDK's generated headers exceed MAX_PATH under the runner's work folder.
+      - run: git config --global core.longpaths true
+
+      - uses: actions/checkout@v4
+
+      # No game on the runner: RtVariantTest / PatchScopeTest are compiled out (docs/internals.md "Self-tests").
+      - name: Configure
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Package the mod
+        shell: pwsh
+        run: ./scripts/package_mod.ps1
+
+      # Also proves the SDK's example builds on its own, fetching RED4ext.SDK at the pinned commit.
+      - name: Package the SDK
+        shell: pwsh
+        run: ./scripts/package_sdk.ps1 -BuildExample
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: REDGraph
+          path: |
+            dist/*.zip
+            build/Release/REDGraph.dll
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true

@@ -1,0 +1,481 @@
+# REDGraph internals
+
+How the host works inside the engine - for people changing REDGraph itself. Modders writing a CLIENT need only
+[`sdk/README.md`](../sdk/README.md) and [`include/rg_host.h`](../include/rg_host.h).
+
+Every address below is a Cyberpunk 2077 **2.31** RVA (the exe base is 0x140000000; "0x1401f7224" and "0x1f7224" name
+the same function). They all live in [`src/core/engine_231.hpp`](../src/core/engine_231.hpp) (the constant-block
+hooks keep theirs in `cb_hooks.cpp`). Section [Finding engine addresses](#finding-engine-addresses) says how they were
+found and how to check a new one.
+
+Each mechanism carries the milestone tag the code comments use (M1..M12): the order they were built in.
+
+## Overview
+
+```
+include/rg_host.h        THE API: plain C, versioned, append-only. Clients include only this.
+src/plugin.cpp           RED4ext entry: settings, crash log, core::open / arm, the CET functions
+src/core/                the host CORE - knows no client
+  host.cpp               the rg_host table, registration window, attach-on-demand, the w_* wrappers (clients tab)
+  engine_231.hpp         every 2.31 RVA and struct offset
+  pso_patch.cpp          M1  PSO clone + live swap; the bind funnel; patch scope (M11); shader skip (debug)
+  bindings.cpp           M2  leases: our descriptors staged into the engine's own tables
+  rt_lib.cpp             M3  RT libraries at the state-object creator; M12 raygen variants
+  passes.cpp             M4  dispatch subscriptions, companions, after-dispatch passes, RestoreState
+  cb_hooks.cpp               engine constant blocks (cb12, fog / cloud b6)
+  render_flow.cpp        M5  node context per thread, RenderFlow by name, request record / replay, jobs carry node
+  render_nodes.cpp       M6-M9 our nodes, declarations, wrap / remove of engine nodes; the debug slots
+  graph_probe.cpp            graph walk, dump, census (node -> shaders / resources / DispatchRays)
+  graph_debug.cpp            the CET graph debug module's state and report
+  clients.cpp                who registered what (the Clients tab)
+  prof.cpp                   the host's own CPU profile
+  crash_log.cpp              vectored exception handler, device-removed watchdog, DRED
+src/settings.cpp         REDGraph.ini
+src/ui.cpp               RTTI global functions for the CET window (Game.RG_*)
+cet/REDGraph/init.lua    the CET window
+selftest/                REDGraphSelfTest.dll - the host's tests, a client like any other
+```
+
+Clients are other RED4ext plugins. They find the host with `rg_host_when_ready` (any load order: a client that loads
+first waits in a process-wide rendezvous, a named file mapping `Local\REDGraph.rendezvous.<pid>`, and the host runs its
+init in the host's own Load) or directly via the export `rg_host_get`.
+
+## Lifetime: registration and attach
+
+| step | when | what |
+|---|---|---|
+| `core::open` | REDGraph's RED4ext Load | the log works; the table is served |
+| `drain_clients` | right after | clients that loaded earlier and wait in the rendezvous register now |
+| clients' Load | RED4ext loads plugins alphabetically | a client loading after REDGraph registers in its own Load |
+| `core::arm` | end of REDGraph's Load | hooks `GpuApi::InitDevice` (0x7e0bb4, called from `CRenderInterface::Init`) |
+| `core::attach` | at `InitDevice`'s entry | registration CLOSES (`RG_E_LATE` after this); the engine hooks the registrations need are attached |
+
+`InitDevice` creates the device and the global root signatures; no PSO or RT state object exists yet, and every
+RED4ext plugin's Load has run before it. If that hook cannot attach, `attach` runs at the end of Load instead.
+
+The flag file `no_pso_swap` next to the DLL makes `attach` attach nothing native and claim no shader (the user's A/B
+baseline); `no_hooks` leaves out the constant-block hooks only. The build option `RG_NATIVE_HOST=OFF` compiles the
+native part out (for a bisect).
+
+## Core rules
+
+* **Hooks are attached on demand.** No RT library registered -> no state-object hook; no lease -> no
+  `UpdateRootParams` detour, and so on. Fewer collisions with other mods' hooks, zero cost for unused mechanisms.
+* **Every hook checks its call site first.** `call_site_ok(base, ret, target)`: the `E8` call right before a known
+  return address must land on the target. A different exe fails the check and that mechanism stays off.
+* **Variants are built eagerly.** The full PSO desc exists only inside `PSOSubCache::Create`, so all of a patch's
+  variants (up to `RG_MAX_VARIANTS`) are cloned there at once; the bind funnel then picks one per bind.
+* **One patched stage per engine PSO.** A graphics PSO whose VS and PS are both claimed gets the first claim; the second
+  is logged as a conflict.
+* **Two clients on one target: one wins** - higher `priority`, ties by registration order. The loser gets
+  `RG_E_TAKEN` (or is refused later with the reason in the Clients tab).
+* **A handle belongs to the module that made it.** `clients.cpp` records the owner of every handle (the module the
+  registering call returned to) and each client's image range; every entry that takes a handle - the registering
+  wrappers and the `[hot]` ones (`h_*` in `host.cpp`: a scan of the client ranges, no lock) - refuses another
+  module's with `RG_E_FOREIGN`, logged. The `*_stats` calls are read-only and take any handle.
+* **Clients share resources only through the engine's graph, by name.** A `node_alloc` transient is PUBLISHED under
+  `"<mod>/<name>"` (one publisher per name); another client reads it with `flow_register(name, 0)` + `node_use`, and
+  the engine owns its lifetime, barriers and frame order - the host brokers no raw D3D12 objects between clients. A
+  node's name is unique among all clients' nodes (it is its class name in the graph).
+* **The host never writes the engine's shared data.** Swaps and additions edit the CREATING thread's own lists (PSO
+  desc copies, the state-object subobject list), so no engine object waits on a lock of ours.
+* **Failure falls back to vanilla.** A clone the driver refuses, a bake that fails, a lease the vanilla shader would
+  collide with: the engine's own object runs, the reason is logged.
+* **Objects the engine consumes live on the engine's device** (`rg_host::device`, `kDeviceData + kDeviceInData`) -
+  with ReShade loaded that is ReShade's proxy, and a heap made on the underlying device crashes it.
+
+## Engine hooks
+
+| hook (2.31) | mechanism | runs | attached when |
+|---|---|---|---|
+| `PSOSubCache<compute/graphics>::Create` 0x88dc58 / 0x88f364 | M1 identify + clone | every PSO creation | any patch, companion, subscription, lease, census |
+| `ComputePSO/GraphicsPSO::CreatePSO` 0x1f7224 / 0x1f744c (from `SetupForDispatch/Draw`) | M1 bind funnel: engine PSO -> clone | every state change before a draw / dispatch | same |
+| `SFrameResources::UpdateRootParams` 0x1f22e4 | M2 stage / restore leased descriptors | before every draw / dispatch with dirty tables | any lease |
+| `GpuApi::DispatchCompute` 0x1f6ed4, `DispatchIndirectCompute` 0x6232ac | M4 post-hooks | every compute dispatch | any companion, pass, subscription |
+| state-object creator 0x315f68 + its subobject append 0x316398 | M3 swap / ADD of RT libraries | every RT state object built | any RT library |
+| global `DispatchRays` 0x2934058, `GetShaderGroupIdentifier` 0x3141f0 | M12 raygen variants; census rows | every RT dispatch | any variant, census |
+| `CRenderNodeBase::Process` 0x1ec404 | M5 node context per thread | every node run | flow resources, scope, census, debug |
+| `rend::NodeGraphFactory::Register` 0x98585c | M6 our nodes; M8 wraps (vtable slot patch) | every graph build | any node, wrap, removal, debug |
+| `SRenderFlowInternalData::HandleRequest` 0x1f0f80 | M9 record / replay; census rows | every RenderFlow request | any removal, census |
+| `job::Dispatcher::RunJob` 0x14299c | jobs carry their node | every job submission | node context (scope / census / debug) |
+| `CRenderNodeGraph::ExecuteParallel` 0xa86438 | frame tick: census windows, graph walk, profile | once per frame | always (one detour per frame) |
+| `GpuApi::UpdateBuffer`, `SetComputeShaderConstsRaw` | engine constant blocks | filtered on return address | always unless `no_hooks` |
+| `GpuApi::InitDevice` 0x7e0bb4 | registration window | once | always |
+
+Detours go through RED4ext's hooking API (`sdk->hooking->Attach`). Other plugins compare prologues in their own Load,
+so REDGraph attaches late (at `InitDevice`), after every plugin's Load.
+
+## PSO patches (M1)
+
+**Identity.** `PSOSubCache<desc>::Create(self, ComPtr* out, base, u32, u32 key, const desc*)` is the only place the
+engine's full PSO desc - every stage's bytecode - exists. The host reads the 16-byte digest of each stage's DXIL
+`HASH` chunk (`common/dxil_hash.hpp`) and looks it up in the registrations. A match: one clone per variant from the
+same desc with the client's bytecode in that stage (`CreateComputePipelineState` / `CreateGraphicsPipelineState` on the
+engine's device), stored in an insert-only open-addressing table engine PSO -> `clone[variant]` (written under a lock
+at creation, read lock-free).
+
+**Swap.** `ComputePSO::CreatePSO` / `GraphicsPSO::CreatePSO(state)` is the bind funnel: `GpuApi::SetupForDispatch` /
+`SetupForDraw` call it for the PSO to set. The detour maps the engine PSO to the selected clone (`patch_select`, one
+atomic per patch; -1 = the engine PSO). A clone the driver refused stays NULL and the engine PSO binds.
+
+**Scope (M11).** `patch_scope(patch, node)`: the funnel swaps only when the innermost node recording on this thread
+(`render_flow::current_node`) has `GetName == node` - a class (`CRenderNode_RenderSkyScattering`) or a group
+(`Lighting`). Elsewhere the engine's shader stays and `out_of_scope` counts it. Cost: one virtual `GetName` per bind of
+a scoped patch's PSO. The log names the first bind inside and the first outside.
+
+**Shader skip (debug).** If the funnel returns NULL, `SetupForDraw/Dispatch` returns false and the engine records no
+draw / dispatch (`test rax,rax; je` at 0x1401f6f7d / 0x1401f711f). The graph debug module uses that.
+
+## Leases (M2)
+
+A client's descriptor reaches a patched engine shader through the ENGINE'S OWN descriptor tables - no root-signature
+extension, zero root DWORDs.
+
+GpuApi never binds a resource into the root signature directly: `SFrameResources::BindDescriptor` writes a CPU handle
+into the context's staging array (`fr+0x28`) and marks that table dirty; `UpdateRootParams` (right before every draw /
+dispatch) copies every dirty table into the engine's shader-visible ring and sets it. So before the engine's
+`UpdateRootParams` the host stages ITS handle (a CBV / SRV / UAV in the host's CPU-only heap) into the leased register
+when the bound shader is one of the lease's owners, and gives the engine's handle back at the next other draw.
+
+The register inventory comes from the engine's root-signature DEFINITION (`fr+0x68`): per stage, CBV b0-b13, SRV
+t0-t127, UAV u0-u18 in space0; a byte map gives each register's bucket, `0xff` = not covered. A lease is granted only if:
+
+| check | when | failure |
+|---|---|---|
+| every owner blob (patch variant / companion / RT library) reads exactly that register | registration | `RG_E_*` |
+| the VANILLA shader does not read it (its `PSV0` bindings) | the engine's first PSO of that shader | the owner is refused (vanilla) |
+| the definition covers it | the first `UpdateRootParams` | never staged; patch never swaps |
+| (SRV) its table is not STATIC at that moment (`fr+0x78`, a resource pack at t0) | per draw | not staged (`static_skips`) |
+
+Leases of different shaders share a register freely: staging is per draw.
+
+**RT leases.** `UpdateRootParams` with `rays = 1` (from `GpuApi::DispatchRays`) forces the CS tables, so those are what
+raygens read. A `DispatchRays` carries no shader identity, so an RT lease stages at EVERY RT dispatch. That is safe
+because every library the engine creates is checked (its `RDAT`) not to declare the register; a source not ready
+stages a NULL descriptor. Hence **one RT lease per register in the process** - a second gets `RG_E_TAKEN`.
+
+**Companions' leases** stage at every dispatch of the engine shader they accompany (inert for the vanilla shader);
+`companion_request` is accepted only when the descriptors sit in that dispatch's table.
+
+What a lease binds today: a host cbuffer (`cbuffer_create` / `_write` / `_feed`, a ring on the engine's device; UPLOAD,
+or GPU_UPLOAD when available) or a view of a client-owned **buffer** (`view_create` / `view_set_resource`). Textures:
+see [Known gaps](#known-gaps).
+
+## RT libraries (M3)
+
+The creator `0x315f68` (`bool(StateObjectData* out, const u32* blob id)`; only caller the StateObject resource
+container's Create, from `CRenderInterface::InitDevice` and lazily from
+`CRenderAccelerationStructure::PrepareAccelerationStructures`) takes an id into the GpuApi blob container
+(`kBlobContainer`, entries `{ptr, u32 size}`). The blob is a `CPOS` wrapper as stored in `staticshader_final.cache`:
+header 0x1c, UTF-16 export names, then the DXIL library.
+
+The creator reads the DXIL bytes in ONE place - `BlobView::Range(entry + 0x14 ..)` at 0x140315fd9 - into the
+DXIL-library desc it appends at 0x316143 with `NumExports 0` (= export all); the export names at `+0x10` feed the
+hit groups / raygen names. It builds its subobject list through a 0x24-byte append (0x316398: a fixed 64 x 16 B array,
+count at +0x400, no bounds check). One detour on that append, armed per creation on the creating thread, does both:
+
+* **Swap** (a library without variants; the highest priority on that engine library): the engine's DXIL-library
+  subobject is replaced by one pointing at the client's DXIL (`NumExports 0`). The export names stay the engine's.
+  Bake-time only, no live switch.
+* **Add** (a library WITH variants): the client's library goes in right after the engine's as a second DXIL-library
+  subobject exporting ONLY the variants (`pExports`); the engine's stays byte-identical. Several clients can add to
+  one engine library (up to 8; an export name already taken in that state object is left out with a warning, and
+  `rt_variant` refuses a duplicate name up front). Such blobs carry only their variants (`rt_raygen_variant.py --only`).
+
+A failed creation is retried with nothing armed (vanilla). The shared container entry is never written, so creations
+run fully in parallel. (Until 2026-10-10 the swap rewrote the entry for the length of the call under an exclusive
+lock, which serialized every state-object build in the game behind the driver's DXR compile - tens of seconds on a
+cold driver cache.) `rtlib_stats`: swapped / added / failed state objects per library.
+
+### RT per node
+
+M12, `rt_variant(lib, raygen, variant, node)`: "in node X, instead of raygen Y run Z", switchable live.
+
+Why not a duplicate state object: `GpuApi::DispatchRays` (0x2a406e4) builds the RAYGEN record per dispatch, but the
+MISS and HIT tables are engine buffers filled with the ORIGINAL state object's identifiers - a duplicate would run
+against foreign identifiers.
+
+So: every RT node's Execute calls ONE global `DispatchRays(eRayTracingStateObject so, u32 a2..a8, BufferRef)`
+(0x2934058). `so` -> a 24 B entry at `[kRtSoTable] + 0x4648` (+0 the state-object id) -> `SetPipelineState1` on the
+`ID3D12StateObject` at device data `+0x13b2c48 + (id-1) * 0x38` - exactly the creator's `out` (+0 the ComPtr, +0x10
+the export names). `a4` = the raygen group, `a2 x a3` the grid. The hook reads the dispatch's state object, the
+libraries baked into it and the raygen's name; for a variant of that raygen that is on and in scope (highest library
+priority wins, an off one falls through) it arms a thread-local override, and the hook on `GetShaderGroupIdentifier`
+(0x3141f0 - which `GpuApi::DispatchRays` calls for exactly that raygen record) returns
+`GetShaderIdentifier(variant)`. Root signature, miss / hit tables and every other export stay the engine's.
+
+## Work on the engine's command list (M4)
+
+Post-hooks on `GpuApi::DispatchCompute` and `DispatchIndirectCompute` (attached only for a companion, a pass or a
+subscription):
+
+* **subscription** (`dispatch_subscribe`): `fn` runs right after every dispatch of an engine PSO carrying the shader,
+  on the recording thread, the engine's Dispatch already recorded. From inside `fn` a client may request:
+* **companion** (`companion_register` / `_request`): `SetPipelineState(companion) -> Dispatch ->
+  SetPipelineState(engine PSO)`. Same root signature, every root argument still bound - no restore. Scoped by
+  `companion_scope` like a patch.
+* **pass** (`pass_after_dispatch`): `fn(user, list)`; returning `RG_PASS_TOUCHED_STATE` makes the host run
+  `GpuApi::Hacks::RestoreState(list)` (0x2a3e9d4: re-ensures both root signatures - all params dirty - and re-binds
+  the heaps) and clear the PSO with both PSO states dirty.
+
+A request whose context (or, for a companion, bound PSO) changed before the engine's Dispatch returned is dropped.
+
+## Engine constant blocks
+
+`rg_engine_block` (`cbuffer_feed`, `engine_block`): copies of constant data the engine writes, caught at the write -
+`GpuApi::UpdateBuffer(BufferRef, size, data)` from `CRenderInterface::CalculateSharedConstants` (cb12, size 0x630) and
+`GpuApi::SetComputeShaderConstsRaw(size, data)` (the fog CS b6, the cloud bake's b6, the world clouds' b6). Both detours
+filter on their return address and size before taking a lock.
+
+## The render graph
+
+Not a call chain: a DATA graph, built by code and cached.
+
+| piece | what | where |
+|---|---|---|
+| nodes | ~250 classes `CRenderNode_*` : `CRenderNodeBase`; every vtable has 6 slots: [0] dtor, [1] `Execute(SRenderNodeImplContext&, job::Builder*)`, [2] `GetName(CName*)`, [3] `CreateCommandList`, [4] `GetJobBuilderUsage`, [5] `GetCommandListUsage` | e.g. `??_7CRenderNode_VolumetricFog@@6B@` 0x142b39e20 |
+| creation | `rend::NodeGraphFactory::Create<T>(group, type, subtype)` -> pool alloc -> `Register` -> `CRenderNodeGraph::AddNode` | 0x98585c |
+| groups | `rend::CRenderNodeCommandListGroup` (one vtable 0x142b3a008, name at +0x18): members `{CRenderNodeBase*, u64}` at +0x28, count +0x34, run in order by its Execute (0x1ec1d0) | `BeginCommandListGroup` 0x9853b4 |
+| edges | `AddDependency(from, to, type)` - type 0 = CPU job dependencies (a DAG through `Synchronize`), type 1 = the submission chain (one linear chain). The union is NOT acyclic - never order by both | 0x986104 |
+| caching | `CRenderGraphCache` keyed by `SCameraHash`; rebuilt on a setup change (render mode, load), not per frame | |
+| execution | `CRenderNodeGraph::ExecuteParallel` (0xa86438, one call site in `RenderFrame`) -> jobs -> group `Execute` -> `CRenderNodeBase::Process` (0x1ec404) -> `Execute` | |
+| resources | "RenderFlow": nodes request resources by NAME HASH through `SRenderFlowInternalData::HandleRequest` (0x1f0f80, 524 call sites, mostly inlined) | |
+
+**The graph is a superset.** RT, PT and raster graphs are identical by name except for the shadow cascades (raster) and
+the acceleration-structure nodes (RT / PT); the render mode is decided inside `Execute`. The top level is ~90 nodes:
+~45 command-list GROUPS (`DepthPrepass`, `GBuffer_*`, `Lighting`, `Transparents`, `PostFX`, ...), plain nodes, and
+dummy group inputs / outputs with no object. Groups hold ~300 members. [`sdk/reference/nodes.md`](../sdk/reference/nodes.md)
+lists them with their shaders.
+
+**Process.** `Process` binds the node's command list per `GetCommandListUsage` (2 = the group's own list, 1 = the flow
+thread's current list), calls `Execute` VIRTUALLY, unbinds, then - if `GetJobBuilderUsage` - runs a job with the node's
+builder and waits for it (such work records AFTER `Execute` returns). A group's `Execute` starts with
+`BindCommandList(0)` and every member unbinds after itself: nothing is bound when a group's `Execute` returns.
+`GpuApi::BindCommandList` (0x1ec68c) is a TLS binding only.
+
+### Layout
+
+`CRenderNodeGraph`: two sparse sets (`TRenderNodeGraphArray`: element data + a dense list of live indices).
+
+| field | nodes | deps |
+|---|---|---|
+| live count | +0x10 | +0x40 |
+| element data | +0x18 | +0x48 |
+| data size | +0x24 | +0x54 |
+| live list (u32*) | +0x28 | +0x58 |
+
+`SNodeData`, 48 B: +0 dense position (-1 = free), +8 type, +0xc subtype, +0x10 `CRenderNodeBase*`, +0x1c u16, +0x20 /
++0x28 in / out edge list heads (one per dependency type). `SDepData`, 24 B: +4 type, +8 from, +0xc to, +0x10 next
+out-edge, +0x14 next in-edge. Handles: node index | 1<<29, dep index | 1<<30; 0x80000000 = end of list.
+
+### Requests
+
+`SRequest`, 0x30 B: +0 u8 type, +1 u8 the flow thread (`ctx+0x38`, one per group / command list), +4 u32 the tag =
+name hash ^ (view << 24), +8 u32 param or a 40 B `SRenderFlowTargetDesc`.
+
+| type | wrapper | payload |
+|---|---|---|
+| 1 | `RTAlloc` / `RTTempAlloc` / `RTSharedAlloc` | the desc |
+| 3 | `RTIsAlloc` | - |
+| 4 | `RTUseBegin(tag, access)`: 1 read, 2 write, 4 keep the contents | access |
+| 5 | `RTUseEnd(tag)` | - |
+| 2, 7, 8, 0xb, 0xd | rare; meaning open | |
+
+**The graph runs TWICE a frame.** Phase (`[data+2]`, `SetPhase` 0x1eda84): 1 = DECLARE (every node's `Execute` runs
+with no command list and only issues requests; each is recorded per flow thread), 2 = `Resolve` then the real run.
+`Resolve` (0x24cac8) sorts the requests by (flow thread, index): a resource lives from its alloc to its last request in
+that order - the flow thread number IS the frame order of the groups (StartRender 0 ... Lighting 68 ... Transparents 74
+... PostFX 80 ... EndRender 84). **Phase 2 matches a request to its declaration by (thread, index), not by hash**: a
+request issued in one run only shifts every later request of that thread onto another resource's events. At a
+lifetime's first request the engine places an aliasing barrier (+ `DiscardTexture` unless access bit 4), at its last
+`MakeStateSafeToRetire`. State transitions are not RenderFlow's - GpuApi tracks them at bind time.
+
+`SRenderFlowTargetDesc` (40 B, ctor 0x1edcd0): +0x10 / +0x12 u16 width / height, +0x14 / +0x16 the same for an absolute
+size, +0x1a u16 array size, +0x20 u8 flags (0x39 = render target + UAV), +0x25 u8 the ENGINE's format (5 =
+R8G8B8A8_UNORM).
+
+### Resources by name (M5)
+
+`render_flow.cpp` hooks `Process` (node + ctx per recording thread, nested for group members) and resolves a name the
+way the engine's nodes do: `GetResource<TextureRef>(**(ctx+8), &id, hash ^ view << 24, ctx[0x38])` (0x1f3d20) -> the
+GpuApi texture container (`SDeviceData + 0x2F1C0`, a 0x10 header, then 32768 handles of 0xB0 B: refcount, ..., +8 the
+`ID3D12Resource*`; handle = id - 1). A transient is aliased memory: take it between its write and its last consumer,
+never across frames. `flow_transition` = the engine's `TransitionTexture` (0x1f40dc, takes a `D3D12_RESOURCE_STATES`)
++ `FlushPendingBarriers` (0x1f7164) on the thread's context.
+
+### Our own node
+
+M6 / M7. `NodeGraphFactory::Register(factory, group, SRenderNodeParameters{type, subtype, CRenderNodeBase*})` is where
+every node enters the graph; with a group open (`factory+0xf0`) it is appended to that group's members. The hook waits
+for the ANCHOR (its `GetName` hash == FNV-1a 64 of the client's `after`), then registers ours the same way: a 0x20 B
+object from the engine's pool allocator (0xa1eff0), our index at +0x18, a vtable whose slots 3..5 are copied from
+`CRenderNode_VolumetricFog`'s. The engine frees our nodes itself on every rebuild.
+
+`Execute` runs in both phases; the client's `fn` only in the real run. Because phase 2 matches by index, the node's
+RenderFlow declarations (`node_use`, `node_alloc` - a transient of ours, tag = FNV-1a 32 of its published name
+`"<mod>/<name>"`; `flow_register(name, 0)` resolves to the same tag, and `render_flow::attach` warns about a name looked
+up that nobody publishes) are issued BY
+THE HOST in both runs, identically: the allocs, an `RTUseBegin` per resource, [fn], an `RTUseEnd` per resource.
+
+### Wrapping an engine node
+
+M8, `node_wrap(target, before, after)`. The first time the engine registers a node whose `GetName` == target, slot [1]
+of its class vtable (.rdata: `VirtualProtect` + one `InterlockedExchangePointer`) becomes the host's `wrap_execute`:
+befores, the original, afters - the fns in the real run only. A vtable shared by several names (every group) is
+matched by `GetName` per call. After a group nothing is bound, so for `after` the host binds the list the group's
+members recorded into and unbinds after (`rebinds`). Several wraps on one node run in registration order.
+
+### Removing an engine node
+
+M9, `node_remove(target, on)`. Skipping `Register` would leave the engine a node handle that does not exist (top-level
+`Link`) and need a rebuild to toggle. Instead the node STAYS and only its work goes: in the declaration run its
+original runs (no list, it only declares) while the host records its requests (48 B each, up to 512 per instance); in
+the real run the host REPLAYS exactly those requests through the engine's entry instead of running it. Every alloc,
+lifetime, barrier and later node's request index stays as declared; readers of what the node writes get old /
+undefined contents. The switch is latched per node instance at its declaration run. Refused: groups and job-builder
+nodes. One removal per node class in the process.
+
+### Replacing an engine node
+
+No API of its own: `node_remove` + `node_wrap(after)` on the same class = the client's work in the removed node's
+slot, on its command list, inside the resource contract its replayed declarations keep. `RestoreState` restores root
+signatures and heaps only; the engine re-sets render targets (`SetupRenderTargets` always calls `OMSetRenderTargets`)
+and viewports itself when it needs them.
+
+### Descriptors
+
+M10, `gpu_descriptors(count)`. The engine hands out shader-visible descriptors itself:
+`GpuDescriptorRangeAllocator` at device data `+0x149de40`, `AllocateRange(alloc, Range* out, n)` (0x7744b0; Range =
+{heap, offset, count}) over a lock-free ring released by the frame's fence - in the heap the engine keeps bound
+(`GpuApi::ClearBufferUAV_Zero` 0x774384 uses it with no `SetDescriptorHeaps`). The ring heap is 1 000 000 descriptors.
+
+Before handing out a range the host makes sure the list HAS the engine's heaps bound: a context the engine has not
+drawn on yet has `SFrameResources[0]` NULL and `BindDescriptorHeaps` (0xa1ffa8) then binds nothing - so the host binds
+{ring heap, sampler heap} itself and leaves `[0]` NULL (the engine still does its full bind at its first draw);
+otherwise it runs `RestoreState`. A table set with no heap bound crashes the driver.
+
+### A patch scoped to a node
+
+See [PSO patches (M1)](#pso-patches-m1), "Scope". `companion_scope` is the same for companions, `rt_variant`'s `node`
+for raygens.
+
+### Jobs carry their node
+
+Many nodes submit jobs (`job::Dispatcher::RunJob`, 0x14299c - every submission) and wait for them; the work they
+record ran outside the node's `Process`. The hook wraps a job submitted while a node (or a job carrying one) runs:
+`{thunk, record {fn, data, node}}`; the thunk runs the job with the node set. Jobs a job submits inherit it. Left
+outside any node: `CRenderInterface::FrameTick` work (surface cache, BC compression - its own command list) and some UI
+draw-buffer batches.
+
+## Graph debug module
+
+`[Diagnostics] RenderGraphDebug = true` (restart). `graph_probe::walk` builds the node tree at every change of the
+executing graph (a KEY per node, `<parent>/<name>#<n-th among siblings>`, survives rebuilds); the census pairs every
+PSO bind with its node; under the module every node class is wrapped at `Register`. The CET window then offers:
+
+| control | how | refused |
+|---|---|---|
+| node off | M9 per INSTANCE (32 debug slots keyed by the node object), re-mapped by key at every graph change | groups as such, job-builder nodes, clients' nodes (`node_register`: recognised by the host's own node vtable, shown with the client that registered them), structural nodes (`Set*`, `End*`, `Bind*`, `AccelerationStructure*`, `Init*`, `Synchronize`, `Present`, `DoCulling`, ...) unless "allow structural" |
+| shader skip | a rule = the row's stage hashes (+ optional node key); the bind funnel returns NULL | RT rows |
+
+## Census and graph dump
+
+`[Diagnostics] RenderGraphDump = true` writes `render-graph/graph-NNN.txt` next to the DLL, one file per distinct
+graph (at most 64 per session), and for 300 frames after each new graph a census: `graph-NNN-shaders.txt` (node ->
+stage hashes, binds, PSOs; RT rows with library, raygen record, call site, grid) and `graph-NNN-resources.txt` (node ->
+RenderFlow requests by type and phase). The headers record the render mode both by config vars
+(`Config::cvPathTracing` / `cvRayTracingEnable`, value at +0x30) and by what ran. [`scripts/sdk_node_reference.py`](../scripts/sdk_node_reference.py)
+turns census files into `sdk/reference/`.
+
+## Clients tab
+
+The API carries no client identity. Every registering entry of the table is a host-side wrapper (`host.cpp`, `w_*`)
+that records the call under the MODULE its return address lies in (`clients.cpp`); a waiting client's init runs with
+its module as the fallback. Refusals found after registration (a lease's vanilla / RT check, a patch taken by a higher
+priority, a library a higher-priority swap replaces) are attached with their reason. Shown in the window's Clients tab
+with live counters, plus "Shared targets" (one shader / raygen / node / register registered by several clients) and
+"Registers". Hot calls (`*_stats`, `patch_select`, `rt_variant_set`, ...) are not wrapped.
+
+## Host CPU profile
+
+`prof.cpp`. Window tab Host -> "Host CPU profile" (`RG_Profile(delay, seconds)`). Every hot detour opens a
+`prof::Scope`; the engine's original and every client callback inside it run under a `prof::Pause`, so a point counts
+only the host's own code (rdtsc, the TSC rate measured against QPC). Not measuring = one relaxed load per Scope. A
+measured reference point (raster and PT, one spot): ~570 us/frame summed over ~19 threads, spread evenly - about 40 us
+on any one thread, below run-to-run fps noise.
+
+## Crash log
+
+`crash_log.cpp`. A vectored exception handler (first in the chain; AV, illegal instruction, stack overflow, buffer
+overrun, in-page error - not C++ exceptions; at most 12 reports; observe only, never reads memory it was not handed)
+and a watchdog thread (`GetDeviceRemovedReason` every 500 ms). Once the device is removed: DRED - the faulting GPU VA,
+the allocations around it, the breadcrumbs of unfinished command lists. DRED must be enabled before the engine creates
+its device: `[Diagnostics] Dred = true`.
+
+A first-chance access violation is logged even when an SEH handler elsewhere will catch it. Never read engine memory
+under `__try`: the engine's crash handler freezes the game on any first-chance AV.
+
+## Self-tests
+
+`REDGraphSelfTest.dll` is a client like any other; `REDGraphSelfTest.ini` next to it, section `[Tests]`:
+
+| key | covers | expected (log) |
+|---|---|---|
+| `FlowProbe = true` (+ REDGraph's `RenderGraphDump`) | M5-M10: t64 by name, `RgNode_SelfTest` after VolumetricFog with a transient read across groups, wrap of VolumetricFog and Lighting, removal of the world clouds in 600-frame windows (they vanish for 10 s), replacement by a striped sky that samples t64 through engine-ring descriptors, a second removal refused | `node self-test`, `node content test ... bad 0`, `node wrap test`, `node remove test`, `node replace test`; on screen: clouds gone / striped sky every other 10 s |
+| `RtSwapTest = 1` | M3 swap: 318cee44 WHOLE, `rgs_shadow_main` "lit" in place (no variant: swapped in the subobject list) | `rt swap test ... swapped N ... PASS` every 600 GlobalShadow runs; on screen: RT sun shadows gone for the session (switch off a client's variant of that raygen, e.g. CRT's grass shadow) |
+| `RtVariantTest = 1` / `2` | M12: 318cee44 + `rgtest_rgs_shadow_lit` (RT sun shadows "lit"), live in GlobalShadow / scoped to a foreign node; a duplicate variant name refused | `rt variant test ... swapped` grows (1: shadows vanish every other 10 s) / `out_of_scope` grows (2) |
+| `PatchScopeTest = 1` / `2` | M11: the game's own PS 0c359133 swapped for itself, scoped inside / outside its node | `scope test ... swaps` / `out_of_scope` grow |
+
+RtVariantTest, RtSwapTest and PatchScopeTest need game bytecode, which this repository does not carry: CMake builds it from the
+installed game (`scripts/make_selftest_blobs.py`, `RG_GAME_DIR` + `RG_DXC_DIR`). Without them those tests are
+compiled out and log that they are.
+
+## Finding engine addresses
+
+Names come from [cp2077-symbols](https://codeberg.org/bartmoss/cp2077-symbols) (names by address for 2.31);
+[`scripts/exe_re.py`](../scripts/exe_re.py) disassembles the exe with them: `func`, `callers`, `up` (caller tree),
+`sym`. Symbol names can be wrong where the linker folded identical functions - trust the code. A new hook needs:
+the target RVA, a known call site's return address for `call_site_ok`, and a line in `engine_231.hpp`. Verify on
+hardware with a log line before building on it.
+
+**The game version is fixed at 2.31.** The game has not been updated in over a year; hard-coded RVAs are the design.
+
+## Known gaps
+
+The order the host grows in: first what keeps the existing mechanisms whole and consistent, then the cells of the
+mechanism x kind-of-work matrix that are empty. A consumer (a glass / refraction overhaul, a strand-hair mod, ...)
+validates an item; it does not set the order.
+
+| mechanism | compute dispatch | draw | DispatchRays |
+|---|---|---|---|
+| replace the shader, live variants | yes | yes (VS / PS, GS added) | raygen only (`rt_variant`) |
+| scope to a node | yes | yes | yes |
+| lease a register | yes | yes | yes (one per register) |
+| subscription (callback after it) | yes | **no** | **no** |
+| companion (again, with every root argument bound) | yes | **no** | **no** |
+| raw pass after it | yes | **no** | **no** |
+| pipeline state beyond bytecode | - | **no** | - |
+
+0. ~~The engine-PSO map is keyed by pointer and insert-only~~ - FIXED 2026-10-10, hardware-confirmed 13:12 (`48 engine PSO(s) released by the engine` two minutes into a
+   drive, 32 left mapped; no `duplicate`): the engine
+   frees PSOs (`GpuApi::Destroy(ShaderRef)` -> `PSOSubCache::ShaderDestroyed`, material streaming); the host now holds
+   a reference on every engine PSO it maps and drops entries the engine released every 64 frames (`pso_patch.cpp`
+   `sweep_locked`; clones released one sweep later). 1. **Lease sources: textures.** `view_create` makes buffer views only (`D3D12_SRV/UAV_DIMENSION_BUFFER` in
+   `bindings.cpp`); a texture needs a dimension (the NULL descriptor must match the shader's). And an engine texture
+   found BY NAME (M5) cannot be a lease's source - a patched shader cannot read a RenderFlow texture the vanilla one
+   does not.
+2. **Several clients' patches on one PSO.** One patched stage per engine PSO: a client's VS patch and another's PS
+   patch of the same PSO conflict (the second loses). A clone with both stages (variants: the product) would compose.
+3. **PSO desc edits beyond bytecode.** A clone changes one stage's bytecode only - no rasterizer (cull mode), depth,
+   blend or render-target-format changes. A per-variant edit of a COPY of the engine's desc at clone time (a plain-C
+   mirror of the fields a client may touch, ABI-appended to `rg_patch_desc`).
+4. **The graphics wing of M4.** Draw subscriptions (after every draw of an engine PSO carrying shader X, on the
+   recording thread), then a companion draw and a raw pass after a draw. Needs the `GpuApi::Draw*` entry points found
+   and call-site-checked, near-zero cost for unsubscribed shaders.
+5. **The RT wing of M4.** An RT companion: the engine's `DispatchRays` issued again (same state object and tables,
+   another raygen, a leased output). The raygen record is built per dispatch in the upload ring
+   (`GpuApi::DispatchRays` 0x2a406e4), so the second dispatch needs its own record.
+6. Smaller: `node_wrap` cannot declare resources (`node_use`) as `node_register` can; subscriptions have no stats;
+   resources that outlive a frame cannot be published (only `node_alloc` transients) - whether the engine's RenderFlow
+   has persistent resources to hang them on is not checked; a client loading BEFORE REDGraph cannot log through the
+   host until the host's Load.

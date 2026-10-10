@@ -1,0 +1,17 @@
+# build trees
+/build*/
+/out/
+/dist/
+CMakeUserPresets.json
+.vs/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+
+# never commit game bytecode or anything extracted from the game
+*.dxil
+*.cso
+*.ll
+shader_names/

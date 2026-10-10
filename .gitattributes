@@ -1,0 +1,11 @@
+# Normalise line endings in the repository; the working tree keeps the platform default.
+* text=auto
+
+# Windows-only tooling keeps CRLF on checkout.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Generated: a byte-array header and the node reference. Not reviewed line by line.
+selftest/sky_paint_shader.hpp linguist-generated=true -diff
+sdk/reference/* linguist-generated=true
