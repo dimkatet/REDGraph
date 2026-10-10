@@ -243,6 +243,7 @@ host->rt_variant_set(v, 1);   /* live, any thread; 0 = the engine's raygen */
 | shared thing | rule |
 |---|---|
 | one engine shader patched by two clients | the higher `priority` wins (ties: the first registered); the other is refused, with the reason |
+| one draw whose VS one client patches and PS (or added GS) another | allowed: both apply, each switches on its own (a clone per combination of their variants) |
 | one register leased by shaders of two clients | allowed: each lease stages only for its own shaders |
 | one register leased for RT by two clients | the second gets `RG_E_TAKEN` |
 | one node removed by two clients | the second gets `RG_E_TAKEN` |

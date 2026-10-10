@@ -1,6 +1,7 @@
 // REDGraphSelfTest - the host's self-tests as a client plugin (selftest.hpp). Which tests run: REDGraphSelfTest.ini
 // next to the DLL, [Tests] FlowProbe = true/false (needs REDGraph's [Diagnostics] RenderGraphDump for its census
-// files), RtVariantTest = 0/1/2, RtSwapTest = 0/1, PatchScopeTest = 0/1/2, LeaseTexTest = true/false. The tests write into REDGraph's log (host->log).
+// files), RtVariantTest = 0/1/2, RtSwapTest = 0/1, PatchScopeTest = 0/1/2, LeaseTexTest = true/false,
+// ComposeTest = true/false. The tests write into REDGraph's log (host->log).
 
 #include <RED4ext/Common.hpp>
 #include <RED4ext/Api/ApiVersion.hpp>
@@ -21,7 +22,7 @@
 namespace {
 
 struct Wanted {
-  bool flow = false, lease_tex = false;
+  bool flow = false, lease_tex = false, compose = false;
   int rtv = 0, swap = 0, scope = 0;
 } g_want;
 
@@ -29,14 +30,16 @@ void on_host(const rg_host* host, void*) {
   char line[200];
   std::snprintf(line, sizeof line,
                 "selftest: REDGraph ready - FlowProbe %s, RtVariantTest %d, RtSwapTest %d, PatchScopeTest %d, "
-                "LeaseTexTest %s",
-                g_want.flow ? "on" : "off", g_want.rtv, g_want.swap, g_want.scope, g_want.lease_tex ? "on" : "off");
+                "LeaseTexTest %s, ComposeTest %s",
+                g_want.flow ? "on" : "off", g_want.rtv, g_want.swap, g_want.scope, g_want.lease_tex ? "on" : "off",
+                g_want.compose ? "on" : "off");
   host->log(RG_LOG_INFO, line);
   if (g_want.flow) selftest::flow_probe::register_with(host);
   selftest::rt_variant_test::register_with(host, g_want.rtv);
   selftest::rt_swap_test::register_with(host, g_want.swap);
   selftest::scope_test::register_with(host, g_want.scope);
   selftest::lease_tex_test::register_with(host, g_want.lease_tex);
+  selftest::compose_test::register_with(host, g_want.compose);
 }
 
 }  // namespace
@@ -52,6 +55,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle handle, RED4ex
     if (const std::string* s = ini.find("Tests", "RtSwapTest")) g_want.swap = std::atoi(s->c_str());
     if (const std::string* s = ini.find("Tests", "PatchScopeTest")) g_want.scope = std::atoi(s->c_str());
     if (const std::string* s = ini.find("Tests", "LeaseTexTest")) g_want.lease_tex = *s == "true" || *s == "1";
+    if (const std::string* s = ini.find("Tests", "ComposeTest")) g_want.compose = *s == "true" || *s == "1";
   }
   const int r = rg_host_when_ready(&on_host, nullptr);
   sdk->logger->InfoF(handle, "REDGraphSelfTest: %s, host %s", path.string().c_str(),

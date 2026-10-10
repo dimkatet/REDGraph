@@ -2,12 +2,13 @@
 // pipeline kind only if some client registered a patch / companion of that kind:
 //   PSOSubCache<compute|graphics>::Create - every PSO the engine makes, with the FULL desc: hash the stage a patch
 //     targets, run the broker's lease test BEFORE the engine creates the PSO (so a refusal is already visible to anyone
-//     asking shader_claimed from inside that creation), then build one
-//     clone per variant from the same desc.
-//   ComputePSO::CreatePSO / GraphicsPSO::CreatePSO - the bind funnel: engine PSO -> table -> clone[selected variant].
+//     asking shader_claimed from inside that creation), then build the clones from the same desc.
+//   ComputePSO::CreatePSO / GraphicsPSO::CreatePSO - the bind funnel: engine PSO -> table -> clone[selected variants].
 //     The engine binds what we return (its `!= ctx+0x3d0` compare); a switch lands at the next state change.
-// One patched stage per engine PSO (docs/internals.md "Core rules"): a graphics PSO whose VS and PS are both claimed gets
-// the VS patch, and the conflict is logged.
+// Patches COMPOSE on one engine PSO (docs/internals.md "PSO patches (M1)"): a graphics PSO may carry a VS patch, a PS
+// patch and a GS one (added) of different clients at once; a clone is built for every combination of their variants
+// (each stage also vanilla), and the bind picks the one where each patch is as it is now - selected, in scope, its
+// leases staged - independently of the others.
 
 #include <Windows.h>
 #include <d3d12.h>
@@ -117,12 +118,22 @@ constexpr uintptr_t kTomb = 1;  // a removed entry: probing goes on past it, ins
 constexpr uint32_t kSweepFrames = 64;
 // kSubOnly: an engine PSO mapped only for its dispatch subscriptions (M4c) - no clone.
 enum SlotKind : uint32_t { kPatch = 0, kComp = 1, kSubOnly = 2 };
+// What an engine PSO maps to. kPatch: up to kMaxStages patches (one per stage: VS, PS, an added GS), and a clone per
+// COMBINATION of their states - combo = sum over i of (variant_i + 1) * stride[i], 0 = vanilla, so clone[0] is the
+// engine's own (nullptr). kComp: clone[0] = the companion PSO, idx[0] its index.
+constexpr uint32_t kMaxStages = 3;
+struct Mapping {
+  ID3D12PipelineState** clone = nullptr;  // nclone entries; nullptr = that build failed (the engine PSO stays bound)
+  uint32_t nclone = 0;
+  uint32_t kind = kPatch;
+  uint32_t np = 0;
+  uint32_t idx[kMaxStages] = {};
+  uint32_t stride[kMaxStages] = {};
+  uint32_t subs = 0;  // passes' subscription mask for the shader (compute)
+};
 struct Slot {
   std::atomic<uintptr_t> engine{0};
-  ID3D12PipelineState* clone[RG_MAX_VARIANTS];  // nullptr = that build failed; the engine PSO stays bound
-  uint32_t kind;
-  uint32_t idx;
-  uint32_t subs;  // passes' subscription mask for the shader (compute)
+  Mapping m;
 };
 Slot g_slots[kSlots];
 std::atomic<uint32_t> g_entries{0};
@@ -139,7 +150,7 @@ const Slot* find(uintptr_t engine) {
   return nullptr;
 }
 
-bool insert(uintptr_t engine, ID3D12PipelineState* const* clones, uint32_t kind, uint32_t idx, uint32_t subs) {
+bool insert(uintptr_t engine, const Mapping& m) {
   AcquireSRWLockExclusive(&g_insert_lock);
   bool ok = false;
   if (!find(engine) && g_entries.load(std::memory_order_relaxed) < kMaxEntries) {
@@ -155,10 +166,7 @@ bool insert(uintptr_t engine, ID3D12PipelineState* const* clones, uint32_t kind,
     }
     if (at < kSlots) {
       Slot& s = g_slots[at];
-      std::memcpy(s.clone, clones, sizeof(s.clone));
-      s.kind = kind;
-      s.idx = idx;
-      s.subs = subs;
+      s.m = m;
       reinterpret_cast<ID3D12PipelineState*>(engine)->AddRef();  // the address stays this PSO's while mapped
       s.engine.store(engine, std::memory_order_release);
       g_entries.fetch_add(1, std::memory_order_relaxed);
@@ -169,8 +177,9 @@ bool insert(uintptr_t engine, ID3D12PipelineState* const* clones, uint32_t kind,
   return ok;
 }
 
-// Clones of entries removed by the previous sweep - released by the next one.
+// Clones (and their arrays) of entries removed by the previous sweep - released by the next one.
 std::vector<ID3D12PipelineState*> g_retired;
+std::vector<ID3D12PipelineState**> g_retired_arrays;
 std::atomic<uint64_t> g_removed{0};
 uint32_t g_sweep_frame = 0;
 bool g_said_removed = false;
@@ -179,6 +188,8 @@ bool g_said_removed = false;
 void sweep_locked() {
   for (ID3D12PipelineState* c : g_retired) c->Release();
   g_retired.clear();
+  for (ID3D12PipelineState** a : g_retired_arrays) delete[] a;
+  g_retired_arrays.clear();
   uint32_t removed = 0;
   for (Slot& s : g_slots) {
     const uintptr_t k = s.engine.load(std::memory_order_relaxed);
@@ -187,10 +198,11 @@ void sweep_locked() {
     p->AddRef();
     if (p->Release() != 1) continue;  // the engine (or anyone else) still holds it
     s.engine.store(kTomb, std::memory_order_release);
-    for (ID3D12PipelineState*& c : s.clone) {
-      if (c) g_retired.push_back(c);
-      c = nullptr;
-    }
+    for (uint32_t i = 0; i < s.m.nclone; ++i)
+      if (s.m.clone[i]) g_retired.push_back(s.m.clone[i]);
+    if (s.m.clone) g_retired_arrays.push_back(s.m.clone);  // a reader that found the slot may still index it
+    s.m.clone = nullptr;
+    s.m.nclone = 0;
     p->Release();  // ours, the last: the engine's PSO goes now
     g_entries.fetch_sub(1, std::memory_order_relaxed);
     ++removed;
@@ -212,7 +224,7 @@ SubCacheCreate_t g_orig_cs_create = nullptr, g_orig_gfx_create = nullptr;
 bool g_attached[2] = {false, false};
 bool g_want[2] = {false, false};  // which pipe kinds some registration targets (set at attach)
 bool g_want_stage[4] = {false, false, false, false};
-std::atomic<bool> g_conflict_logged{false};
+std::atomic<bool> g_composed_logged{false};
 std::atomic<bool> g_first_create{false};
 thread_local uint32_t t_bound_subs = 0;
 
@@ -235,9 +247,21 @@ int32_t find_patch(uint32_t stage, const dxil_hash::Hash& h) {
 
 struct Match {
   uint32_t kind = kPatch;
-  int32_t idx = -1;  // -1 = not ours
-  uint32_t subs = 0;  // dispatch subscriptions on the (compute) shader, whatever idx says
+  uint32_t n = 0;               // 0 = not ours; kPatch: the patches (one per stage), kComp: 1
+  int32_t idx[kMaxStages] = {};  // their indices
+  uint32_t subs = 0;            // dispatch subscriptions on the (compute) shader, whatever n says
 };
+
+// The lease test of patch i - before the engine's own creation, so a refusal is final before anyone asks
+// shader_claimed. The stage's VANILLA bytecode: a GS patch adds a stage, its leases (none can be GS) see the PS.
+bool lease_test(Pipe pipe, const void* desc_v, int32_t i) {
+  if (!bindings::patch_has_lease(i + 1)) return true;
+  const D3D12_SHADER_BYTECODE* code;
+  if (pipe == kCompute) code = &static_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(desc_v)->CS;
+  else if (g_p[i].stage != RG_STAGE_VS) code = &static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc_v)->PS;
+  else code = &static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc_v)->VS;
+  return bindings::on_patch_matched(i + 1, code->pShaderBytecode, code->BytecodeLength);
+}
 
 // Before the engine creates the PSO: which patch / companion, and the broker's lease test on the vanilla bytecode.
 Match identify(Pipe pipe, const void* desc_v) {
@@ -250,113 +274,157 @@ Match identify(Pipe pipe, const void* desc_v) {
       return m;
     }
     m.subs = passes::subs_for(h->data());
-    m.idx = find_patch(RG_STAGE_CS, *h);
-    if (m.idx < 0) {
-      const uint32_t n = g_nc.load(std::memory_order_acquire);
-      for (uint32_t i = 0; i < n; ++i) {
-        if (g_c[i].hash != *h || g_c[i].state.load() == RG_STATE_REFUSED) continue;
-        // The lease test on the vanilla bytecode, as for a patch below: a refusal leaves the engine PSO unmapped.
-        if (!bindings::on_companion_matched(static_cast<rg_handle>(i + 1), cs.pShaderBytecode, cs.BytecodeLength))
-          return m;
-        return {kComp, static_cast<int32_t>(i), m.subs};
-      }
+    const int32_t p = find_patch(RG_STAGE_CS, *h);
+    if (p >= 0) {
+      if (lease_test(pipe, desc_v, p)) m.idx[m.n++] = p;
       return m;
     }
-  } else {
-    const auto* g = static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc_v);
-    int32_t vs = -1, ps = -1;
-    if (g_want_stage[RG_STAGE_VS]) {
-      const auto h = hash_of(g->VS);
-      if (h) vs = find_patch(RG_STAGE_VS, *h);
-      else if (g->VS.pShaderBytecode) g_creates_unhashed.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t n = g_nc.load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < n; ++i) {
+      if (g_c[i].hash != *h || g_c[i].state.load() == RG_STATE_REFUSED) continue;
+      // The lease test on the vanilla bytecode, as for a patch: a refusal leaves the engine PSO unmapped.
+      if (!bindings::on_companion_matched(static_cast<rg_handle>(i + 1), cs.pShaderBytecode, cs.BytecodeLength))
+        return m;
+      m.kind = kComp;
+      m.idx[m.n++] = static_cast<int32_t>(i);
+      return m;
     }
-    if (g_want_stage[RG_STAGE_PS] || g_want_stage[RG_STAGE_GS]) {
-      const auto h = hash_of(g->PS);
-      if (h && g_want_stage[RG_STAGE_PS]) ps = find_patch(RG_STAGE_PS, *h);
-      if (h && ps < 0 && g_want_stage[RG_STAGE_GS] && !g->GS.pShaderBytecode) ps = find_patch(RG_STAGE_GS, *h);
-    }
-    if (vs >= 0 && ps >= 0 && !g_conflict_logged.exchange(true))
-      g_sdk->logger->WarnF(g_handle, "pso swap: an engine PSO carries two patched stages (VS %s, PS %s) - only the VS "
-                           "patch applies to it (one patched stage per PSO); logged once", g_p[vs].name, g_p[ps].name);
-    m.idx = vs >= 0 ? vs : ps;
-    if (m.idx < 0) return m;
+    return m;
   }
-  // The lease test - before the engine's own creation, so a refusal is final before anyone asks shader_claimed.
-  Patch& p = g_p[m.idx];
-  if (bindings::patch_has_lease(m.idx + 1)) {
-    const D3D12_SHADER_BYTECODE* code = nullptr;
-    if (pipe == kCompute) code = &static_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(desc_v)->CS;
-    else if (p.stage != RG_STAGE_VS) code = &static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc_v)->PS;
-    else code = &static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc_v)->VS;
-    if (!bindings::on_patch_matched(m.idx + 1, code->pShaderBytecode, code->BytecodeLength)) return {kPatch, -1, m.subs};
+  const auto* g = static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc_v);
+  int32_t found[kMaxStages] = {-1, -1, -1};  // VS, PS, GS (added: keyed on the PS, only where the engine has none)
+  if (g_want_stage[RG_STAGE_VS]) {
+    const auto h = hash_of(g->VS);
+    if (h) found[0] = find_patch(RG_STAGE_VS, *h);
+    else if (g->VS.pShaderBytecode) g_creates_unhashed.fetch_add(1, std::memory_order_relaxed);
   }
+  if (g_want_stage[RG_STAGE_PS] || g_want_stage[RG_STAGE_GS]) {
+    const auto h = hash_of(g->PS);
+    if (h && g_want_stage[RG_STAGE_PS]) found[1] = find_patch(RG_STAGE_PS, *h);
+    if (h && g_want_stage[RG_STAGE_GS] && !g->GS.pShaderBytecode) found[2] = find_patch(RG_STAGE_GS, *h);
+  }
+  for (const int32_t p : found)
+    if (p >= 0 && lease_test(pipe, desc_v, p)) m.idx[m.n++] = p;
   return m;
 }
 
+const char* stage_label(uint32_t s) { return s == RG_STAGE_VS ? "VS" : s == RG_STAGE_PS ? "PS" : s == RG_STAGE_GS ? "GS" : "CS"; }
+
+// Every combination of the matched patches' variants (combo 0 = all vanilla = the engine PSO itself), or the companion.
 void build(Pipe pipe, ID3D12PipelineState* engine, const void* desc_v, const Match& m) {
-  const rg_blob* blobs;
-  uint32_t n;
-  const char* name;
-  uint32_t stage;
-  Counters* c;
-  if (m.kind == kComp) {
-    blobs = &g_c[m.idx].cs, n = 1, name = g_c[m.idx].name, stage = RG_STAGE_CS, c = &g_c[m.idx].c;
-  } else {
-    Patch& p = g_p[m.idx];
-    blobs = p.v, n = p.n, name = p.name, stage = p.stage, c = &p.c;
+  Mapping map;
+  map.kind = m.kind;
+  map.np = m.n;
+  map.subs = m.subs;
+  uint32_t total = 1;
+  for (uint32_t i = 0; i < m.n; ++i) {
+    map.idx[i] = static_cast<uint32_t>(m.idx[i]);
+    map.stride[i] = total;
+    total *= m.kind == kComp ? 1u : g_p[m.idx[i]].n + 1;
   }
-  ID3D12PipelineState* clones[RG_MAX_VARIANTS] = {};
+  if (m.kind == kComp) total = 1;  // clone[0] = the companion
+  map.nclone = total;
+  map.clone = new ID3D12PipelineState*[total]();
   ID3D12Device* dev = nullptr;
-  HRESULT hr = engine->GetDevice(IID_PPV_ARGS(&dev));
-  uint32_t built = 0;
-  for (uint32_t v = 0; v < n && SUCCEEDED(hr); ++v) {
-    const D3D12_SHADER_BYTECODE ours{blobs[v].bytes, blobs[v].size};
+  const HRESULT hr = engine->GetDevice(IID_PPV_ARGS(&dev));
+  uint32_t built = 0, failed = 0;
+  uint32_t built_with[kMaxStages] = {};
+  for (uint32_t combo = m.kind == kComp ? 0u : 1u; combo < total && SUCCEEDED(hr); ++combo) {
     HRESULT vhr;
+    uint32_t e[kMaxStages] = {};  // per patch: 0 vanilla, v + 1 = variant v
     if (pipe == kCompute) {
       D3D12_COMPUTE_PIPELINE_STATE_DESC d = *static_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(desc_v);
-      d.CS = ours;
+      const rg_blob& b = m.kind == kComp ? g_c[m.idx[0]].cs : g_p[m.idx[0]].v[combo - 1];
+      e[0] = m.kind == kComp ? 1u : combo;  // a compute patch: combo = variant + 1
+      d.CS = {b.bytes, b.size};
       d.CachedPSO = {};
-      vhr = dev->CreateComputePipelineState(&d, IID_PPV_ARGS(&clones[v]));
+      vhr = dev->CreateComputePipelineState(&d, IID_PPV_ARGS(&map.clone[combo]));
     } else {
       D3D12_GRAPHICS_PIPELINE_STATE_DESC d = *static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc_v);
-      (stage == RG_STAGE_GS ? d.GS : stage == RG_STAGE_PS ? d.PS : d.VS) = ours;
+      for (uint32_t i = 0; i < m.n; ++i) {
+        const Patch& p = g_p[m.idx[i]];
+        e[i] = (combo / map.stride[i]) % (p.n + 1);
+        if (!e[i]) continue;
+        const rg_blob& b = p.v[e[i] - 1];
+        (p.stage == RG_STAGE_GS ? d.GS : p.stage == RG_STAGE_PS ? d.PS : d.VS) = {b.bytes, b.size};
+      }
       d.CachedPSO = {};
-      vhr = dev->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&clones[v]));
+      vhr = dev->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&map.clone[combo]));
     }
     if (SUCCEEDED(vhr)) {
       ++built;
-    } else {
-      clones[v] = nullptr;
-      c->clone_failed.fetch_add(1);
-      c->last_hr.store(static_cast<uint32_t>(vhr));
-      g_sdk->logger->ErrorF(g_handle, "pso swap: clone build FAILED for %s variant %u (engine PSO %p), hr 0x%08x - "
-                            "engine PSO stays", name, v, static_cast<void*>(engine), static_cast<unsigned>(vhr));
+      for (uint32_t i = 0; i < m.n; ++i) built_with[i] += e[i] ? 1u : 0u;
+      continue;
     }
+    map.clone[combo] = nullptr;
+    ++failed;
+    char what[160];
+    int at = 0;
+    for (uint32_t i = 0; i < m.n; ++i) {
+      if (!e[i]) continue;
+      Counters& c = m.kind == kComp ? g_c[m.idx[i]].c : g_p[m.idx[i]].c;
+      c.clone_failed.fetch_add(1);
+      c.last_hr.store(static_cast<uint32_t>(vhr));
+      at += std::snprintf(what + at, sizeof what - at, "%s%s variant %u", at ? " + " : "",
+                          m.kind == kComp ? g_c[m.idx[i]].name : g_p[m.idx[i]].name, e[i] - 1);
+      if (at >= static_cast<int>(sizeof what)) break;
+    }
+    g_sdk->logger->ErrorF(g_handle, "pso swap: clone build FAILED for %s (engine PSO %p), hr 0x%08x - engine PSO stays "
+                          "for that combination", what, static_cast<void*>(engine), static_cast<unsigned>(vhr));
   }
   if (dev) dev->Release();
-  const uint32_t k = c->engine_psos.fetch_add(1) + 1;
-  c->clones.fetch_add(built);
-  if (!insert(reinterpret_cast<uintptr_t>(engine), clones, m.kind, static_cast<uint32_t>(m.idx), m.subs)) {
-    for (ID3D12PipelineState* cl : clones)
-      if (cl) cl->Release();  // a duplicate Create for a PSO we already map, or the table is full
+  uint32_t k[kMaxStages] = {};
+  for (uint32_t i = 0; i < m.n; ++i) {
+    Counters& c = m.kind == kComp ? g_c[m.idx[i]].c : g_p[m.idx[i]].c;
+    k[i] = c.engine_psos.fetch_add(1) + 1;
+    c.clones.fetch_add(built_with[i]);
+  }
+  const char* name = m.kind == kComp ? g_c[m.idx[0]].name : g_p[m.idx[0]].name;
+  if (!insert(reinterpret_cast<uintptr_t>(engine), map)) {
+    for (uint32_t i = 0; i < map.nclone; ++i)
+      if (map.clone[i]) map.clone[i]->Release();  // a duplicate Create for a PSO we already map, or the table is full
+    delete[] map.clone;
     g_sdk->logger->WarnF(g_handle, "pso swap: %s engine PSO %p not mapped (duplicate or table full, %u entries)", name,
                          static_cast<void*>(engine), g_entries.load());
     return;
   }
-  if (built && (k == 1 || (k <= 3 && verbose())))  // the first clone says it works; more with VerboseLog
-    g_sdk->logger->InfoF(g_handle, "pso swap: %s engine PSO %p -> clone %p%s (#%u for it, %u of %u variants)", name,
-                         static_cast<void*>(engine), static_cast<void*>(clones[0]), m.kind == kComp ? " (companion)" : "",
-                         k, built, n);
+  if (m.n > 1 && (!g_composed_logged.exchange(true) || verbose())) {
+    char who[240];
+    int at = 0;
+    for (uint32_t i = 0; i < m.n && at < static_cast<int>(sizeof who); ++i)
+      at += std::snprintf(who + at, sizeof who - at, "%s%s '%s'", i ? " + " : "", stage_label(g_p[m.idx[i]].stage),
+                          g_p[m.idx[i]].name);
+    g_sdk->logger->InfoF(g_handle, "pso swap: engine PSO %p carries %u patches - %s: %u of %u combination(s) built, %u "
+                         "failed (the first such PSO; more with VerboseLog)", static_cast<void*>(engine), m.n, who,
+                         built, total - 1, failed);
+  }
+  for (uint32_t i = 0; i < m.n; ++i) {
+    // the first clone of each patch says it works; more with VerboseLog
+    if (!built_with[i] || !(k[i] == 1 || (k[i] <= 3 && verbose()))) continue;
+    const bool comp = m.kind == kComp;
+    const uint32_t nv = comp ? 1u : g_p[m.idx[i]].n;
+    if (m.n == 1)
+      g_sdk->logger->InfoF(g_handle, "pso swap: %s engine PSO %p -> clone %p%s (#%u for it, %u of %u variants)",
+                           comp ? g_c[m.idx[i]].name : g_p[m.idx[i]].name, static_cast<void*>(engine),
+                           static_cast<void*>(map.clone[comp ? 0 : map.stride[i]]), comp ? " (companion)" : "", k[i],
+                           built, nv);
+    else  // composed: the clones carrying this patch's variants, in every state of the other patches
+      g_sdk->logger->InfoF(g_handle, "pso swap: %s engine PSO %p -> clone %p (#%u for it, composed: %u clone(s) carry "
+                           "its %u variant(s))", g_p[m.idx[i]].name, static_cast<void*>(engine),
+                           static_cast<void*>(map.clone[map.stride[i]]), k[i], built_with[i], nv);
+  }
 }
 
 void on_create(Pipe pipe, void** out, const void* desc, const Match& m) {
   if (!out || !*out || !desc) return;
   g_creates[pipe].fetch_add(1, std::memory_order_relaxed);
-  if (m.idx >= 0) {
+  if (m.n) {
     build(pipe, static_cast<ID3D12PipelineState*>(*out), desc, m);
   } else if (m.subs) {
-    ID3D12PipelineState* none[RG_MAX_VARIANTS] = {};
-    if (!insert(reinterpret_cast<uintptr_t>(*out), none, kSubOnly, 0, m.subs))
+    Mapping sub;
+    sub.kind = kSubOnly;
+    sub.subs = m.subs;
+    if (!insert(reinterpret_cast<uintptr_t>(*out), sub))
       g_sdk->logger->WarnF(g_handle, "pso swap: subscribed engine PSO %p not mapped (duplicate or table full)", *out);
   }
 }
@@ -415,23 +483,33 @@ ID3D12PipelineState* swap(Pipe pipe, const void* state, ID3D12PipelineState* eng
   if (engine && graph_debug::skip(pipe, engine)) out = nullptr;
   else if (engine && g_entries.load(std::memory_order_relaxed) != 0) {
     if (const Slot* s = find(reinterpret_cast<uintptr_t>(engine))) {
-      if (pipe == kCompute) t_bound_subs = s->subs;
-      if (s->kind == kSubOnly) {
+      const Mapping& m = s->m;
+      if (pipe == kCompute) t_bound_subs = m.subs;
+      if (m.kind == kSubOnly) {
         // subscriptions only - the engine PSO stays bound
-      } else if (s->kind == kComp) {
-        g_c[s->idx].c.engine_hits.fetch_add(1, std::memory_order_relaxed);  // a companion is never bound in its place
-        if (pipe == kCompute) bindings::companion_bind(static_cast<rg_handle>(s->idx + 1), state);  // learns the ref
+      } else if (m.kind == kComp) {
+        g_c[m.idx[0]].c.engine_hits.fetch_add(1, std::memory_order_relaxed);  // a companion is never bound in its place
+        if (pipe == kCompute) bindings::companion_bind(static_cast<rg_handle>(m.idx[0] + 1), state);  // learns the ref
       } else {
-        Patch& p = g_p[s->idx];
-        p.c.engine_hits.fetch_add(1, std::memory_order_relaxed);
-        const int32_t v = p.variant.load(std::memory_order_relaxed);
-        const bool in_scope = !p.scope.any() || in_node(p.scope, p.name, "bind");
-        const bool on = v >= 0 && p.state.load(std::memory_order_relaxed) != RG_STATE_REFUSED && in_scope;
-        const rg_handle h = static_cast<rg_handle>(s->idx + 1);
-        const bool ok = !bindings::patch_has_lease(h) || bindings::bind_ok(h, state, pipe == kCompute, on);
-        if (on && ok && s->clone[v]) {
-          out = s->clone[v];
-          p.c.swaps.fetch_add(1, std::memory_order_relaxed);
+        // Each patch on its own: selected, in its node, its leases staged - the clone of exactly that combination.
+        uint32_t combo = 0, active = 0;
+        for (uint32_t i = 0; i < m.np; ++i) {
+          Patch& p = g_p[m.idx[i]];
+          p.c.engine_hits.fetch_add(1, std::memory_order_relaxed);
+          const int32_t v = p.variant.load(std::memory_order_relaxed);
+          const bool in_scope = !p.scope.any() || in_node(p.scope, p.name, "bind");
+          const bool on = v >= 0 && v < static_cast<int32_t>(p.n) &&
+                          p.state.load(std::memory_order_relaxed) != RG_STATE_REFUSED && in_scope;
+          const rg_handle h = static_cast<rg_handle>(m.idx[i] + 1);
+          const bool ok = !bindings::patch_has_lease(h) || bindings::bind_ok(h, state, pipe == kCompute, on);
+          if (!on || !ok) continue;
+          combo += static_cast<uint32_t>(v + 1) * m.stride[i];
+          active |= 1u << i;
+        }
+        if (combo && combo < m.nclone && m.clone[combo]) {
+          out = m.clone[combo];
+          for (uint32_t i = 0; i < m.np; ++i)
+            if (active & (1u << i)) g_p[m.idx[i]].c.swaps.fetch_add(1, std::memory_order_relaxed);
         }
       }
     }
@@ -674,8 +752,8 @@ bool patch_selected(rg_handle h) {
 ID3D12PipelineState* companion_of(ID3D12PipelineState* engine, rg_handle h) {
   if (!engine || g_entries.load(std::memory_order_relaxed) == 0) return nullptr;
   const Slot* s = find(reinterpret_cast<uintptr_t>(engine));
-  if (!s || s->kind != kComp || s->idx + 1 != static_cast<uint32_t>(h)) return nullptr;
-  return s->clone[0];
+  if (!s || s->m.kind != kComp || s->m.idx[0] + 1 != static_cast<uint32_t>(h)) return nullptr;
+  return s->m.clone[0];
 }
 
 bool companion_info(rg_handle h, rg_blob* cs) {

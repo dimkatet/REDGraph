@@ -65,8 +65,9 @@ native part out (for a bisect).
   return address must land on the target. A different exe fails the check and that mechanism stays off.
 * **Variants are built eagerly.** The full PSO desc exists only inside `PSOSubCache::Create`, so all of a patch's
   variants (up to `RG_MAX_VARIANTS`) are cloned there at once; the bind funnel then picks one per bind.
-* **One patched stage per engine PSO.** A graphics PSO whose VS and PS are both claimed gets the first claim; the second
-  is logged as a conflict.
+* **Patches of different stages compose on one engine PSO** (since 2026-10-10): a VS, a PS and an added GS patch -
+  any clients' - each switch on their own; see [PSO patches (M1)](#pso-patches-m1). One stage of one shader is still
+  ONE patch (below).
 * **Two clients on one target: one wins** - higher `priority`, ties by registration order. The loser gets
   `RG_E_TAKEN` (or is refused later with the reason in the Clients tab).
 * **A handle belongs to the module that made it.** `clients.cpp` records the owner of every handle (the module the
@@ -117,6 +118,16 @@ engine's full PSO desc - every stage's bytecode - exists. The host reads the 16-
 same desc with the client's bytecode in that stage (`CreateComputePipelineState` / `CreateGraphicsPipelineState` on the
 engine's device), stored in an insert-only open-addressing table engine PSO -> `clone[variant]` (written under a lock
 at creation, read lock-free).
+
+**Composition.** A graphics PSO's VS, PS and (added) GS may each be patched - by different clients. The PSO's
+mapping then holds those patches and a clone for EVERY combination of their states: with variant counts n_i, prod(n_i
++ 1) - 1 clones, `combo = sum (variant_i + 1) * stride_i` (`stride` the mixed radix; combo 0 = all vanilla = the engine
+PSO). At the bind each patch decides alone - selected, in scope, its leases staged - and the funnel returns
+`clone[combo]`; a patch that is off (or whose lease did not stage for this draw) leaves its stage vanilla without
+taking the others with it. A combination that failed to build keeps the engine PSO for that combination only (logged
+with every patch in it). Worst case 4 variants on 3 stages = 124 clones of one engine PSO, built on the engine's own
+PSO-creation thread like the rest. Until 2026-10-10 a PSO took ONE patch (the VS won, the PS patch was logged and lost
+there). `ComposeTest`.
 
 **Swap.** `ComputePSO::CreatePSO` / `GraphicsPSO::CreatePSO(state)` is the bind funnel: `GpuApi::SetupForDispatch` /
 `SetupForDraw` call it for the PSO to set. The detour maps the engine PSO to the selected clone (`patch_select`, one
@@ -448,9 +459,10 @@ under `__try`: the engine's crash handler freezes the game on any first-chance A
 | `RtSwapTest = 1` | M3 swap: 318cee44 WHOLE, `rgs_shadow_main` "lit" in place (no variant: swapped in the subobject list) | `rt swap test ... swapped N ... PASS` every 600 GlobalShadow runs; on screen: RT sun shadows gone for the session (switch off a client's variant of that raygen, e.g. CRT's grass shadow) |
 | `RtVariantTest = 1` / `2` | M12: 318cee44 + `rgtest_rgs_shadow_lit` (RT sun shadows "lit"), live in GlobalShadow / scoped to a foreign node; a duplicate variant name refused | `rt variant test ... swapped` grows (1: shadows vanish every other 10 s) / `out_of_scope` grows (2) |
 | `PatchScopeTest = 1` / `2` | M11: the game's own PS 0c359133 swapped for itself, scoped inside / outside its node | `scope test ... swaps` / `out_of_scope` grow |
+| `ComposeTest = true` | M1 composition: VS 69090ccd (2 variants) and PS 0c359133 (1), the game's own bytecode swapped for itself, on the sky pass's PSO; four phases of 600 sky runs: VS only, both, PS only, none | `engine PSO ... carries 2 patches ... 5 of 5 combination(s) built`, then per phase `compose test A/B/C/D ... -> PASS` (swaps grow exactly for the patches switched on). Nothing on screen; takes CRT's sky patch for the session |
 | `LeaseTexTest = true` | M2 texture sources: a companion of the tonemapping-LUT CS 88c57ef1 (scoped to `CRenderNode_GenerateTonemappingLUT`, after the frame's third dispatch) reads our 4x4x2 R32_UINT texture through a 2D_ARRAY view of slice 1 (t64) and the engine's LUT `2ae9f45c` by name through a 3D UAV view (u16) into our raw buffer (u17); the registration checks (a raw view at a Texture2DArray refused, a cube UAV refused, a buffer into a texture view / a resource into a flow view refused) | `lease tex test: registered`, `views set`, then every 300 frames `lease tex test #N ... client texture 16/16 = slice 1 ... LUT texels 2/2 equal to the copy ... PASS`. Nothing on screen |
 
-RtVariantTest, RtSwapTest and PatchScopeTest need game bytecode, which this repository does not carry: CMake builds it from the
+RtVariantTest, RtSwapTest, PatchScopeTest and ComposeTest need game bytecode, which this repository does not carry: CMake builds it from the
 installed game (`scripts/make_selftest_blobs.py`, `RG_GAME_DIR` + `RG_DXC_DIR`). Without them those tests are
 compiled out and log that they are.
 
@@ -491,8 +503,10 @@ validates an item; it does not set the order.
    the owners' declared ResourceKind checked against the view at registration (buffers too: raw vs structured). Left
    open: a flow source declares nothing to the engine (gap 6, `node_wrap` + `node_use`) - its lifetime and state are
    the client's.
-2. **Several clients' patches on one PSO.** One patched stage per engine PSO: a client's VS patch and another's PS
-   patch of the same PSO conflict (the second loses). A clone with both stages (variants: the product) would compose.
+2. ~~**Several clients' patches on one PSO.**~~ DONE 2026-10-10, hardware-confirmed 20:38 (`ComposeTest` 5/5 PASS;
+   both on: VS +909, PS +185 swaps; `5 of 5 combination(s) built, 0 failed`): VS, PS
+   and an added GS patch compose on one engine PSO, a clone per combination of their variants, each switched alone
+   (PSO patches (M1), "Composition").
 3. **PSO desc edits beyond bytecode.** A clone changes one stage's bytecode only - no rasterizer (cull mode), depth,
    blend or render-target-format changes. A per-variant edit of a COPY of the engine's desc at clone time (a plain-C
    mirror of the fields a client may touch, ABI-appended to `rg_patch_desc`).

@@ -27,4 +27,8 @@ namespace lease_tex_test {  // [Tests] LeaseTexTest: M2 texture sources (a clien
 void register_with(const rg_host* host, bool on);
 }  // namespace lease_tex_test
 
+namespace compose_test {  // [Tests] ComposeTest: M1 composition (a VS and a PS patch on one engine PSO)
+void register_with(const rg_host* host, bool on);
+}  // namespace compose_test
+
 }  // namespace selftest

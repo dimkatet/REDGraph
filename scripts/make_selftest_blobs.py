@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The self-test's GAME-DERIVED blobs, built from the game installed on this machine.
 
-The repository carries no bytecode of the game. Two self-tests need some, so the build makes it from the game's own
+The repository carries no bytecode of the game. Some self-tests need it, so the build makes it from the game's own
 shader caches with the SDK's tools - the same path a modder takes:
 
   patches/rt_variant_test_318cee44.hpp   RtVariantTest: the RT sun-shadow library 318cee44 reduced to one extra
@@ -10,6 +10,7 @@ shader caches with the SDK's tools - the same path a modder takes:
   patches/rt_swap_test_318cee44.hpp      RtSwapTest: the WHOLE library 318cee44 with rgs_shadow_main's stores "lit"
                                          IN PLACE - no variant, so the host swaps it in for the engine's (M3 swap)
   patches/selftest_vanilla_0c359133.hpp  PatchScopeTest: the sky-cube PS 0c359133 byte for byte (extract -> header)
+  patches/selftest_vanilla_69090ccd.hpp  ComposeTest: the sky passes' VS 69090ccd byte for byte (with 0c359133: one PSO)
 
     python scripts/make_selftest_blobs.py --game <Cyberpunk 2077 install> --dxc <DXC bin/x64> --out <dir>
 
@@ -27,6 +28,7 @@ TOOLS = ROOT / "sdk" / "tools"
 
 RT_HASH = "318cee441b4f0c3b27de656dff3c59c0"
 SKY_HASH = "0c35913398007b9717872af88f5f480f"
+SKY_VS_HASH = "69090ccdf2e91e0bd1cc70d88a0b8434"  # the sky passes' VS: with SKY_HASH in one PSO (ComposeTest)
 
 
 def run(*args):
@@ -67,7 +69,7 @@ def main():
     patches.mkdir(parents=True, exist_ok=True)
     cache, dxil, variant = TOOLS / "rg_shader_cache.py", TOOLS / "rg_dxil.py", TOOLS / "rt_raygen_variant.py"
 
-    run(cache, "extract", RT_HASH, SKY_HASH, "--game", a.game, "--out", work)
+    run(cache, "extract", RT_HASH, SKY_HASH, SKY_VS_HASH, "--game", a.game, "--out", work)
     run(dxil, "dis", work / f"{RT_HASH}.dxil", work / "318cee44_clean.ll", "--dxc", a.dxc)
     run(variant, work / "318cee44_clean.ll", work / "318cee44_lit.ll", "--clone", "rgs_shadow_main",
         "--as", "rgtest_rgs_shadow_lit", "--edit", "lit", "--only", "--prefix", "rgtest_")
@@ -80,6 +82,8 @@ def main():
         "--symbol", "RtSwapTest318cee44", "--namespace", "patches")
     run(dxil, "header", work / f"{SKY_HASH}.dxil", patches / "selftest_vanilla_0c359133.hpp",
         "--symbol", "SelftestVanilla0c359133", "--namespace", "patches")
+    run(dxil, "header", work / f"{SKY_VS_HASH}.dxil", patches / "selftest_vanilla_69090ccd.hpp",
+        "--symbol", "SelftestVanilla69090ccd", "--namespace", "patches")
     print(f"self-test blobs -> {patches}")
 
 

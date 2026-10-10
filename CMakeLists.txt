@@ -117,6 +117,7 @@ if(RG_BUILD_SELFTEST)
     selftest/rt_swap_test.cpp
     selftest/scope_test.cpp
     selftest/lease_tex_test.cpp
+    selftest/compose_test.cpp
     selftest/sky_paint_shader.hpp
     selftest/lease_tex_shader.hpp
   )
@@ -137,7 +138,7 @@ if(RG_BUILD_SELFTEST)
      AND EXISTS "${RG_DXC_DIR}/dxcompiler.dll")
     set(rg_gen "${CMAKE_BINARY_DIR}/selftest_blobs")
     set(rg_blobs "${rg_gen}/patches/rt_variant_test_318cee44.hpp" "${rg_gen}/patches/rt_swap_test_318cee44.hpp"
-                 "${rg_gen}/patches/selftest_vanilla_0c359133.hpp")
+                 "${rg_gen}/patches/selftest_vanilla_0c359133.hpp" "${rg_gen}/patches/selftest_vanilla_69090ccd.hpp")
     add_custom_command(
       OUTPUT ${rg_blobs}
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/make_selftest_blobs.py"
