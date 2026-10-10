@@ -118,6 +118,7 @@ if(RG_BUILD_SELFTEST)
     selftest/scope_test.cpp
     selftest/lease_tex_test.cpp
     selftest/compose_test.cpp
+    selftest/state_test.cpp
     selftest/sky_paint_shader.hpp
     selftest/lease_tex_shader.hpp
   )

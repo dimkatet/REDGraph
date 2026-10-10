@@ -214,6 +214,15 @@ __declspec(noinline) rg_handle w_view_create(uint32_t kind, uint32_t stride, uin
   return r;
 }
 
+__declspec(noinline) int32_t w_patch_state(rg_handle patch, uint32_t variant, const rg_pso_state* s) {
+  int32_t r = clients::owner_check(_ReturnAddress(), clients::sPatch, patch, "patch_state");
+  if (!r) r = pso::patch_state(patch, variant, s);
+  char t[48] = "";
+  if (s) std::snprintf(t, sizeof t, "variant %u, groups 0x%x", variant, s->set);
+  clients::note(_ReturnAddress(), clients::kPatchState, r, patch, clients::name_of(clients::kPatch, patch).c_str(), t);
+  return r;
+}
+
 __declspec(noinline) rg_handle w_view_create_texture(uint32_t kind, const rg_texture_view_desc* d, uint32_t ring) {
   rg_handle r = d && d->flow > 0 ? clients::owner_check(_ReturnAddress(), clients::sFlow, d->flow, "view_create_texture")
                                  : 0;
@@ -390,6 +399,7 @@ const rg_host kHost = {
     &w_companion_scope,
     &rtlib::stats,
     &w_view_create_texture,
+    &w_patch_state,
 };
 
 }  // namespace

@@ -8,6 +8,8 @@
 - A mod's call made from inside one of its callbacks is no longer mistaken for another module's (and refused).
 - Several mods can patch the same draw at once when they patch different shader stages (vertex / pixel / geometry);
   each one switches on and off on its own.
+- A patch can also change how the game draws with a shader (culling, wireframe, depth test, blending, write masks,
+  target formats), with or without replacing the shader itself.
 - The log lists which registers of the game's tables a lease can use, per shader stage.
 
 ## 0.1.1

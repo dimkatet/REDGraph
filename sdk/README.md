@@ -92,6 +92,7 @@ The header documents each call in detail. This table is the map: which call you 
 |---|---|---|
 | your bytecode instead of an engine shader (VS / PS / CS) | `patch_register` (M1) | up to 4 variants, `patch_select` switches live (-1 = vanilla). Two clients on one shader: the higher `priority` wins |
 | ... only inside one node | `patch_scope` (M11) | up to 4 nodes; elsewhere the engine's shader stays |
+| change the engine PSO's pipeline state (cull, fill, depth, blend, write masks, formats) per variant, with or without new bytecode | `patch_state` (M1) | a variant blob `{NULL, 0}` keeps the engine's shader |
 | data into your patched shader | `cbuffer_create` / `cbuffer_write`, `view_create` / `view_create_texture` / `view_set_resource`, `lease_register` (M2) | binds into a **free space0 register of the engine's own tables**, so it costs 0 root-signature DWORDs. See section 5 |
 | the engine's own constants | `cbuffer_feed`, `engine_block` | fog, clouds, `cb12` (the shared per-frame constants) |
 | an extra compute pass right after an engine dispatch, with all its bindings | `companion_register` + `companion_request` (M4a), `companion_scope` | the companion reads exactly what the engine's dispatch had bound |

@@ -91,11 +91,47 @@ typedef struct rg_patch_desc {
   const char* name;           /* for the log */
   uint32_t stage;             /* rg_stage: the stage whose bytecode is replaced */
   uint8_t hash[16];           /* the engine shader's DXIL HASH chunk */
-  const rg_blob* variants;   /* 1..RG_MAX_VARIANTS blobs; a clone per variant is built when the engine makes a PSO */
+  const rg_blob* variants;   /* 1..RG_MAX_VARIANTS blobs; a clone per variant is built when the engine makes a PSO.
+                                 VS / PS: {NULL, 0} = the ENGINE's bytecode stays - a variant that only changes the
+                                 pipeline state (rg_host::patch_state); such a variant can hold no lease */
   uint32_t variant_count;
   int32_t initial_variant;    /* -1 = vanilla until rg_host::patch_select */
   int32_t priority;           /* two clients on one shader: the higher one wins, ties go to the first registered */
 } rg_patch_desc;
+
+/* ---- M1 (2026-10-10): a variant's PIPELINE STATE beyond the bytecode (rg_host::patch_state), graphics only ----
+ * A copy of the engine's own desc is edited at clone time, group by group: only the groups named in `set` change,
+ * the rest stays the engine's. Composed patches (one VS + one PS + one GS on a PSO) apply theirs in stage order VS,
+ * PS, GS - a later one that sets a group an earlier one set wins (logged). The engine still binds ITS render targets
+ * and depth buffer: a format edit must match what it binds, or the draw is invalid - yours to know. */
+#define RG_PSO_CULL 1u        /* cull_mode */
+#define RG_PSO_FILL 2u        /* fill_mode */
+#define RG_PSO_DEPTH_BIAS 4u  /* depth_bias, depth_bias_clamp, slope_scaled_depth_bias */
+#define RG_PSO_DEPTH 8u       /* depth_enable, depth_write, depth_func */
+#define RG_PSO_BLEND 16u      /* blend, for each render target in rt_mask (write masks untouched) */
+#define RG_PSO_WRITE_MASK 32u /* write_mask[i], for each render target i in rt_mask */
+#define RG_PSO_FORMATS 64u    /* num_render_targets, rtv_formats, dsv_format */
+typedef struct rg_pso_blend {
+  uint32_t enable;                    /* 0 / 1 */
+  uint32_t src, dst, op;              /* D3D12_BLEND, D3D12_BLEND, D3D12_BLEND_OP */
+  uint32_t src_alpha, dst_alpha, op_alpha;
+} rg_pso_blend;
+typedef struct rg_pso_state {
+  uint32_t struct_size;               /* sizeof(rg_pso_state) - fields are only ever appended */
+  uint32_t set;                       /* RG_PSO_* */
+  uint32_t cull_mode;                 /* D3D12_CULL_MODE: 1 none, 2 front, 3 back */
+  uint32_t fill_mode;                 /* D3D12_FILL_MODE: 2 wireframe, 3 solid */
+  int32_t depth_bias;
+  float depth_bias_clamp, slope_scaled_depth_bias;
+  uint32_t depth_enable, depth_write; /* 0 / 1 */
+  uint32_t depth_func;                /* D3D12_COMPARISON_FUNC (1..8) */
+  uint32_t rt_mask;                   /* bit i = render target i, for RG_PSO_BLEND / RG_PSO_WRITE_MASK */
+  rg_pso_blend blend;
+  uint8_t write_mask[8];              /* D3D12_COLOR_WRITE_ENABLE bits per render target */
+  uint32_t num_render_targets;        /* 0..8 */
+  uint32_t rtv_formats[8];            /* DXGI_FORMAT */
+  uint32_t dsv_format;
+} rg_pso_state;
 
 typedef struct rg_patch_stats {
   uint32_t state;         /* rg_state */
@@ -495,6 +531,10 @@ typedef struct rg_host {
    * a state your shader may read it in (flow_transition in a node_wrap `before`) unless the engine already left it so.
    * view_set_resource on such a view is RG_E_ARG. */
   rg_handle (*view_create_texture)(uint32_t kind, const rg_texture_view_desc* desc, uint32_t ring);
+
+  /* M1 (2026-10-10): variant `variant` of a VS / PS / GS patch also changes the engine PSO's pipeline state
+   * (rg_pso_state). Register-time; once per variant (a second call replaces the first). 0 = ok. */
+  int32_t (*patch_state)(rg_handle patch, uint32_t variant, const rg_pso_state* state);
 } rg_host;
 
 RG_HOST_EXPORT const rg_host* rg_host_get(uint32_t version);

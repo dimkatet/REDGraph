@@ -80,9 +80,10 @@ struct Patch {
   const char* name;
   uint32_t stage;
   dxil_hash::Hash hash;
-  rg_blob v[RG_MAX_VARIANTS];
+  rg_blob v[RG_MAX_VARIANTS];  // {NULL, 0} (VS / PS): the engine's bytecode stays - a state-only variant
   uint32_t n;
   int32_t priority;
+  rg_pso_state st[RG_MAX_VARIANTS];  // patch_state: the variant's pipeline-state edits (st.set 0 = none)
   std::atomic<int32_t> variant{-1};
   std::atomic<uint32_t> state{RG_STATE_PENDING};
   Counters c;
@@ -225,6 +226,7 @@ bool g_attached[2] = {false, false};
 bool g_want[2] = {false, false};  // which pipe kinds some registration targets (set at attach)
 bool g_want_stage[4] = {false, false, false, false};
 std::atomic<bool> g_composed_logged{false};
+std::atomic<bool> g_state_overlap_logged{false};
 std::atomic<bool> g_first_create{false};
 thread_local uint32_t t_bound_subs = 0;
 
@@ -308,6 +310,57 @@ Match identify(Pipe pipe, const void* desc_v) {
   return m;
 }
 
+// A variant's pipeline-state edits on a copy of the engine's desc. `done` = the groups set so far on this clone; a group
+// set twice (two composed patches) - the later wins, logged once.
+void apply_state(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, const rg_pso_state& s, uint32_t& done, const char* who) {
+  if (!s.set) return;
+  if ((done & s.set) && !g_state_overlap_logged.exchange(true))
+    g_sdk->logger->WarnF(g_handle, "pso swap: '%s' edits pipeline-state group(s) 0x%x another patch on the same PSO "
+                         "edited too - the later stage wins (VS, PS, GS); logged once", who, done & s.set);
+  done |= s.set;
+  auto& r = d.RasterizerState;
+  if (s.set & RG_PSO_CULL) r.CullMode = static_cast<D3D12_CULL_MODE>(s.cull_mode);
+  if (s.set & RG_PSO_FILL) r.FillMode = static_cast<D3D12_FILL_MODE>(s.fill_mode);
+  if (s.set & RG_PSO_DEPTH_BIAS) {
+    r.DepthBias = s.depth_bias;
+    r.DepthBiasClamp = s.depth_bias_clamp;
+    r.SlopeScaledDepthBias = s.slope_scaled_depth_bias;
+  }
+  if (s.set & RG_PSO_DEPTH) {
+    d.DepthStencilState.DepthEnable = s.depth_enable ? TRUE : FALSE;
+    d.DepthStencilState.DepthWriteMask = s.depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+    d.DepthStencilState.DepthFunc = static_cast<D3D12_COMPARISON_FUNC>(s.depth_func);
+  }
+  if (s.set & (RG_PSO_BLEND | RG_PSO_WRITE_MASK)) {
+    auto& b = d.BlendState;
+    if (!b.IndependentBlendEnable && (s.rt_mask & ~1u)) {  // per-target edits need per-target descs: RT0's to all first
+      for (uint32_t i = 1; i < 8; ++i) b.RenderTarget[i] = b.RenderTarget[0];
+      b.IndependentBlendEnable = TRUE;
+    }
+    for (uint32_t i = 0; i < 8; ++i) {
+      if (!(s.rt_mask & (1u << i))) continue;
+      auto& t = b.RenderTarget[i];
+      if (s.set & RG_PSO_BLEND) {
+        t.BlendEnable = s.blend.enable ? TRUE : FALSE;
+        t.LogicOpEnable = FALSE;
+        t.SrcBlend = static_cast<D3D12_BLEND>(s.blend.src);
+        t.DestBlend = static_cast<D3D12_BLEND>(s.blend.dst);
+        t.BlendOp = static_cast<D3D12_BLEND_OP>(s.blend.op);
+        t.SrcBlendAlpha = static_cast<D3D12_BLEND>(s.blend.src_alpha);
+        t.DestBlendAlpha = static_cast<D3D12_BLEND>(s.blend.dst_alpha);
+        t.BlendOpAlpha = static_cast<D3D12_BLEND_OP>(s.blend.op_alpha);
+      }
+      if (s.set & RG_PSO_WRITE_MASK) t.RenderTargetWriteMask = s.write_mask[i];
+    }
+  }
+  if (s.set & RG_PSO_FORMATS) {
+    d.NumRenderTargets = s.num_render_targets;
+    for (uint32_t i = 0; i < 8; ++i)
+      d.RTVFormats[i] = i < s.num_render_targets ? static_cast<DXGI_FORMAT>(s.rtv_formats[i]) : DXGI_FORMAT_UNKNOWN;
+    d.DSVFormat = static_cast<DXGI_FORMAT>(s.dsv_format);
+  }
+}
+
 const char* stage_label(uint32_t s) { return s == RG_STAGE_VS ? "VS" : s == RG_STAGE_PS ? "PS" : s == RG_STAGE_GS ? "GS" : "CS"; }
 
 // Every combination of the matched patches' variants (combo 0 = all vanilla = the engine PSO itself), or the companion.
@@ -341,12 +394,14 @@ void build(Pipe pipe, ID3D12PipelineState* engine, const void* desc_v, const Mat
       vhr = dev->CreateComputePipelineState(&d, IID_PPV_ARGS(&map.clone[combo]));
     } else {
       D3D12_GRAPHICS_PIPELINE_STATE_DESC d = *static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc_v);
-      for (uint32_t i = 0; i < m.n; ++i) {
+      uint32_t state_done = 0;
+      for (uint32_t i = 0; i < m.n; ++i) {  // m.idx is in stage order VS, PS, GS (identify)
         const Patch& p = g_p[m.idx[i]];
         e[i] = (combo / map.stride[i]) % (p.n + 1);
         if (!e[i]) continue;
         const rg_blob& b = p.v[e[i] - 1];
-        (p.stage == RG_STAGE_GS ? d.GS : p.stage == RG_STAGE_PS ? d.PS : d.VS) = {b.bytes, b.size};
+        if (b.bytes) (p.stage == RG_STAGE_GS ? d.GS : p.stage == RG_STAGE_PS ? d.PS : d.VS) = {b.bytes, b.size};
+        apply_state(d, p.st[e[i] - 1], state_done, p.name);
       }
       d.CachedPSO = {};
       vhr = dev->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&map.clone[combo]));
@@ -543,8 +598,11 @@ rg_handle patch_register(const rg_patch_desc* d) {
   if (!d || d->stage > RG_STAGE_GS || !d->variants || d->variant_count == 0 || d->variant_count > RG_MAX_VARIANTS ||
       d->initial_variant < -1 || d->initial_variant >= static_cast<int32_t>(d->variant_count))
     return RG_E_ARG;
-  for (uint32_t v = 0; v < d->variant_count; ++v)
-    if (!is_dxbc(d->variants[v])) return RG_E_BLOB;
+  for (uint32_t v = 0; v < d->variant_count; ++v) {
+    const rg_blob& b = d->variants[v];
+    const bool keep = !b.bytes && !b.size && (d->stage == RG_STAGE_VS || d->stage == RG_STAGE_PS);  // state-only
+    if (!keep && !is_dxbc(b)) return RG_E_BLOB;
+  }
   const uint32_t n = g_np.load();
   if (n >= kMaxPatches) return RG_E_FULL;
   dxil_hash::Hash h;
@@ -573,6 +631,7 @@ rg_handle patch_register(const rg_patch_desc* d) {
   for (uint32_t v = 0; v < d->variant_count; ++v) p.v[v] = d->variants[v];
   p.n = d->variant_count;
   p.priority = d->priority;
+  for (rg_pso_state& st : p.st) st = {};
   p.variant.store(d->initial_variant);
   g_np.store(n + 1, std::memory_order_release);
   return static_cast<rg_handle>(n + 1);
@@ -593,6 +652,29 @@ void patch_stats(rg_handle h, rg_patch_stats* out) {
   out->variant = p->variant.load();
   p->c.fill(out);
   out->out_of_scope = p->scope.out_of_scope.load();
+}
+
+int32_t patch_state(rg_handle h, uint32_t variant, const rg_pso_state* s) {
+  if (!registration_open()) return RG_E_LATE;
+  Patch* p = patch_of(h);
+  if (!p || !s || variant >= p->n || p->stage == RG_STAGE_CS) return RG_E_ARG;
+  if (s->struct_size < sizeof(rg_pso_state) || (s->set & ~127u)) return RG_E_ARG;  // older layouts: none yet
+  const bool bad = ((s->set & RG_PSO_CULL) && (s->cull_mode < 1 || s->cull_mode > 3)) ||
+                   ((s->set & RG_PSO_FILL) && (s->fill_mode < 2 || s->fill_mode > 3)) ||
+                   ((s->set & RG_PSO_DEPTH) && (s->depth_func < 1 || s->depth_func > 8)) ||
+                   ((s->set & (RG_PSO_BLEND | RG_PSO_WRITE_MASK)) && (!s->rt_mask || s->rt_mask > 0xff)) ||
+                   ((s->set & RG_PSO_WRITE_MASK) && [&] {
+                     for (uint8_t w : s->write_mask)
+                       if (w > 15) return true;
+                     return false;
+                   }()) ||
+                   ((s->set & RG_PSO_FORMATS) && s->num_render_targets > 8);
+  if (bad) return RG_E_ARG;
+  p->st[variant] = *s;
+  p->st[variant].struct_size = sizeof(rg_pso_state);
+  g_sdk->logger->InfoF(g_handle, "host: patch '%s' variant %u edits the pipeline state (groups 0x%x)", p->name, variant,
+                       s->set);
+  return 0;
 }
 
 int32_t patch_scope(rg_handle h, const char* node) {

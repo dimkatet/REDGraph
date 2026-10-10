@@ -35,6 +35,7 @@ rg_handle patch_register(const rg_patch_desc* d);
 void patch_select(rg_handle h, int32_t variant);
 void patch_stats(rg_handle h, rg_patch_stats* out);
 int32_t patch_scope(rg_handle h, const char* node);  // M11
+int32_t patch_state(rg_handle h, uint32_t variant, const rg_pso_state* s);  // M1: pipeline state beyond bytecode
 rg_handle companion_register(const char* name, const uint8_t* hash16, rg_blob cs);
 void companion_stats(rg_handle h, rg_patch_stats* out);
 int32_t companion_scope(rg_handle h, const char* node);  // M11 for a companion

@@ -31,4 +31,8 @@ namespace compose_test {  // [Tests] ComposeTest: M1 composition (a VS and a PS 
 void register_with(const rg_host* host, bool on);
 }  // namespace compose_test
 
+namespace state_test {  // [Tests] StateTest: M1 pipeline-state edits (state-only variants of the visible sky's PS)
+void register_with(const rg_host* host, bool on);
+}  // namespace state_test
+
 }  // namespace selftest

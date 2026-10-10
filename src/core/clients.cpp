@@ -22,7 +22,7 @@ constexpr uint32_t kMaxEntries = 1024;
 
 const char* const kKindName[kKinds] = {
     "patch", "patch scope", "companion", "companion scope", "lease", "cbuffer", "cbuffer feed", "view", "RT library",
-    "RT variant", "pass", "subscription", "device_ready", "flow", "node", "node use", "node alloc", "wrap", "remove"};
+    "RT variant", "pass", "subscription", "device_ready", "flow", "node", "node use", "node alloc", "wrap", "remove", "patch state"};
 
 struct Client {
   HMODULE module;
@@ -163,9 +163,10 @@ const char* error_name(int32_t r) {
   }
 }
 
-// Registrations that return a handle (> 0); the others (scope, feed, use, device_ready) return 0 / an index on success.
+// Registrations that return a handle (> 0); the others (scope, feed, use, device_ready, state) return 0 / an index on success.
 bool returns_handle(Kind k) {
-  return k != kPatchScope && k != kCompanionScope && k != kFeed && k != kNodeUse && k != kDeviceReady;
+  return k != kPatchScope && k != kCompanionScope && k != kFeed && k != kNodeUse && k != kDeviceReady &&
+         k != kPatchState;
 }
 
 bool failed(const Entry& e) { return e.result < 0; }

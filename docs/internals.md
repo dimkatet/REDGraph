@@ -129,6 +129,15 @@ with every patch in it). Worst case 4 variants on 3 stages = 124 clones of one e
 PSO-creation thread like the rest. Until 2026-10-10 a PSO took ONE patch (the VS won, the PS patch was logged and lost
 there). `ComposeTest`.
 
+**Pipeline state** (since 2026-10-10). `patch_state(patch, variant, rg_pso_state)`: a graphics variant also edits the
+COPY of the engine's desc its clones are built from - by group (`RG_PSO_CULL`, `_FILL`, `_DEPTH_BIAS`, `_DEPTH`,
+`_BLEND` / `_WRITE_MASK` per render target in `rt_mask` - `IndependentBlendEnable` is switched on with RT0's desc copied
+to all when a target other than 0 is named - and `_FORMATS`); the groups not named stay the engine's. A variant blob
+`{NULL, 0}` (VS / PS) keeps the engine's bytecode: a state-only variant. Composed patches apply theirs in stage order
+VS, PS, GS; a group two of them set goes to the later (logged once). A separate call, not a field of
+`rg_patch_desc`: that struct carries no size, so it cannot grow. The engine still binds its own targets - a format
+edit that does not match them is the client's error. `StateTest`.
+
 **Swap.** `ComputePSO::CreatePSO` / `GraphicsPSO::CreatePSO(state)` is the bind funnel: `GpuApi::SetupForDispatch` /
 `SetupForDraw` call it for the PSO to set. The detour maps the engine PSO to the selected clone (`patch_select`, one
 atomic per patch; -1 = the engine PSO). A clone the driver refused stays NULL and the engine PSO binds.
@@ -460,6 +469,7 @@ under `__try`: the engine's crash handler freezes the game on any first-chance A
 | `RtVariantTest = 1` / `2` | M12: 318cee44 + `rgtest_rgs_shadow_lit` (RT sun shadows "lit"), live in GlobalShadow / scoped to a foreign node; a duplicate variant name refused | `rt variant test ... swapped` grows (1: shadows vanish every other 10 s) / `out_of_scope` grows (2) |
 | `PatchScopeTest = 1` / `2` | M11: the game's own PS 0c359133 swapped for itself, scoped inside / outside its node | `scope test ... swaps` / `out_of_scope` grow |
 | `ComposeTest = true` | M1 composition: VS 69090ccd (2 variants) and PS 0c359133 (1), the game's own bytecode swapped for itself, on the sky pass's PSO; four phases of 600 sky runs: VS only, both, PS only, none | `engine PSO ... carries 2 patches ... 5 of 5 combination(s) built`, then per phase `compose test A/B/C/D ... -> PASS` (swaps grow exactly for the patches switched on). Nothing on screen; takes CRT's sky patch for the session |
+| `StateTest = true` | M1 pipeline state: the visible sky's PS 5f079e10 with two state-only variants (no bytecode): wireframe, RT0 write mask 0; phases of 600 sky runs; bad fill mode and a variant out of range refused at registration | `state test: registered ... (expected 0 0 -1 -1)`, then `state test phase 'wireframe' / 'write mask 0': swaps +N -> PASS`, `'vanilla': +0 -> PASS`. ON SCREEN only where nothing covers the sky's bottom layer (5f079e10 lies under the volumetric clouds, fog and aerial composite): far off, near the horizon |
 | `LeaseTexTest = true` | M2 texture sources: a companion of the tonemapping-LUT CS 88c57ef1 (scoped to `CRenderNode_GenerateTonemappingLUT`, after the frame's third dispatch) reads our 4x4x2 R32_UINT texture through a 2D_ARRAY view of slice 1 (t64) and the engine's LUT `2ae9f45c` by name through a 3D UAV view (u16) into our raw buffer (u17); the registration checks (a raw view at a Texture2DArray refused, a cube UAV refused, a buffer into a texture view / a resource into a flow view refused) | `lease tex test: registered`, `views set`, then every 300 frames `lease tex test #N ... client texture 16/16 = slice 1 ... LUT texels 2/2 equal to the copy ... PASS`. Nothing on screen |
 
 RtVariantTest, RtSwapTest, PatchScopeTest and ComposeTest need game bytecode, which this repository does not carry: CMake builds it from the
@@ -507,9 +517,11 @@ validates an item; it does not set the order.
    both on: VS +909, PS +185 swaps; `5 of 5 combination(s) built, 0 failed`): VS, PS
    and an added GS patch compose on one engine PSO, a clone per combination of their variants, each switched alone
    (PSO patches (M1), "Composition").
-3. **PSO desc edits beyond bytecode.** A clone changes one stage's bytecode only - no rasterizer (cull mode), depth,
-   blend or render-target-format changes. A per-variant edit of a COPY of the engine's desc at clone time (a plain-C
-   mirror of the fields a client may touch, ABI-appended to `rg_patch_desc`).
+3. ~~**PSO desc edits beyond bytecode.**~~ DONE 2026-10-10, hardware-confirmed 21:04 (`StateTest` 3/3 PASS, swaps
+   +539 in both edited phases, +0 vanilla; seen on screen only far off - 5f079e10 is the BOTTOM layer of the visible
+   sky, the volumetric clouds, fog and aerial composite cover most of it): `patch_state` -
+   rasterizer (cull, fill, depth bias), depth, blend / write mask per target, formats, per variant; state-only
+   variants (no bytecode). Not covered: stencil, sample desc, input layout, topology.
 4. **The graphics wing of M4.** Draw subscriptions (after every draw of an engine PSO carrying shader X, on the
    recording thread), then a companion draw and a raw pass after a draw. Needs the `GpuApi::Draw*` entry points found
    and call-site-checked, near-zero cost for unsubscribed shaders.
