@@ -26,6 +26,7 @@
 #include <cstring>
 
 #include "hash_literal.hpp"
+#include "ini_file.hpp"
 #include "lease_tex_shader.hpp"
 #include "selftest.hpp"
 
@@ -333,7 +334,25 @@ rg_handle lease(const char* name, uint32_t kind, uint32_t reg, rg_handle view) {
 
 }  // namespace
 
-void register_with(const rg_host* host, bool on) {
+// HlslTest's run proof: the companion compiled now, from lease_tex.hlsl next to this DLL. {NULL, 0} = it did not.
+rg_blob runtime_blob(const rg_host* host) {
+  static int anchor;
+  const std::string path = (shared::IniFile::module_dir(&anchor) / "lease_tex.hlsl").string();
+  rg_hlsl_desc d{};
+  d.struct_size = sizeof d;
+  d.path = path.c_str();
+  d.entry = "main";
+  d.profile = "cs_6_0";
+  rg_blob b{};
+  char err[400], line[600];
+  const int32_t r = host->compile_hlsl(&d, &b, err, sizeof err);
+  std::snprintf(line, sizeof line, "lease tex test: companion compiled at runtime from %s -> %d, %zu bytes%s%s",
+                path.c_str(), r, b.size, r ? " - " : "", r ? err : "");
+  host->log(r ? RG_LOG_ERROR : RG_LOG_INFO, line);
+  return r ? rg_blob{} : b;
+}
+
+void register_with(const rg_host* host, bool on, bool runtime_hlsl) {
   if (!on) return;
   g_host = host;
   if (host->struct_size < offsetof(rg_host, view_create_texture) + sizeof(void*)) {
@@ -341,8 +360,12 @@ void register_with(const rg_host* host, bool on) {
     return;
   }
   static constexpr auto kLutCs = hash_literal::hash_from_hex("88c57ef1799c4d87f1f6b68eaee49f75");
-  g_comp = host->companion_register("lease tex test: companion of 88c57ef1", kLutCs.data(),
-                                    rg_blob{lease_tex::kCSBytes, lease_tex::kCSSize});
+  rg_blob cs{lease_tex::kCSBytes, lease_tex::kCSSize};
+  if (runtime_hlsl) {
+    cs = runtime_blob(host);
+    if (!cs.bytes) return;  // logged: the test would prove nothing about compile_hlsl
+  }
+  g_comp = host->companion_register("lease tex test: companion of 88c57ef1", kLutCs.data(), cs);
   const int32_t scoped = g_comp > 0 ? host->companion_scope(g_comp, kNode) : g_comp;
   g_flow = host->flow_register("tonemapping LUT 2ae9f45c", kLutHash);
   rg_texture_view_desc td{};

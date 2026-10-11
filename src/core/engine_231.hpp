@@ -33,6 +33,7 @@ constexpr uintptr_t kBindCbDescRet = 0x1f389f;       // GpuApi::BindConstantBuff
 // "Core rules").
 constexpr uintptr_t kDeviceData = 0x3438a28;
 constexpr uintptr_t kDeviceInData = 0x13bc4a8;
+constexpr uintptr_t kDirectQueueInData = 0x13bc4d0;  // ComPtr<ID3D12CommandQueue> (RED4ext.SDK GpuApi/DeviceData.hpp)
 // GpuApi::InitDevice(const DeviceParams&) - creates the device and the global root signatures; every RED4ext plugin's
 // Load has run before it (feasibility 0.1), no PSO / state object exists yet. The host's registration window closes
 // and its hooks attach at its entry (core::arm).

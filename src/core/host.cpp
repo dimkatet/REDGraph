@@ -449,6 +449,7 @@ const rg_host kHost = {
     &w_draw_companion_scope,
     &pso::draw_companion_stats,
     &h_after_draw,
+    &hlsl::compile,
 };
 
 }  // namespace

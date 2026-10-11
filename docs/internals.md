@@ -580,3 +580,7 @@ validates an item; it does not set the order.
    resources that outlive a frame cannot be published (only `node_alloc` transients) - whether the engine's RenderFlow
    has persistent resources to hang them on is not checked; a client loading BEFORE REDGraph cannot log through the
    host until the host's Load.
+7. **GPU time per host work item + runtime HLSL compile service** - BUILT and hardware-checked 2026-10-11 (ideas from
+   spuddeh/cp2077-native-shaders, author's permission): [`plan-gpu-timing-and-hlsl.md`](plan-gpu-timing-and-hlsl.md).
+   `[Diagnostics] GpuTiming` (companions, draw companions, passes; engine dispatches by hash and raygens not yet);
+   `compile_hlsl` (cs/vs/ps_6_x; the DXC DLLs are NOT shipped - licence of a stable release unchecked; no hot reload).

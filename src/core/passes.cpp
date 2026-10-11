@@ -29,6 +29,7 @@
 
 #include "core/clients.hpp"
 #include "core/engine_231.hpp"
+#include "core/gpu_timing.hpp"
 #include "core/internal.hpp"
 #include "core/prof.hpp"
 
@@ -90,7 +91,10 @@ std::atomic<uint32_t> g_nsubs{0};
 void record_companion(uint8_t* ctx, const Pending& p) {
   auto* cl = *reinterpret_cast<ID3D12GraphicsCommandList**>(ctx + kCtxCmdList);
   cl->SetPipelineState(p.aux);
-  cl->Dispatch(p.gx, p.gy, p.gz);
+  {
+    gpu_timing::Scope gpu(cl, gpu_timing::kCompanion, p.comp);
+    cl->Dispatch(p.gx, p.gy, p.gz);
+  }
   cl->SetPipelineState(p.engine);
   pso::companion_count(p.comp);
   if (g_tail_done.fetch_add(1) == 0)
@@ -112,6 +116,7 @@ void run_after(uint8_t* ctx) {
   {
     prof::Pause client;
     clients::Running running(reinterpret_cast<const void*>(a.fn));
+    gpu_timing::Scope gpu(cl, gpu_timing::kPass, a.pass);
     touched = a.fn(a.user, cl);
   }
   if (!(touched & RG_PASS_TOUCHED_STATE)) return;
@@ -279,6 +284,7 @@ void on_draw(const rg_draw_info& info) {
   if (d.ncomp) {
     for (uint32_t i = 0; i < d.ncomp; ++i) {
       cl->SetPipelineState(d.comp_pso[i]);
+      gpu_timing::Scope gpu(cl, gpu_timing::kDrawCompanion, d.comp[i]);
       issue_draw(ctx, cl, info);
       pso::draw_companion_count(d.comp[i]);
     }
@@ -294,6 +300,7 @@ void on_draw(const rg_draw_info& info) {
     {
       prof::Pause client;
       clients::Running running(reinterpret_cast<const void*>(d.after.fn));
+      gpu_timing::Scope gpu(cl, gpu_timing::kPass, d.after.pass);
       touched = d.after.fn(d.after.user, cl);
     }
     if (touched & RG_PASS_TOUCHED_STATE) {

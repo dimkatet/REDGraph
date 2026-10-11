@@ -739,6 +739,16 @@ void node_remove_set(rg_handle h, uint32_t on) {
   if (Removal* r = removal_of(h)) r->on.store(on != 0, std::memory_order_relaxed);
 }
 
+rg_handle client_removal(const char* node_name) {
+  if (!node_name || !g_nrm.load()) return 0;
+  const uint64_t hash = RED4ext::CName(node_name).hash;
+  const uint32_t n = g_nw.load(std::memory_order_acquire);
+  for (uint32_t i = 0; i < n; ++i)
+    if (g_w[i].rm >= 0 && g_w[i].target == hash && g_rm[g_w[i].rm].on.load(std::memory_order_relaxed))
+      return static_cast<rg_handle>(i + 1);
+  return 0;
+}
+
 void node_remove_stats(rg_handle h, rg_remove_stats* out) {
   if (!out) return;
   *out = {};

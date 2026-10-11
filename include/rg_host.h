@@ -58,7 +58,9 @@ enum rg_error {
   RG_E_UNSUPPORTED = -4,  /* not implemented by this host version */
   RG_E_LATE = -5,         /* registration is closed (after Load) */
   RG_E_BLOB = -6,         /* a blob is not a DXBC container, or does not read what it is registered for */
-  RG_E_FOREIGN = -7       /* a handle another client made (handles work only in the module that made them) */
+  RG_E_FOREIGN = -7,      /* a handle another client made (handles work only in the module that made them) */
+  RG_E_UNAVAILABLE = -8,  /* a host service is not there on this install (compile_hlsl: no dxcompiler.dll) */
+  RG_E_COMPILE = -9       /* compile_hlsl: the compiler said no - the error text says why */
 };
 
 /* = the engine's own stage numbering in its descriptor tables (0 VS, 1 PS, 2 CS; RT uses CS).
@@ -84,6 +86,19 @@ typedef struct rg_blob {
   const void* bytes;
   size_t size;
 } rg_blob;
+
+/* compile_hlsl's input. `source` = the HLSL text (`path` then names it in errors and gives the include folder), or
+ * NULL = read the file at `path` (UTF-8). defines: "NAME" or "NAME=VALUE". include_dir NULL = the file's folder. */
+typedef struct rg_hlsl_desc {
+  uint32_t struct_size; /* sizeof(rg_hlsl_desc) - fields are only ever appended */
+  const char* source;
+  const char* path;
+  const char* entry;   /* e.g. "main" */
+  const char* profile; /* e.g. "cs_6_0" */
+  const char* const* defines;
+  uint32_t define_count;
+  const char* include_dir;
+} rg_hlsl_desc;
 
 /* ---- M1: a shader patch - our bytecode in place of one engine shader, live-switchable between variants ---- */
 #define RG_MAX_VARIANTS 4u
@@ -600,6 +615,15 @@ typedef struct rg_host {
    * restored - the engine's NEXT draw may be in the same batch and re-sets none of them: leave them as you found them.
    * 1 = accepted. [hot] */
   uint32_t (*pass_after_draw)(rg_handle pass, rg_pass_fn fn, void* user);
+
+  /* HLSL compiled by the host (2026-10-11; dxcompiler.dll + dxil.dll from next to REDGraph.dll - an optional part of
+   * the install). Synchronous, on the CPU, no device needed: call it in init and register the blob as any other. The
+   * blob is the host's and lives for the process (the engine keeps pointers into bytecode). Profiles cs_6_x, vs_6_x,
+   * ps_6_x (RG_E_UNSUPPORTED otherwise); -O3. The registers must be the engine's layout (free space0 registers - see
+   * the SDK guide): its root signatures are global, the DXIL's own one is never read. 0 = ok; RG_E_UNAVAILABLE = the
+   * compiler is not installed; RG_E_COMPILE = errors in `error` (NUL-terminated, cut to error_size; may be NULL).
+   * Warnings of a successful compile are logged. Thread-safe (one compile at a time). */
+  int32_t (*compile_hlsl)(const rg_hlsl_desc* desc, rg_blob* out, char* error, uint32_t error_size);
 } rg_host;
 
 RG_HOST_EXPORT const rg_host* rg_host_get(uint32_t version);

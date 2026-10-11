@@ -1,7 +1,7 @@
 #pragma once
 
 // REDGraph's own settings: `REDGraph.ini` next to REDGraph.dll, section [Diagnostics]. A setting is named
-// "Section.Key"; bools are 0 / 1. VerboseLog applies live, the rest at the next start (they shape what attaches).
+// "Section.Key"; bools are 0 / 1. VerboseLog and GpuTiming apply live, the rest at the next start (they shape what attaches).
 
 #include <string>
 

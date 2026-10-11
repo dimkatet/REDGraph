@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- GPU timing (Host tab, off by default): the GPU time of every mod companion and pass, and each one marked as a
+  debug event for GPU capture tools.
+- Mods can compile HLSL through REDGraph while the game starts (needs the shader compiler DLLs next to REDGraph).
+- Higher limits for mods that patch many shaders: 256 patches, 32 leases, and a lease now reaches up to 64 different
+  game shaders (it stopped at 8 without a word; now the log says when it is full).
+- The render graph window shows the nodes a mod removed.
+
 ## 0.2.1
 
 - A GPU crash is now written to the log (the reason and, with `Dred = true`, where on the GPU) before the game

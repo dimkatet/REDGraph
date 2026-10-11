@@ -24,7 +24,8 @@ void register_with(const rg_host* host, int mode);
 }  // namespace scope_test
 
 namespace lease_tex_test {  // [Tests] LeaseTexTest: M2 texture sources (a client texture, an engine one by name)
-void register_with(const rg_host* host, bool on);
+// runtime_hlsl: its companion compiled now from lease_tex.hlsl next to the DLL (HlslTest), not the checked-in blob
+void register_with(const rg_host* host, bool on, bool runtime_hlsl);
 }  // namespace lease_tex_test
 
 namespace compose_test {  // [Tests] ComposeTest: M1 composition (a VS and a PS patch on one engine PSO)
@@ -42,5 +43,10 @@ void register_with(const rg_host* host, bool on);
 namespace draw_test {  // [Tests] DrawTest: the graphics wing of M4 (draw subscriptions, a draw companion, a pass after)
 void register_with(const rg_host* host, bool on);
 }  // namespace draw_test
+
+namespace hlsl_test {  // [Tests] HlslTest: compile_hlsl (a good CS, a broken PS, an RT library refused)
+bool available(const rg_host* host);  // the host has compile_hlsl
+void register_with(const rg_host* host, bool on);
+}  // namespace hlsl_test
 
 }  // namespace selftest

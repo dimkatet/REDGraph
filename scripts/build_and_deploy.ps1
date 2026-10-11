@@ -1,13 +1,17 @@
 # Builds REDGraph (cmake --build build) and deploys it into a game install or a mod-manager mod folder:
 #   <Target>/red4ext/plugins/REDGraph/REDGraph.dll
 #   <Target>/bin/x64/plugins/cyber_engine_tweaks/mods/REDGraph/   (the CET window)
-# -SelfTest also deploys REDGraphSelfTest.dll (+ REDGraphSelfTest.ini from selftest/ when none is there yet).
+# -SelfTest also deploys REDGraphSelfTest.dll (+ REDGraphSelfTest.ini from selftest/ when none is there yet, and
+#   lease_tex.hlsl for HlslTest).
+# -Dxc <dir> copies dxcompiler.dll + dxil.dll from a DXC bin/x64 next to REDGraph.dll (compile_hlsl). LOCAL TESTING
+#   ONLY: their redistribution terms are not settled - never package what this copies.
 # Target: -Target, else $env:RG_DEPLOY_DIR - the game's root (holding bin/ and red4ext/) or an MO2 mod's root.
 # Configure build/ once first (README "Building"). The game must be closed: it holds the DLL open.
 
 param(
     [string]$Target = $env:RG_DEPLOY_DIR,
     [switch]$SelfTest,
+    [string]$Dxc = '',
     [string]$Config = 'Release'
 )
 $ErrorActionPreference = 'Stop'
@@ -48,7 +52,15 @@ function Deploy-Plugin([string]$name) {
     return $dir
 }
 
-[void](Deploy-Plugin 'REDGraph')
+$hostDir = Deploy-Plugin 'REDGraph'
+if ($Dxc) {
+    foreach ($d in 'dxil.dll', 'dxcompiler.dll') {
+        $src = Join-Path $Dxc $d
+        if (-not (Test-Path -LiteralPath $src)) { throw "no $d in $Dxc" }
+        Copy-Item -LiteralPath $src -Destination (Join-Path $hostDir $d) -Force -ErrorAction Stop
+    }
+    Write-Host "dxc     -> $hostDir (local testing only - not for a package)"
+}
 $cet = Join-Path $Target 'bin\x64\plugins\cyber_engine_tweaks\mods\REDGraph'
 New-Item -ItemType Directory -Force -Path $cet | Out-Null
 Copy-Item -Path (Join-Path $repo 'cet\REDGraph\*') -Destination $cet -Recurse -Force -ErrorAction Stop
@@ -56,6 +68,7 @@ Write-Host "CET mod -> $cet"
 
 if ($SelfTest) {
     $dir = Deploy-Plugin 'REDGraphSelfTest'
+    Copy-Item -LiteralPath (Join-Path $repo 'selftest\lease_tex.hlsl') -Destination (Join-Path $dir 'lease_tex.hlsl') -Force
     $ini = Join-Path $dir 'REDGraphSelfTest.ini'
     if (-not (Test-Path -LiteralPath $ini)) {
         Copy-Item -LiteralPath (Join-Path $repo 'selftest\REDGraphSelfTest.ini') -Destination $ini

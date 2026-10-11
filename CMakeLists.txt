@@ -78,6 +78,9 @@ add_library(redgraph SHARED
   src/core/graph_probe.cpp
   src/core/graph_debug.cpp
   src/core/graph_debug.hpp
+  src/core/gpu_timing.cpp
+  src/core/gpu_timing.hpp
+  src/core/hlsl.cpp
   src/core/render_flow.cpp
   src/core/render_nodes.cpp
   src/core/cb_hooks.cpp
@@ -121,6 +124,7 @@ if(RG_BUILD_SELFTEST)
     selftest/state_test.cpp
     selftest/wrap_use_test.cpp
     selftest/draw_test.cpp
+    selftest/hlsl_test.cpp
     selftest/sky_paint_shader.hpp
     selftest/lease_tex_shader.hpp
   )

@@ -1,7 +1,7 @@
 // REDGraph's native global functions for its CET window (cet/REDGraph/init.lua), called as Game.<name>():
 //   RG_Ping() -> String                     the host is there (version, API, registration state)
 //   RG_Get(String name) -> Float            a host setting, "Diagnostics.Key" (settings.hpp); bools 0 / 1
-//   RG_Set(String name, Float v) -> Bool    saved (VerboseLog live, the rest from the next start)
+//   RG_Set(String name, Float v) -> Bool    saved (VerboseLog, GpuTiming live, the rest from the next start)
 //   RG_Status() -> String                   the host's counters + its settings (also into its log)
 //   RG_Graph*                               the render graph debug module ([Diagnostics] RenderGraphDebug,
 //                                           core/graph_debug.hpp): RG_Graph() -> the report ("" = module off),
@@ -11,6 +11,8 @@
 //   RG_Profile(Float delay, Float seconds) -> String   the host's own CPU, measured `seconds` after `delay`
 //                                           (core/prof.hpp); "" = armed, else why not
 //   RG_ProfileState() -> String             "idle" / "starts in" / "measuring", then the last report
+//   RG_GpuTiming() -> String                GPU ms per companion / pass ([Diagnostics] GpuTiming,
+//                                           core/gpu_timing.cpp has the format); "" = off
 //   RG_Clients() -> String                  the host's clients and what each registered (core/clients.cpp has
 //                                           the format)
 
@@ -23,6 +25,7 @@
 
 #include "rg_host.h"
 #include "core/clients.hpp"
+#include "core/gpu_timing.hpp"
 #include "core/graph_debug.hpp"
 #include "core/prof.hpp"
 #include "settings.hpp"
@@ -84,6 +87,8 @@ std::string status() {
   o += "Clients: " + core::clients::summary() + "\n";
   const std::string prof = core::prof::report();
   o += prof.empty() ? "host profile: not run (Host tab, Profile)\n" : prof;
+  const std::string gpu = core::gpu_timing::report();
+  o += gpu.empty() ? "gpu timing: off ([Diagnostics] GpuTiming)\n" : gpu;
   o += "Settings (" + rg_settings::path() + "):\n" + rg_settings::report();
   return o;
 }
@@ -122,6 +127,11 @@ void Profile(RED4ext::IScriptable*, RED4ext::CStackFrame* frame, RED4ext::CStrin
 void ProfileState(RED4ext::IScriptable*, RED4ext::CStackFrame* frame, RED4ext::CString* out, int64_t) {
   frame->code++;  // ParamEnd
   if (out) *out = RED4ext::CString((core::prof::state() + "\n" + core::prof::report()).c_str());
+}
+
+void GpuTiming(RED4ext::IScriptable*, RED4ext::CStackFrame* frame, RED4ext::CString* out, int64_t) {
+  frame->code++;  // ParamEnd
+  if (out) *out = RED4ext::CString(core::gpu_timing::report().c_str());
 }
 
 // ---- the render graph debug module (core/graph_debug.hpp has the report format) ----
@@ -205,6 +215,7 @@ void post_register() {
     rtti->RegisterFunction(f);
   }
   rtti->RegisterFunction(make("RG_ProfileState", &ProfileState, "String"));
+  rtti->RegisterFunction(make("RG_GpuTiming", &GpuTiming, "String"));
   rtti->RegisterFunction(make("RG_Graph", &Graph, "String"));
   {
     auto* f = make("RG_GraphNode", &GraphNode, "String");
@@ -232,7 +243,7 @@ void post_register() {
     f->AddParam("Int32", "action");
     rtti->RegisterFunction(f);
   }
-  say(RG_LOG_INFO, "ui: native functions registered - RG_Ping, RG_Get, RG_Set, RG_Status, RG_Clients, RG_Profile*, RG_Graph*");
+  say(RG_LOG_INFO, "ui: native functions registered - RG_Ping, RG_Get, RG_Set, RG_Status, RG_Clients, RG_Profile*, RG_GpuTiming, RG_Graph*");
 }
 
 void on_register() {}

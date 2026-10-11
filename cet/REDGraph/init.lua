@@ -8,7 +8,8 @@ local overlay = false
 local status = ""
 local G                 -- the render graph debug window's state (below)
 
-local kNames = { "Diagnostics.VerboseLog", "Diagnostics.RenderGraphDebug", "Diagnostics.RenderGraphDump", "Diagnostics.Dred" }
+local kNames = { "Diagnostics.VerboseLog", "Diagnostics.RenderGraphDebug", "Diagnostics.RenderGraphDump", "Diagnostics.Dred",
+                 "Diagnostics.GpuTiming" }
 
 local function log(text) print("[REDGraph] " .. text) end
 
@@ -89,6 +90,59 @@ local function draw_profile()
     if P.state ~= "" then ImGui.TextWrapped(P.state) end
 end
 
+-- ---- GPU time of the host's work items (core/gpu_timing.cpp has the report format) ----
+
+local T = { at = -1, head = nil, items = {} }
+
+local function gpu_refresh()
+    local ok, s = pcall(function() return Game.RG_GpuTiming() end)
+    T.head, T.items = nil, {}
+    if not ok or not s then return end
+    for line in s:gmatch("[^\n]+") do
+        local t = {}
+        for f in (line .. "\t"):gmatch("([^\t]*)\t") do t[#t + 1] = f end
+        if t[1] == "gpu" then
+            T.head = { frames = t[2], late = t[3], overflow = t[4], overhead = tonumber(t[5]) or -1 }
+        elseif t[1] == "item" then
+            T.items[#T.items + 1] = { kind = t[2], client = t[3], name = t[4], ms = tonumber(t[5]) or -1,
+                                      last = tonumber(t[6]) or 0, per_frame = t[7], frames = t[8],
+                                      rejected = t[9], late = t[10] }
+        end
+    end
+end
+
+local function draw_gpu()
+    heading("GPU time")
+    check("GPU timing", "Diagnostics.GpuTiming",
+        "Measures the GPU time of every mod companion and pass REDGraph records on the game's command\n" ..
+        "lists (GPU timestamps, read a few frames later - never waits) and marks each one as a debug\n" ..
+        "event for Nsight / RenderDoc. A number per item, smoothed; not an absolute truth. Live.")
+    if not on("Diagnostics.GpuTiming") then return end
+    local now = os.clock()
+    if now - T.at > 0.5 then
+        T.at = now
+        gpu_refresh()
+    end
+    if not T.head then
+        note("waiting for the first frames")
+        return
+    end
+    note(string.format("frames read %s, late pairs %s, frames over budget %s, timing's own cost %.4f ms",
+        T.head.frames, T.head.late, T.head.overflow, T.head.overhead))
+    if #T.items == 0 then
+        note("nothing timed yet - no companion or pass has run")
+        return
+    end
+    for _, it in ipairs(T.items) do
+        local text = string.format("%8.4f ms  (last %.4f, x%s per frame)  [%s] %s / %s", it.ms, it.last,
+            it.per_frame, it.kind, it.client, it.name)
+        if it.ms < 0 then ImGui.TextDisabled(text) else ImGui.Text(text) end
+        if (tonumber(it.rejected) or 0) > 0 or (tonumber(it.late) or 0) > 0 then
+            note("rejected " .. it.rejected .. ", late " .. it.late)
+        end
+    end
+end
+
 local function draw_host()
     ImGui.Text(plugin)
     heading("Diagnostics")
@@ -121,6 +175,7 @@ local function draw_host()
     end
     tip("REDGraph's counters and settings - also written into its log.")
     if status ~= "" then ImGui.TextWrapped(status) end
+    draw_gpu()
     draw_profile()
 end
 
@@ -296,7 +351,7 @@ local function graph_refresh()
             G.frames = tonumber(t[6]:match("^(%d+) frames")) or 0
         elseif t[1] == "N" then
             local n = { i = tonumber(t[2]), parent = tonumber(t[3]), depth = tonumber(t[4]), flags = t[5],
-                        removed = t[6] == "1", name = t[7], key = t[8], rem = t[9], ran = t[10], refused = t[11],
+                        removed = t[6] ~= "0", by_client = t[6] == "2", name = t[7], key = t[8], rem = t[9], ran = t[10], refused = t[11],
                         owner = t[12] }
             G.nodes[n.i] = n
             G.kids[n.i] = {}
@@ -388,12 +443,19 @@ local function draw_node(i, label_prefix)
     if has(n, "o") then
         suffix = suffix .. "  (node of " .. ((n.owner and n.owner ~= "-") and n.owner or "a client") .. ")"
     end
-    if n.removed then suffix = suffix .. "  REMOVED " .. n.rem .. " / ran " .. n.ran end
+    if n.by_client then
+        suffix = suffix .. "  REMOVED by " .. n.owner .. " (every node of its class) " .. n.rem .. " / ran " .. n.ran
+    elseif n.removed then
+        suffix = suffix .. "  REMOVED " .. n.rem .. " / ran " .. n.ran
+    end
     if (n.rows or 0) > 0 then
         suffix = suffix .. "   [" .. n.rows .. " sh" ..
             (G.frames > 0 and string.format(", %.0f/frame", n.binds / G.frames) or "") .. "]"
     end
-    if group or (has(n, "w") and not has(n, "j") and not has(n, "o")) then
+    if n.by_client then
+        ImGui.TextDisabled("[-]")
+        tip("Removed by a mod (node_remove) - only that mod can bring it back.")
+    elseif group or (has(n, "w") and not has(n, "j") and not has(n, "o")) then
         local running = not (group and n.some_removed or n.removed)
         local v, p = ImGui.Checkbox("##n" .. i, running)
         if p then node_set(i, not v) end

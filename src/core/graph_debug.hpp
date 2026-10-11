@@ -14,11 +14,12 @@ namespace core::graph_debug {
 void enable();  // at Load, before core::attach - with graph_probe::enable (the census) and render_nodes' class wraps
 bool on();
 
-// The report, one record per line, fields tab-separated (cet/CyberpunkRenderTweaks/init.lua parses it):
+// The report, one record per line, fields tab-separated (cet/REDGraph/init.lua parses it):
 //   H gen sig mode wrapped_classes census removed_wanted removed_elsewhere rules
 //   N index parent depth flags removed name key removed_runs ran_runs refused owner
 //       flags: g group, j job-builder (M9 refuses), s structural, o a client's node (node_register - by the host's
 //       vtable, owner = its client's module, "-" for an engine node), w removable (its class is wrapped)
+//       removed: 0, 1 = by this window, 2 = by a client's node_remove (owner = that client; runs are its class's)
 //   S row node pipe vs ps cs binds psos here all skipped_here skipped_all rt
 //       node -1 = outside any node (jobs); pipe 0 compute, 1 graphics, 2 DispatchRays (rt set, no skip)
 //   R rule vs ps cs node_key skipped

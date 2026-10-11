@@ -125,13 +125,18 @@ View g_view[kMaxViews];
 std::atomic<uint32_t> g_nview{0};
 
 // ---- leases and slot groups ----
-constexpr uint32_t kMaxLeases = 16;
-constexpr uint32_t kMaxLeaseOwners = 8;
-constexpr uint32_t kMaxRefs = 8;
-constexpr uint32_t kMaxGroups = 16;
-constexpr uint32_t kMaxPatchHandles = 96;
+// Sizes with headroom, not a measured budget (raised 2026-10-11 for a client patching many material shaders through
+// one lease). The bind path walks only what is REGISTERED (groups, their leases, a lease's learned refs), so a larger
+// array costs memory, not time.
+constexpr uint32_t kMaxLeases = 32;
+constexpr uint32_t kMaxLeaseOwners = 16;
+constexpr uint32_t kMaxRefs = 64;  // ShaderRefs a lease learns - one per engine shader of its owners it is bound with
+constexpr uint32_t kMaxGroups = 32;
+constexpr uint32_t kMaxPatchHandles = kMaxPatchCount;
 constexpr uint32_t kMaxCompHandles = 8;
-constexpr uint32_t kMaxLeasesPerOwner = 4;
+constexpr uint32_t kMaxLeasesPerOwner = 8;
+static_assert(kMaxGroups <= 32, "FrSave::mask is a uint32_t bit per group");
+static_assert(kMaxLeases <= 127, "g_lease_of_patch / g_lease_of_comp hold a lease index in an int8_t");
 
 struct Group {
   uint32_t stage, kind, reg;
@@ -158,6 +163,7 @@ struct Lease {
   std::atomic<uint32_t> state{RG_STATE_PENDING};
   std::atomic<uint32_t> refs[kMaxRefs] = {};
   std::atomic<uint32_t> nrefs{0};
+  std::atomic<bool> refs_full{false};
   std::atomic<uint64_t> stages{0}, not_staged{0};
   uint64_t rt_mask = 0;  // RT library owners, bit (handle - 1)
   std::atomic<uint64_t> null_stages{0}, static_skips{0};
@@ -1229,6 +1235,10 @@ bool lease_bind_ok(Lease& l, uint8_t* ctx, bool enabled) {
       l.nrefs.store(n + 1, std::memory_order_release);
       g_sdk->logger->InfoF(g_handle, "native table: lease '%s' %s ShaderRef id %u learned (%u known)", l.name,
                            stage_name(l.stage), ref, n + 1);
+    } else if (!l.refs_full.exchange(true)) {
+      g_sdk->logger->ErrorF(g_handle, "native table: lease '%s' %s knows %u ShaderRefs - the most it can: shader ref %u "
+                            "and any further one are NOT staged (logged once)", l.name, stage_name(l.stage), kMaxRefs,
+                            ref);
     }
     return false;  // this draw's UpdateRootParams has already run without our descriptor
   }

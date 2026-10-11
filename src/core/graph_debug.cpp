@@ -246,12 +246,16 @@ std::string report() {
     if (f == flags) *f++ = '-';
     *f = 0;
     rg_remove_stats st{};
-    const bool removed = g_removed.count(n.key) != 0;
+    // removed: 1 = here (the window's), 2 = by a client's node_remove (the whole class; its counters are the class's)
+    int removed = g_removed.count(n.key) ? 1 : 0;
+    const rg_handle by = !removed && !n.group ? render_nodes::client_removal(n.name.c_str()) : 0;
     if (removed) render_nodes::debug_remove_stats(n.obj, &st);
+    else if (by) removed = 2, render_nodes::node_remove_stats(by, &st);
+    const std::string who = own ? owner_of(own) : by ? clients::client_of(clients::kRemove, by) : "-";
     std::snprintf(b, sizeof b, "N\t%zu\t%d\t%u\t%s\t%d\t%s\t%s\t%llu\t%llu\t%llu\t%s\n", i, n.parent, n.depth, flags,
-                  removed ? 1 : 0, n.name.c_str(), n.key.c_str(), static_cast<unsigned long long>(st.removed),
+                  removed, n.name.c_str(), n.key.c_str(), static_cast<unsigned long long>(st.removed),
                   static_cast<unsigned long long>(st.ran), static_cast<unsigned long long>(st.refused),
-                  own ? owner_of(own).c_str() : "-");
+                  who.empty() ? "?" : who.c_str());
     o += b;
   }
   if (c)

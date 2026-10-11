@@ -79,7 +79,7 @@ struct Scope {
   }
 };
 
-constexpr uint32_t kMaxPatches = 96;
+constexpr uint32_t kMaxPatches = kMaxPatchCount;  // internal.hpp - bindings sizes its per-patch tables by it
 struct Patch {
   const char* name;
   uint32_t stage;
@@ -132,7 +132,8 @@ std::atomic<uint32_t> g_ndc{0};
 // whose PSO only the host still holds: the key becomes kTomb, the clones are released one sweep LATER (a command list
 // recorded before may still be on the GPU). Until 2026-10-10 the table was insert-only: a new PSO at a freed address
 // found the OLD entry and bound clones built from another desc (seen as "not mapped (duplicate ...)" for VS 1b259993).
-constexpr uint32_t kSlots = 4096;
+constexpr uint32_t kSlotBits = 14;  // 16384 (4096 until 2026-10-11: material patches map hundreds of PSOs each)
+constexpr uint32_t kSlots = 1u << kSlotBits;
 constexpr uint32_t kMaxEntries = kSlots / 2;
 constexpr uintptr_t kTomb = 1;  // a removed entry: probing goes on past it, insert may reuse it
 constexpr uint32_t kSweepFrames = 64;
@@ -164,7 +165,9 @@ Slot g_slots[kSlots];
 std::atomic<uint32_t> g_entries{0};
 SRWLOCK g_insert_lock = SRWLOCK_INIT;
 
-uint32_t slot_of(uintptr_t p) { return static_cast<uint32_t>(((p >> 4) * 0x9E3779B97F4A7C15ull) >> 52) & (kSlots - 1); }
+uint32_t slot_of(uintptr_t p) {
+  return static_cast<uint32_t>(((p >> 4) * 0x9E3779B97F4A7C15ull) >> (64 - kSlotBits)) & (kSlots - 1);
+}
 
 const Slot* find(uintptr_t engine) {
   for (uint32_t i = slot_of(engine), n = 0; n < kSlots; i = (i + 1) & (kSlots - 1), ++n) {

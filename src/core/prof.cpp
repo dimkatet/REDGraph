@@ -8,6 +8,7 @@
 #include <mutex>
 
 #include "core/engine_231.hpp"
+#include "core/gpu_timing.hpp"
 #include "core/internal.hpp"
 
 namespace core::prof {
@@ -188,6 +189,7 @@ void d_execute_parallel(const void* graph, const void* ctx, void* builder) {
   frame();
   pso::frame_tick();
   bindings::frame_tick();
+  gpu_timing::frame_tick();
   g_orig(graph, ctx, builder);
 }
 
@@ -222,6 +224,7 @@ void on_graph_execute() {
   frame();
   pso::frame_tick();
   bindings::frame_tick();
+  gpu_timing::frame_tick();
 }
 
 void attach_frames() {

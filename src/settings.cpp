@@ -11,6 +11,7 @@
 #include <sstream>
 
 #include "rg_host.h"
+#include "core/gpu_timing.hpp"
 #include "ini_file.hpp"
 
 namespace rg_settings {
@@ -32,6 +33,8 @@ const Def kDefs[] = {
     {"Diagnostics", "RenderGraphDebug", false, "graph debug window"},
     // DRED (GPU page-fault address + auto-breadcrumbs) for the crash log - on BEFORE the engine creates its device.
     {"Diagnostics", "Dred", false, "DRED"},
+    // GPU time of every companion / pass (timestamps on the engine's lists, core/gpu_timing) + their debug events.
+    {"Diagnostics", "GpuTiming", true, "GPU timing"},
 };
 constexpr size_t kCount = sizeof(kDefs) / sizeof(kDefs[0]);
 
@@ -60,6 +63,7 @@ size_t index_of(const char* name) {
 void apply_live(size_t i) {
   const rg_host* h = rg_host_get(RG_HOST_API_VERSION);
   if (h && std::strcmp(kDefs[i].key, "VerboseLog") == 0) h->log_set_verbose(g_val[i] > 0.5f ? 1u : 0u);
+  if (std::strcmp(kDefs[i].key, "GpuTiming") == 0) core::gpu_timing::set_enabled(g_val[i] > 0.5f);
 }
 
 bool parse_bool(const std::string& t, float* out) {

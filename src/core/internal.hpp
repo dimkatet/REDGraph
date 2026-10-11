@@ -15,6 +15,9 @@ struct ID3D12PipelineState;
 
 namespace core {
 
+// Patches (pso_patch.cpp) = the patch handles bindings keeps a lease list for (bindings.cpp).
+constexpr uint32_t kMaxPatchCount = 256;
+
 // host.cpp
 extern RED4ext::v1::PluginHandle g_handle;
 extern const RED4ext::v1::Sdk* g_sdk;
@@ -217,6 +220,8 @@ void node_wrap_uses(rg_handle h, uint32_t* uses, uint64_t* requests, uint32_t* g
 rg_handle node_remove(const char* target, uint32_t on);
 void node_remove_set(rg_handle h, uint32_t on);
 void node_remove_stats(rg_handle h, rg_remove_stats* out);
+// The client removal (node_remove) of the class `node_name` that is ON now - its handle, else 0. For the debug window.
+rg_handle client_removal(const char* node_name);
 // A node vtable's Execute as the engine built it (the original when slot [1] is wrapped) - for the graph dump.
 const void* original_execute(const void* const* vtable);
 // The graph debug module (graph_debug.cpp): every engine class's slot [1] is wrapped at its first Register (before
@@ -230,6 +235,11 @@ void debug_remove_clear();                      // every slot freed - at a graph
 void debug_remove_stats(const void* node, rg_remove_stats* out);
 uint32_t debug_wrapped_classes();
 }  // namespace render_nodes
+
+// hlsl.cpp - compile_hlsl (dxcompiler.dll next to the host, optional)
+namespace hlsl {
+int32_t compile(const rg_hlsl_desc* desc, rg_blob* out, char* error, uint32_t error_size);
+}  // namespace hlsl
 
 // graph_probe.cpp - the render graph, read only ([Diagnostics] RenderGraphDump)
 namespace graph_probe {
