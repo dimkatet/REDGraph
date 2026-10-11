@@ -183,7 +183,7 @@ Current limits are static array sizes picked with headroom, not a measured budge
 - A client's `node_remove_set` does not show as removed in the graph debug window. `node_remove_stats` is already
   collected (`clients.cpp`); find why the window ignores it (likely it only reflects its own debug removals).
 
-### 6c. Emissive in path tracing - NOT a host feature
+### 6c. Emissive in path tracing - NOT a host feature; the dump below is NOT ours either (user, 2026-10-11) - the client's to do
 Patching RT libraries is avoided on purpose: they are a pressure point (two mods patching one library conflict; a swap
 takes effect only at state-object creation; SHARC UPDATE `06ae1631` and the RTXDI emissive-triangle path may need it too;
 no way to tell neon from other emissive at that point). The host does not offer "scale emission in PT".
@@ -212,5 +212,5 @@ First step: a dump - find the writing node/shader (neighbours of `d6336346`) and
 ### 6d. Order
 1. 6a (cheap, safe) after measuring the per-draw cost of a longer patch list.
 2. 6b debug-window visibility, then the clear flag.
-3. 6c dump (reading only); decide from it whether a buffer API is needed.
+3. ~~6c dump~~ - dropped (the client's).
 4. Reply to the user (text agreed 2026-10-11).
