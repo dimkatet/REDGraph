@@ -2,9 +2,10 @@
 // author's permission; reworked for lists recorded on many threads (an atomic pair counter per frame slot, a resolve
 // per pair, slots cleared after reading).
 //
-// Report format (report()): line 1 "gpu\t<frames read>\t<late>\t<overflow frames>\t<overhead ms>", then one line per
-// item that was ever timed: "item\t<kind>\t<client>\t<name>\t<ms smoothed>\t<ms last>\t<per frame>\t<frames>\t
-// <rejected>\t<late>" (kind: companion / draw companion / pass; ms = the item's sum over one frame).
+// Report format (report()): line 1 "gpu\t<frames read>\t<late>\t<overflow frames>\t<overhead ms>\t<nodes timed 0/1>",
+// then one line per item that was ever timed: "item\t<kind>\t<client>\t<name>\t<ms smoothed>\t<ms last>\t<per frame>\t
+// <frames>\t<rejected>\t<late>" (kind: kKindName below; ms = the item's sum over one frame; a node's client is
+// "engine").
 
 #include "core/gpu_timing.hpp"
 
@@ -25,25 +26,37 @@ namespace {
 
 using namespace e231;
 
-constexpr uint32_t kRing = 8;          // frames between recording a slot and reading it
-constexpr uint32_t kPairs = 2048;      // pairs per frame (a draw companion is timed per draw)
-constexpr uint32_t kPerKind = 8;       // = kMaxComps / kMaxDrawComps (pso_patch.cpp), kMaxPasses (passes.cpp)
-constexpr uint32_t kItems = kKinds * kPerKind;
-constexpr uint8_t kEmpty = 0xff;       // the slot's empty pair
+constexpr uint32_t kRing = 8;      // frames between recording a slot and reading it
+constexpr uint32_t kPairs = 4096;  // pairs per frame (a draw companion is timed per draw; a node per execution)
+// Handles per kind = the registering module's table size (pso_patch.cpp, passes.cpp, render_nodes.cpp kMaxVt,
+// rt_lib.cpp).
+constexpr uint32_t kCount[kKinds] = {8, 8, 8, 256, 64, 64};
+constexpr uint32_t base_of(uint32_t k) { return k == 0 ? 0 : base_of(k - 1) + kCount[k - 1]; }
+constexpr uint32_t kItems = base_of(kKinds);
+constexpr uint16_t kEmpty = 0xfffe, kIgnore = 0xffff;  // the slot's empty pair; a pair begun and never ended
+static_assert(kItems < kEmpty);
+constexpr uint32_t kMaskWords = (kItems + 63) / 64;
 constexpr double kMaxMs = 50.0, kSmooth = 0.05;
 
+// kNode is named by render_nodes (set_node_name), not by a registration.
+const clients::Kind kClientKind[kKinds] = {clients::kCompanion, clients::kDrawCompanion, clients::kPass,
+                                           clients::kKinds,     clients::kRtLib,         clients::kRtVariant};
+const char* const kKindName[kKinds] = {"companion", "draw companion", "pass", "node", "rays (library)",
+                                       "rays (variant)"};
+
 struct Slot {
-  std::atomic<uint32_t> n{0};             // pairs taken (may run past kPairs: the excess is refused)
-  std::atomic<uint32_t> refused{0};       // items that lost a pair this frame: their frame is incomplete
+  std::atomic<uint32_t> n{0};                      // pairs taken (may run past kPairs: the excess is refused)
+  std::atomic<uint64_t> refused[kMaskWords] = {};  // items that lost a pair this frame: their frame is incomplete
   std::atomic<bool> empty_done{false};
-  bool used = false;                      // recorded into since the last read
-  uint8_t item[kPairs];
+  bool used = false;                               // recorded into since the last read
+  uint16_t item[kPairs];
 };
 Slot g_slot[kRing];
 std::atomic<uint32_t> g_cur{0};
 
 std::atomic<bool> g_want{false}, g_active{false};
-bool g_ready = false, g_failed = false;   // frame thread only
+bool g_ready = false, g_failed = false;  // frame thread only
+bool g_nodes = false;                    // every node class is wrapped: nodes are timed
 ID3D12QueryHeap* g_heap = nullptr;
 ID3D12Resource* g_rb = nullptr;
 const uint64_t* g_mapped = nullptr;
@@ -51,28 +64,40 @@ double g_ms_per_tick = 0;
 uint64_t g_frame = 0;
 
 struct Item {
-  wchar_t event[96];  // "REDGraph: <client>/<name>"
+  wchar_t event[96];  // "REDGraph: <client>/<name>" (our own work)
   double ema = -1, last = 0;
   uint32_t per_frame = 0;
   uint64_t frames = 0, rejected = 0, late = 0;
 };
 Item g_item[kItems];
+std::atomic<const char*> g_node_name[256] = {};
 std::mutex g_mu;  // the stats: frame_tick writes, report reads
 uint64_t g_read = 0, g_late = 0, g_overflow = 0;
 double g_overhead = -1;
 
-const clients::Kind kClientKind[kKinds] = {clients::kCompanion, clients::kDrawCompanion, clients::kPass};
-const char* const kKindName[kKinds] = {"companion", "draw companion", "pass"};
+std::string client(uint32_t k, rg_handle h) {
+  if (k == kNode) return "engine";
+  std::string c = clients::client_of(kClientKind[k], h);
+  if (const size_t dot = c.rfind('.'); dot != std::string::npos) c.resize(dot);  // "X.dll" -> "X"
+  return c.empty() ? "?" : c;
+}
+std::string name(uint32_t k, rg_handle h) {
+  if (k == kNode) {
+    const char* n = g_node_name[h - 1].load(std::memory_order_acquire);
+    return n ? n : "?";
+  }
+  const std::string n = clients::name_of(kClientKind[k], h);
+  return n.empty() ? "?" : n;
+}
 
 void name_items() {
   for (uint32_t k = 0; k < kKinds; ++k)
-    for (uint32_t i = 0; i < kPerKind; ++i) {
-      std::string client = clients::client_of(kClientKind[k], static_cast<rg_handle>(i + 1));
-      const std::string name = clients::name_of(kClientKind[k], static_cast<rg_handle>(i + 1));
-      if (const size_t dot = client.rfind('.'); dot != std::string::npos) client.resize(dot);  // "X.dll" -> "X"
-      std::swprintf(g_item[k * kPerKind + i].event, 96, L"REDGraph: %hs/%hs", client.empty() ? "?" : client.c_str(),
-                    name.empty() ? "?" : name.c_str());
-    }
+    if (k != kNode)
+      for (uint32_t i = 0; i < kCount[k]; ++i) {
+        const rg_handle h = static_cast<rg_handle>(i + 1);
+        std::swprintf(g_item[base_of(k) + i].event, 96, L"REDGraph: %hs/%hs", client(k, h).c_str(),
+                      name(k, h).c_str());
+      }
 }
 
 bool create() {
@@ -118,34 +143,38 @@ bool create() {
   std::memset(p, 0, static_cast<size_t>(rd.Width));
   g_ms_per_tick = 1000.0 / static_cast<double>(freq);
   name_items();
-  g_sdk->logger->InfoF(g_handle, "gpu timing: ON - %u frame slots x %u pairs, timestamp %llu Hz (direct queue)", kRing,
-                       kPairs, static_cast<unsigned long long>(freq));
+  g_sdk->logger->InfoF(g_handle, "gpu timing: ON - %u frame slots x %u pairs, timestamp %llu Hz (direct queue); render "
+                       "graph nodes %s", kRing, kPairs, static_cast<unsigned long long>(freq),
+                       g_nodes ? "timed" : "NOT timed (GpuTiming / RenderGraphDebug was off at the start)");
   return true;
 }
 
 void smooth(double* ema, double x) { *ema = *ema < 0 ? x : *ema + (x - *ema) * kSmooth; }
+bool bit(const uint64_t* m, uint32_t i) { return (m[i >> 6] >> (i & 63)) & 1; }
 
 // The slot recorded kRing frames ago: every pair the GPU resolved since, then cleared for this frame.
 void read(uint32_t si) {
   Slot& s = g_slot[si];
   const uint32_t n = s.n.load() < kPairs ? s.n.load() : kPairs;
-  const uint32_t refused = s.refused.load();
   auto* rb = const_cast<uint64_t*>(g_mapped) + size_t(si) * kPairs * 2;
   double sum[kItems] = {}, overhead = -1;
   uint32_t cnt[kItems] = {};
-  uint32_t bad = refused;  // items whose frame is incomplete
-  uint64_t late = 0, late_item[kItems] = {}, rej_item[kItems] = {};
+  uint64_t late_item[kItems] = {}, rej_item[kItems] = {};
+  uint64_t bad[kMaskWords];  // items whose frame is incomplete
+  for (uint32_t w = 0; w < kMaskWords; ++w) bad[w] = s.refused[w].load();
+  uint64_t late = 0;
   for (uint32_t p = 0; p < n; ++p) {
+    const uint16_t it = s.item[p];
+    if (it == kIgnore) continue;
     const uint64_t b = rb[p * 2], e = rb[p * 2 + 1];
-    const uint8_t it = s.item[p];
     if (!b || !e) {
       ++late;
-      if (it != kEmpty) ++late_item[it], bad |= 1u << it;
+      if (it != kEmpty) ++late_item[it], bad[it >> 6] |= 1ull << (it & 63);
       continue;
     }
     const double ms = e >= b ? static_cast<double>(e - b) * g_ms_per_tick : -1.0;
     if (ms < 0 || ms > kMaxMs) {
-      if (it != kEmpty) ++rej_item[it], bad |= 1u << it;
+      if (it != kEmpty) ++rej_item[it], bad[it >> 6] |= 1ull << (it & 63);
       continue;
     }
     if (it == kEmpty) {
@@ -165,7 +194,7 @@ void read(uint32_t si) {
     Item& t = g_item[i];
     t.late += late_item[i];
     t.rejected += rej_item[i];
-    if (!cnt[i] || (bad & (1u << i))) continue;
+    if (!cnt[i] || bit(bad, i)) continue;
     smooth(&t.ema, sum[i]);
     t.last = sum[i];
     t.per_frame = cnt[i];
@@ -173,10 +202,10 @@ void read(uint32_t si) {
   }
 }
 
-uint32_t take_pair(Slot& s, uint8_t item) {
+uint32_t take_pair(Slot& s, uint16_t item) {
   const uint32_t p = s.n.fetch_add(1, std::memory_order_relaxed);
   if (p >= kPairs) {
-    if (item != kEmpty) s.refused.fetch_or(1u << item, std::memory_order_relaxed);
+    if (item != kEmpty) s.refused[item >> 6].fetch_or(1ull << (item & 63), std::memory_order_relaxed);
     return UINT32_MAX;
   }
   s.item[p] = item;
@@ -187,6 +216,11 @@ uint32_t take_pair(Slot& s, uint8_t item) {
 
 void set_enabled(bool on) { g_want.store(on); }
 bool enabled() { return g_want.load(); }
+bool active() { return g_active.load(std::memory_order_relaxed); }
+void set_node_timing(bool on) { g_nodes = on; }
+void set_node_name(int32_t handle, const char* n) {
+  if (handle > 0 && static_cast<uint32_t>(handle) <= kCount[kNode]) g_node_name[handle - 1].store(n);
+}
 
 void frame_tick() {
   if (!g_want.load(std::memory_order_relaxed)) {
@@ -203,15 +237,16 @@ void frame_tick() {
   Slot& s = g_slot[next];
   if (s.used) read(next);
   s.n.store(0, std::memory_order_relaxed);
-  s.refused.store(0, std::memory_order_relaxed);
+  for (auto& w : s.refused) w.store(0, std::memory_order_relaxed);
   s.empty_done.store(false, std::memory_order_relaxed);
   s.used = true;
   g_cur.store(next, std::memory_order_release);
   g_active.store(true, std::memory_order_release);
 }
 
-uint32_t begin(ID3D12GraphicsCommandList* cl, Kind kind, int32_t handle) {
-  if (!g_active.load(std::memory_order_acquire) || !cl || handle <= 0 || static_cast<uint32_t>(handle) > kPerKind)
+uint32_t begin(ID3D12GraphicsCommandList* cl, Kind kind, int32_t handle, bool event) {
+  if (!g_active.load(std::memory_order_acquire) || !cl || kind >= kKinds || handle <= 0 ||
+      static_cast<uint32_t>(handle) > kCount[kind])
     return 0;
   const D3D12_COMMAND_LIST_TYPE type = cl->GetType();
   if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE) return 0;
@@ -227,40 +262,48 @@ uint32_t begin(ID3D12GraphicsCommandList* cl, Kind kind, int32_t handle) {
       cl->ResolveQueryData(g_heap, D3D12_QUERY_TYPE_TIMESTAMP, q, 2, g_rb, UINT64(q) * sizeof(uint64_t));
     }
   }
-  const uint8_t item = static_cast<uint8_t>(kind * kPerKind + (handle - 1));
+  const auto item = static_cast<uint16_t>(base_of(kind) + (handle - 1));
   const uint32_t p = take_pair(s, item);
   if (p == UINT32_MAX) return 0;
-  const wchar_t* ev = g_item[item].event;
-  cl->BeginEvent(0, ev, static_cast<UINT>((std::wcslen(ev) + 1) * sizeof(wchar_t)));
+  if (event) {
+    const wchar_t* ev = g_item[item].event;
+    cl->BeginEvent(0, ev, static_cast<UINT>((std::wcslen(ev) + 1) * sizeof(wchar_t)));
+  }
   cl->EndQuery(g_heap, D3D12_QUERY_TYPE_TIMESTAMP, (base + p) * 2);
   return base + p + 1;
 }
 
-void end(ID3D12GraphicsCommandList* cl, uint32_t token) {
+void end(ID3D12GraphicsCommandList* cl, uint32_t token, bool event) {
   const UINT q = (token - 1) * 2;
   cl->EndQuery(g_heap, D3D12_QUERY_TYPE_TIMESTAMP, q + 1);
   cl->ResolveQueryData(g_heap, D3D12_QUERY_TYPE_TIMESTAMP, q, 2, g_rb, UINT64(q) * sizeof(uint64_t));
-  cl->EndEvent();
+  if (event) cl->EndEvent();
+}
+
+void abandon(uint32_t token) {
+  const uint32_t g = token - 1;
+  g_slot[g / kPairs].item[g % kPairs] = kIgnore;
 }
 
 std::string report() {
   if (!g_want.load()) return "";
   std::lock_guard g(g_mu);
-  char line[320];
-  std::snprintf(line, sizeof line, "gpu\t%llu\t%llu\t%llu\t%.4f\n", static_cast<unsigned long long>(g_read),
-                static_cast<unsigned long long>(g_late), static_cast<unsigned long long>(g_overflow), g_overhead);
+  char line[400];
+  std::snprintf(line, sizeof line, "gpu\t%llu\t%llu\t%llu\t%.4f\t%d\n", static_cast<unsigned long long>(g_read),
+                static_cast<unsigned long long>(g_late), static_cast<unsigned long long>(g_overflow), g_overhead,
+                g_nodes ? 1 : 0);
   std::string o = line;
-  for (uint32_t i = 0; i < kItems; ++i) {
-    const Item& t = g_item[i];
-    if (!t.frames && !t.rejected && !t.late) continue;
-    const uint32_t k = i / kPerKind;
-    const rg_handle h = static_cast<rg_handle>(i % kPerKind + 1);
-    std::snprintf(line, sizeof line, "item\t%s\t%s\t%s\t%.4f\t%.4f\t%u\t%llu\t%llu\t%llu\n", kKindName[k],
-                  clients::client_of(kClientKind[k], h).c_str(), clients::name_of(kClientKind[k], h).c_str(), t.ema,
-                  t.last, t.per_frame, static_cast<unsigned long long>(t.frames),
-                  static_cast<unsigned long long>(t.rejected), static_cast<unsigned long long>(t.late));
-    o += line;
-  }
+  for (uint32_t k = 0; k < kKinds; ++k)
+    for (uint32_t i = 0; i < kCount[k]; ++i) {
+      const Item& t = g_item[base_of(k) + i];
+      if (!t.frames && !t.rejected && !t.late) continue;
+      const rg_handle h = static_cast<rg_handle>(i + 1);
+      std::snprintf(line, sizeof line, "item\t%s\t%s\t%s\t%.4f\t%.4f\t%u\t%llu\t%llu\t%llu\n", kKindName[k],
+                    client(k, h).c_str(), name(k, h).c_str(), t.ema, t.last, t.per_frame,
+                    static_cast<unsigned long long>(t.frames), static_cast<unsigned long long>(t.rejected),
+                    static_cast<unsigned long long>(t.late));
+      o += line;
+    }
   return o;
 }
 

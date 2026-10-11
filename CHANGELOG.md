@@ -8,6 +8,10 @@
 - Higher limits for mods that patch many shaders: 256 patches, 32 leases, and a lease now reaches up to 64 different
   game shaders (it stopped at 8 without a word; now the log says when it is full).
 - The render graph window shows the nodes a mod removed.
+- GPU timing, when on at the game's start, also times every pass of the game's render graph and the ray dispatches
+  mods change - switch a mod's change off and on to see what it costs.
+- A mod that removes a game node can have that node's outputs cleared to a value it chooses, instead of leaving them
+  stale.
 
 ## 0.2.1
 

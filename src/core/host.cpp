@@ -15,6 +15,7 @@
 
 #include "core/cb_hooks.hpp"
 #include "core/clients.hpp"
+#include "core/gpu_timing.hpp"
 #include "core/crash_log.hpp"
 #include "core/engine_231.hpp"
 #include "core/internal.hpp"
@@ -385,6 +386,12 @@ void* h_flow_texture(rg_handle res, uint32_t* gpuapi_id) {
 uint32_t h_flow_transition(rg_handle res, uint32_t state) {
   return own(_ReturnAddress(), clients::sFlow, res, "flow_transition") ? render_flow::flow_transition(res, state) : 0u;
 }
+__declspec(noinline) int32_t w_node_remove_clear(rg_handle remove, uint32_t name_hash, const float* value) {
+  int32_t r = clients::owner_check(_ReturnAddress(), clients::sRemove, remove, "node_remove_clear");
+  if (!r) r = render_nodes::node_remove_clear(remove, name_hash, value);
+  return r;
+}
+
 void h_node_remove_set(rg_handle remove, uint32_t on) {
   if (own(_ReturnAddress(), clients::sRemove, remove, "node_remove_set")) render_nodes::node_remove_set(remove, on);
 }
@@ -450,6 +457,7 @@ const rg_host kHost = {
     &pso::draw_companion_stats,
     &h_after_draw,
     &hlsl::compile,
+    &w_node_remove_clear,
 };
 
 }  // namespace
@@ -557,10 +565,12 @@ void attach() {
   if (want_cbv) cbv_ok = pso_ok && bindings::attach();
   if (want_rt) rt_ok = rtlib::attach();
   if (want_pass) pass_ok = passes::attach();
-  render_nodes::attach();  // only if a client registered a node
+  if (gpu_timing::enabled()) render_nodes::wrap_all_classes();  // GpuTiming on at the start: every node timed
+  render_nodes::attach();  // only if a client registered a node, a wrap, or every class is wrapped
   render_flow::attach();   // only if a census, a flow_register or a node wants it
   if (graph_probe::census()) graph_probe::attach();
-  rtlib::attach_rays(graph_probe::rays_wanted());  // M12 variants and / or the census's DispatchRays rows
+  // M12 variants, the census's DispatchRays rows and / or GPU timing of raygens in state objects with our libraries
+  rtlib::attach_rays(graph_probe::rays_wanted(), gpu_timing::enabled());
   prof::attach_frames();                           // the profile timer (RG_Profile)
   auto s = [](bool want, bool ok) { return want ? (ok ? "on" : "FAILED") : "none"; };
   g_sdk->logger->InfoF(g_handle, "host: ATTACHED at %s - PSO patches %s, engine-table leases %s, RT libraries %s, "

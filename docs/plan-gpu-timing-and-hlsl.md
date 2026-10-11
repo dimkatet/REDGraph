@@ -128,7 +128,7 @@ Their reading vs ours; each is a grep in `docs/render-graph.md` / `render_nodes.
 | `GameplayPostFX::Execute` runs twice, the request run's view index unreliable | CONSISTENT with ours (the graph runs twice: declaration + real, `kFlowPhase`) | none: `tag_of` reads `ctx+0x34` in both runs exactly as the engine's `RTAlloc` does; `flow_texture` resolves only in the real run |
 | under DLSS the view's `+0x34/+0x38` = render size, `+0x54/+0x58` = output | not checked (a VIEW object, not the node ctx - our `kNodeCtxView` 0x34 is a different struct) | none today: no host or CRT code sizes a target from a view; `node_alloc` takes absolute sizes from the client. If a host helper ever sizes post-upscale targets, read `+0x54/+0x58` and verify it first |
 | a node object is recreated per graph rebuild | handled | removal instances (`render_nodes.cpp` `claim_instance`) recycle the oldest by declaration stamp and re-latch every declaration run; graph-debug removals are wanted by a rebuild-proof KEY and re-mapped to the new object (`graph_debug.cpp` ~171); our own nodes carry their index inside the object |
-| `Test` / `TestFilter` keeps HUD / menu 3D previews clean | `Test(DebugFilter)` 0x14021be28: `ctx+0x30` bit 0 -> open; else the view at `ctx+0x18`, a 32 x u64 mask at `view+0x18a0` ANDed with the filter | OPEN GAP: `pass_after_*` / companions are keyed by PSO and fire in every view (inventory / photo-mode previews too); `node_wrap` gets the ctx but no helper. Candidate host call: `rg_view_test(ctx, filter)` or a `gameplay_only` flag on a pass - only when a client asks |
+| `Test` / `TestFilter` keeps HUD / menu 3D previews clean | `Test(DebugFilter)` 0x14021be28: `ctx+0x30` bit 0 -> open; else the view at `ctx+0x18`, a 32 x u64 mask at `view+0x18a0` ANDed with the filter | OPEN GAP: `pass_after_*` / companions are keyed by PSO and fire in every view (inventory / photo-mode previews too); `node_wrap` gets the ctx but no helper. No `gameplay_only` flag (a POLICY - the client's); the host owes the FACT instead: section 7 |
 
 ### Built 2026-10-11, checked in game the same day
 `compile_hlsl(rg_hlsl_desc*, rg_blob*, error, size)` at the end of `rg_host` (+ `RG_E_UNAVAILABLE` / `RG_E_COMPILE`),
@@ -141,9 +141,68 @@ the "it runs" proof. `build_and_deploy.ps1 -Dxc <bin/x64>` copies the two DLLs f
 - hot reload NOT built: a registered patch / companion cannot take a new blob (no such host mechanism - a gap of its own).
 - check: RED4ext scans `red4ext/plugins/<dir>/` for DLLs - it must not choke on `dxcompiler.dll` / `dxil.dll` there.
 
+## 7. The current frame, read-only (framework item, agreed 2026-10-11) - NOT built
+
+Every view the engine renders (the main camera, the inventory / menu 3D previews, photo mode) runs through the same
+graph as its own frame; a client inside a node (pass, subscription, wrap) cannot tell which - its callbacks carry no
+context, and finding out means the engine RE the host exists to hold. The host's line (user, 2026-10-11): it gives
+ACCESS to engine state (like `flow_texture`), never a policy (`gameplay_only` on a pass is the client's decision).
+
+What the exe shows (static, 2026-10-11):
+| where | what | from |
+|---|---|---|
+| `ctx+0x18` | the frame object - likely `CRenderFrame` (its ctor takes `CRenderFrameInfo`; `CRenderFrameSetup(IViewport, ERenderingMode)`), NOT verified | both `Test()`s read it |
+| frame `+0x17d0` | `ERenderFeatureFlags` bit set | `Test(ERenderFeatureFlags)` 0x14023af5c: one `bt` |
+| frame `+0x18a0` | `DebugFilter` mask, 32 x u64 - how the engine keeps post FX off the previews | `Test(DebugFilter)` 0x14021be28 |
+| `ctx+0x34` | the view index (in every RenderFlow tag) | `tag_of`, `RTAlloc` |
+| render / output size under DLSS | `+0x34/+0x38` / `+0x54/+0x58` of the view per spuddeh | NOT checked |
+
+Step 1 = a DUMP of those fields from inside one node in three places (gameplay, inventory, photo mode): which field /
+bit tells them apart, are the sizes there. Step 2, only from the dump: `frame_info(rg_frame_info*)` + a feature-bit
+query, callable from any host callback inside a node. No API by guess.
+
 ## 4. Not taking
 - `uniform` annotations, `settings.ini` layout, the CET window, the script API: the client layer.
 - Their addresses: we have cp2077-symbols for 2.31.
+
+## Second batch, 2026-10-11
+- **The engine's work, timed PER RENDER-GRAPH NODE** (section 1 items 3 + 4): when
+  GpuTiming is on at the START, every engine node class is wrapped (render_nodes' mechanism of the graph debug module -
+  RenderGraphDebug gives the same), and a pair goes around each node's Execute (or its removal's replay) on the node's
+  list, keyed by the class: "node / engine / <class>", every instance of a class summed per frame. Not a group (members
+  are on their own lists) nor a job-builder node; a list that changed under it drops the pair. What a client's patch
+  costs = its node with the patch on minus off. Plus `rays (variant | library)`: one bracket around a DispatchRays of a
+  state object holding a client library. No debug event on engine work.
+  **Ran 2026-10-11:** 120 node classes timed, sum 13.3 ms a frame, late / rejected / over budget 0, own cost 0.002 ms;
+  a small frame-rate drop (user: fine). Top: ApplyDLSS 2.77, RenderRayTracedReflections 2.30 (CRT's fog raygen
+  variants inside it 1.9), RenderRayTracedRTXDI 2.02, RenderElements x40 1.75, ReSTIR GI 0.91, LocalShadowMaps 0.62.
+  **Gap: job-builder nodes** (the G-buffer geometry; most likely where CRT's tree wind CS runs) are not timed - their
+  work is in jobs on other lists. Next: render_flow already wraps every job a node submits and knows its node - a pair
+  around each job on its list, summed into the owning node.
+- **Why not per PSO (built, run and REMOVED the same day):** the first version bracketed the engine's dispatches / draws
+  of patched / subscribed PSOs. It had to GUESS what the next engine call would run (the last bind on the thread, the
+  PSO on the list, the dirty bytes; or open inside the bind funnel through a thread-local "in a hooked call"),
+  depended on hooks attached for other reasons, and per draw it serialised the GPU:
+  ~2000 pairs a frame, almost all CRT's tree wind (CS db18e315 656
+  calls 1.87 ms, VS 5fec49ce 575 calls 2.88 ms, VS aed1561a 514 calls 1.93 ms, the other tree VS ~290 calls ~1.1 ms);
+  the user saw most of the frame rate go, and it came back with the switch off. A timestamp + resolve per draw keeps
+  the GPU from overlapping the draws - the cost AND an inflated number. Now per RUN: back-to-back calls of one item on
+  one list share one pair, ended by the next call that is not the item or by our own work (a run cut off by the end of
+  its list is dropped, counted as "never closed"). Run: the tree VS collapsed to 1-3 runs a frame (from 500-600
+  calls) - but CS db18e315 stayed at 698 runs (its dispatches are interleaved with other calls), and the drop, smaller,
+  stayed. So: at most kSampleRuns = 32 runs of an engine item are timed per frame, every run is counted on the CPU,
+  and ms = the timed sum x runs / timed ("32 of 698" in the window). Bounded cost every frame, no spike frames; it
+  assumes the runs of one shader in a frame are alike. Ran: no frame-rate drop, db18e315 ~2.2 ms.
+  User: "isn't it hacky?" - yes; replaced by the per-node timing above (no guessing, no runs, no sampling).
+- **`node_remove_clear(removal, name_hash, value[4])`** (6b): in the replay of a removed node, right after each
+  RTUseBegin with WRITE access whose tag matches, the texture is cleared - RTV / DSV of our own heaps on the
+  engine's device, the engine's TransitionTexture first. UAV-only textures, buffers and 1D are skipped (logged once).
+  The neutral value is the client's. Self-test: FlowProbe registers magenta on the clouds removal.
+  **First run, 2026-10-11: `0 = every written texture` cleared SCENE COLOUR (tag 3d7e6258) - the clouds node
+  declares a write to it because it composites into it - and the whole frame went magenta except what draws later
+  (sky, some transparents).** The mechanism worked; the meaning was wrong. Now 0 = only the textures the node ALLOCATES
+  (RTAlloc in its own record); a shared target only by name.
+- `gpu_ms` in the public API: DROPPED (user: the host's UI is where performance is read; no client needs it to work).
 
 ## The 2026-10-11 run (one batch: sections 1, 2, 6a, 6b)
 `HlslTest` PASS (cs_6_0 2068 B signed; broken ps_6_0 -> RG_E_COMPILE with the text; lib_6_3 refused); `LeaseTexTest`

@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 
 #include <RED4ext/CName.hpp>
 
@@ -373,15 +374,164 @@ void want_requests() {
 bool requests_attached() { return g_req_attached; }
 void record_into(FlowRecord* r) { t_rec = r; }
 
-// The recorded requests, raw, through the engine's own entry (the census still sees them as phase 2).
-void replay(const void* node_ctx, const FlowRecord& r) {
-  auto* data = const_cast<uint8_t*>(flow_data(static_cast<const uint8_t*>(node_ctx)));
+namespace {
+// ---- node_remove_clear: the removed node's written textures cleared in its place ----
+// Our own CPU-only RTV / DSV heaps on the engine's device; a descriptor is read when the Clear is RECORDED, so a small
+// ring reused at once is enough.
+constexpr uint32_t kClearRing = 64;
+ID3D12Device* g_cdev = nullptr;
+ID3D12DescriptorHeap *g_rtv = nullptr, *g_dsv = nullptr;
+uint32_t g_rtv_inc = 0, g_dsv_inc = 0;
+std::atomic<uint32_t> g_rtv_next{0}, g_dsv_next{0};
+std::once_flag g_clear_once;
+std::atomic<uint64_t> g_cleared{0}, g_clear_skipped{0};
+std::atomic<bool> g_skip_logged{false};
+
+void clear_setup() {
+  const auto* data = *reinterpret_cast<const uint8_t* const*>(g_base + kDeviceData);
+  auto* engine_dev = data ? *reinterpret_cast<IUnknown* const*>(data + kDeviceInData) : nullptr;
+  if (!engine_dev || FAILED(engine_dev->QueryInterface(IID_PPV_ARGS(&g_cdev)))) return;
+  g_cdev->Release();  // the engine holds it for the process
+  D3D12_DESCRIPTOR_HEAP_DESC d{};
+  d.NumDescriptors = kClearRing;
+  d.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+  if (FAILED(g_cdev->CreateDescriptorHeap(&d, IID_PPV_ARGS(&g_rtv)))) g_rtv = nullptr;
+  d.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+  if (FAILED(g_cdev->CreateDescriptorHeap(&d, IID_PPV_ARGS(&g_dsv)))) g_dsv = nullptr;
+  g_rtv_inc = g_cdev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+  g_dsv_inc = g_cdev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+}
+
+DXGI_FORMAT depth_format(DXGI_FORMAT f) {
+  switch (f) {
+    case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_D32_FLOAT;
+    case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    case DXGI_FORMAT_R32G8X24_TYPELESS: return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_D16_UNORM;
+    default: return f;
+  }
+}
+DXGI_FORMAT color_format(DXGI_FORMAT f) {  // a typeless color resource: the plain typed view of it
+  switch (f) {
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R32G32_TYPELESS: return DXGI_FORMAT_R32G32_FLOAT;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT;
+    case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R8G8_TYPELESS: return DXGI_FORMAT_R8G8_UNORM;
+    case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_R16_FLOAT;
+    case DXGI_FORMAT_R8_TYPELESS: return DXGI_FORMAT_R8_UNORM;
+    default: return f;
+  }
+}
+
+void skip(const char* why, uint32_t tag, const D3D12_RESOURCE_DESC& d) {
+  g_clear_skipped.fetch_add(1, std::memory_order_relaxed);
+  if (!g_skip_logged.exchange(true))
+    g_sdk->logger->WarnF(g_handle, "node_remove_clear: tag %08x NOT cleared - %s (dimension %u, format %u, flags 0x%x; "
+                         "logged once, counted)", tag, why, static_cast<unsigned>(d.Dimension),
+                         static_cast<unsigned>(d.Format), static_cast<unsigned>(d.Flags));
+}
+
+// Mip 0, every slice: ClearRenderTargetView / ClearDepthStencilView after the engine's own transition (its state
+// tracker then knows where the texture is). A texture only a UAV can write is not cleared (v1).
+void clear_texture(uint32_t id, uint32_t tag, const float v[4]) {
+  std::call_once(g_clear_once, clear_setup);
+  auto* res = static_cast<ID3D12Resource*>(texture_resource(id));
+  auto* cl_ctx = static_cast<uint8_t*>(g_get_ctx());
+  if (!res || !cl_ctx || !g_cdev) return;
+  auto* cl = *reinterpret_cast<ID3D12GraphicsCommandList**>(cl_ctx + kCtxCmdList);
+  const D3D12_RESOURCE_DESC d = res->GetDesc();
+  const bool ds = d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+  const bool rt = d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return skip("a buffer", tag, d);
+  if (!ds && !rt) return skip("neither a render target nor a depth target (a UAV-only texture)", tag, d);
+  if (ds ? !g_dsv : !g_rtv) return skip("no descriptor heap", tag, d);
+  const bool ms = d.SampleDesc.Count > 1;
+  const bool arr = d.DepthOrArraySize > 1 && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  if (ds) {
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return skip("a depth target that is not 2D", tag, d);
+    D3D12_DEPTH_STENCIL_VIEW_DESC vd{};
+    vd.Format = depth_format(d.Format);
+    vd.ViewDimension = ms ? (arr ? D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY : D3D12_DSV_DIMENSION_TEXTURE2DMS)
+                          : (arr ? D3D12_DSV_DIMENSION_TEXTURE2DARRAY : D3D12_DSV_DIMENSION_TEXTURE2D);
+    if (ms && arr) vd.Texture2DMSArray.ArraySize = d.DepthOrArraySize;
+    else if (arr) vd.Texture2DArray.ArraySize = d.DepthOrArraySize;
+    D3D12_CPU_DESCRIPTOR_HANDLE h = g_dsv->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += SIZE_T(g_dsv_next.fetch_add(1, std::memory_order_relaxed) % kClearRing) * g_dsv_inc;
+    g_cdev->CreateDepthStencilView(res, &vd, h);
+    g_transition(cl_ctx, id, D3D12_RESOURCE_STATE_DEPTH_WRITE, 0xffffffffu);
+    g_flush(cl_ctx);
+    const bool stencil = vd.Format == DXGI_FORMAT_D24_UNORM_S8_UINT || vd.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    cl->ClearDepthStencilView(h, stencil ? D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL : D3D12_CLEAR_FLAG_DEPTH,
+                              v[0], static_cast<UINT8>(v[1]), 0, nullptr);
+  } else {
+    D3D12_RENDER_TARGET_VIEW_DESC vd{};
+    vd.Format = color_format(d.Format);
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+      vd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+      vd.Texture3D.WSize = UINT(-1);
+    } else if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+      vd.ViewDimension = ms ? (arr ? D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY : D3D12_RTV_DIMENSION_TEXTURE2DMS)
+                            : (arr ? D3D12_RTV_DIMENSION_TEXTURE2DARRAY : D3D12_RTV_DIMENSION_TEXTURE2D);
+      if (ms && arr) vd.Texture2DMSArray.ArraySize = d.DepthOrArraySize;
+      else if (arr) vd.Texture2DArray.ArraySize = d.DepthOrArraySize;
+    } else {
+      return skip("a 1D render target", tag, d);
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE h = g_rtv->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += SIZE_T(g_rtv_next.fetch_add(1, std::memory_order_relaxed) % kClearRing) * g_rtv_inc;
+    g_cdev->CreateRenderTargetView(res, &vd, h);
+    g_transition(cl_ctx, id, D3D12_RESOURCE_STATE_RENDER_TARGET, 0xffffffffu);
+    g_flush(cl_ctx);
+    cl->ClearRenderTargetView(h, v, 0, nullptr);
+  }
+  if (g_cleared.fetch_add(1, std::memory_order_relaxed) == 0)
+    g_sdk->logger->InfoF(g_handle, "node_remove_clear: first clear - tag %08x, %llux%u x%u, format %u, as a %s target "
+                         "to (%g, %g, %g, %g)", tag, static_cast<unsigned long long>(d.Width), d.Height,
+                         static_cast<unsigned>(d.DepthOrArraySize), static_cast<unsigned>(d.Format),
+                         ds ? "depth" : "render", v[0], v[1], v[2], v[3]);
+}
+}  // namespace
+
+// The recorded requests, raw, through the engine's own entry (the census still sees them as phase 2). With clears:
+// right after a request that begins a WRITE use (RTUseBegin, access bit 2) of a matching resource, it is cleared - the
+// node's place in the frame, the resource live and declared.
+void replay(const void* node_ctx, const FlowRecord& r, const RemoveClear* clears, uint32_t nclears) {
+  const auto* ctx = static_cast<const uint8_t*>(node_ctx);
+  auto* data = const_cast<uint8_t*>(flow_data(ctx));
   if (!data) return;
   alignas(8) uint8_t req[FlowRecord::kSize];
+  // The node's OWN textures (RTAlloc in its record): what a name_hash 0 rule may clear. A target it only writes INTO
+  // (scene colour: the clouds composite there) also gets a write RTUseBegin - clearing it wipes the frame (2026-10-11,
+  // the whole screen magenta) - so a shared target is cleared only by its name.
+  constexpr uint32_t kMaxOwn = 32;
+  uint32_t own[kMaxOwn], nown = 0;
   for (uint32_t i = 0; i < r.n; ++i) {
     std::memcpy(req, r.req[i], sizeof req);
     g_handle_request(data, req, r.thread[i]);
+    if (!nclears) continue;
+    if (r.req[i][0] == kFlowReqAlloc && nown < kMaxOwn) own[nown++] = rd<uint32_t>(r.req[i], 4);
+    if (r.req[i][0] != kFlowReqUseBegin || !(rd<uint32_t>(r.req[i], kFlowRequestPayload) & 2)) continue;
+    const uint32_t tag = rd<uint32_t>(r.req[i], 4);
+    bool owned = false;
+    for (uint32_t k = 0; k < nown && !owned; ++k) owned = own[k] == tag;
+    for (uint32_t c = 0; c < nclears; ++c) {
+      if (clears[c].name_hash ? tag_of(ctx, clears[c].name_hash) != tag : !owned) continue;
+      uint32_t id = 0;
+      g_get_resource(data, &id, &tag, r.thread[i], false);
+      if (id) clear_texture(id, tag, clears[c].value);
+      break;  // the first matching rule, in registration order
+    }
   }
+}
+
+void clear_stats(uint64_t* cleared, uint64_t* skipped) {
+  *cleared = g_cleared.load();
+  *skipped = g_clear_skipped.load();
 }
 
 namespace {

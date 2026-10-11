@@ -45,6 +45,7 @@
 #include <d3d12.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 
 #include "selftest.hpp"
@@ -623,6 +624,19 @@ void register_with(const rg_host* host) {
     std::snprintf(line, sizeof line, "node remove test: a second removal of RenderVolumetricClouds = %d - %s", second,
                   second == RG_E_TAKEN ? "PASS (TAKEN)" : "FAIL (expected -2)");
     host->log(second == RG_E_TAKEN ? RG_LOG_INFO : RG_LOG_ERROR, line);
+  }
+  // node_remove_clear: the textures the clouds node ALLOCATES itself, magenta, in its place - never the scene colour
+  // it composites into (a name_hash 0 rule cannot reach a shared target; the first build could, and the whole frame
+  // went magenta). The proof is REDGraph's "node_remove_clear: first clear" / "NOT cleared - <why>" lines, and NO
+  // magenta on screen. A bad handle and a NULL value are refused.
+  if (host->struct_size >= offsetof(rg_host, node_remove_clear) + sizeof(void*)) {
+    const float magenta[4] = {1, 0, 1, 1};
+    const int32_t ok = g_remove > 0 ? host->node_remove_clear(g_remove, 0, magenta) : g_remove;
+    const int32_t bad = host->node_remove_clear(9999, 0, magenta), null = host->node_remove_clear(g_remove, 0, nullptr);
+    char line[200];
+    std::snprintf(line, sizeof line, "node remove clear test: registered %d, a bad handle %d, NULL value %d - %s", ok,
+                  bad, null, ok == 0 && bad < 0 && null == RG_E_ARG ? "PASS" : "FAIL");
+    host->log(ok == 0 && bad < 0 && null == RG_E_ARG ? RG_LOG_INFO : RG_LOG_ERROR, line);
   }
   g_color = host->flow_register("scene colour", 0x3d7e6258u);
   g_depth = host->flow_register("scene depth", 0xdebf0c27u);

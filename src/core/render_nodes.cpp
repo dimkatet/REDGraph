@@ -50,6 +50,7 @@
 
 #include "core/clients.hpp"
 #include "core/engine_231.hpp"
+#include "core/gpu_timing.hpp"
 #include "core/internal.hpp"
 #include "core/prof.hpp"
 
@@ -121,9 +122,12 @@ struct Instance {
   bool active = false;             // latched at the declaration run
   render_flow::FlowRecord rec{};
 };
+constexpr uint32_t kMaxClears = 4;
 struct Removal {
   std::atomic<bool> on{false};
   Instance inst[kMaxInstances];
+  render_flow::RemoveClear clears[kMaxClears];  // node_remove_clear, fixed once registration closes
+  uint32_t nclears = 0;
   std::atomic<uint64_t> removed{0}, ran{0}, replayed{0}, overflows{0}, refused{0};
 };
 Removal g_rm[kMaxRemovals];
@@ -171,6 +175,7 @@ uint32_t vt_slot(const void* vt) {
 
 // The graph debug module's removals: one slot per removed node INSTANCE (graph_debug.cpp).
 std::atomic<bool> g_debug{false};
+std::atomic<bool> g_wrap_all{false};  // GPU timing on at the start: every class wrapped, as for the debug module
 std::atomic<uint32_t> g_debug_classes{0};
 constexpr uint32_t kMaxDebug = 32;
 struct DebugSlot {
@@ -308,6 +313,7 @@ const PatchedVt* patch_vtable(void** vt, const char* why) {
   }
   InterlockedExchangePointer(&vt[kNodeVtExecute], reinterpret_cast<void*>(&wrap_execute));
   VirtualProtect(&vt[kNodeVtExecute], sizeof(void*), old, &old);
+  gpu_timing::set_node_name(static_cast<int32_t>(n + 1), why);  // the class name (a CName string / a wrap's target)
   return &g_vt[n];
 }
 
@@ -412,10 +418,21 @@ void wrap_execute(const uint8_t* self, const uint8_t* ctx, void* builder) {
     if (declare) wrap_declare(nw, vi, ctx, false);
     return;
   }
+  // GPU timing: the ENGINE's work of this node (its Execute, or the removal's replay) on the node's list - not the
+  // clients' before / after. Not a group (its members run on their own lists) nor a job-builder node (its work is in
+  // jobs); a list that changed under it drops the pair.
+  uint32_t gt = 0;
+  ID3D12GraphicsCommandList* gcl = nullptr;
+  if (!declaring && !p->shared && gpu_timing::active() &&
+      !reinterpret_cast<JobUsage_t>(vt[kNodeVtJobBuilderUsage])(self)) {
+    const uint8_t* lctx = g_get_ctx();
+    gcl = lctx ? *reinterpret_cast<ID3D12GraphicsCommandList* const*>(lctx + kCtxCmdList) : nullptr;
+    gt = gcl ? gpu_timing::begin(gcl, gpu_timing::kNode, vi + 1, false) : 0;
+  }
   if (rm) {
     Instance* in = instance_of(*rm, self);
     if (in && in->active && !in->rec.overflow) {
-      render_flow::replay(ctx, in->rec);
+      render_flow::replay(ctx, in->rec, rm->clears, rm->nclears);
       rm->removed.fetch_add(1, std::memory_order_relaxed);
       rm->replayed.fetch_add(in->rec.n, std::memory_order_relaxed);
     } else {
@@ -433,6 +450,13 @@ void wrap_execute(const uint8_t* self, const uint8_t* ctx, void* builder) {
     }
   } else {
     orig_execute(p, self, ctx, builder);
+  }
+  if (gt) {
+    const uint8_t* lctx = g_get_ctx();
+    if (lctx && *reinterpret_cast<ID3D12GraphicsCommandList* const*>(lctx + kCtxCmdList) == gcl)
+      gpu_timing::end(gcl, gt, false);
+    else
+      gpu_timing::abandon(gt);
   }
   if (!any || declaring) {
     if (declare) wrap_declare(nw, vi, ctx, false);
@@ -494,7 +518,8 @@ uint32_t d_register(void* factory, uint32_t group, const void* params) {
   if (p) std::memcpy(&engine_node, p + kParamsNode, sizeof engine_node);
   const uint64_t h = nn || g_nw.load(std::memory_order_acquire) ? name_hash_of(engine_node) : 0;
   const uint32_t r = g_orig(factory, group, params);
-  if (engine_node && g_debug.load(std::memory_order_relaxed)) debug_patch(engine_node);
+  if (engine_node && (g_debug.load(std::memory_order_relaxed) || g_wrap_all.load(std::memory_order_relaxed)))
+    debug_patch(engine_node);
   if (!h) return r;
   wrap_class(engine_node, h);
   for (uint32_t i = 0; i < nn; ++i) {
@@ -528,7 +553,9 @@ uint32_t d_register(void* factory, uint32_t group, const void* params) {
 
 }  // namespace
 
-bool needed() { return g_nn.load() != 0 || g_nw.load() != 0 || g_debug.load(); }
+bool needed() { return g_nn.load() != 0 || g_nw.load() != 0 || g_debug.load() || g_wrap_all.load(); }
+
+void wrap_all_classes() { g_wrap_all.store(true); }
 
 bool attach() {
   if (!needed()) return false;
@@ -544,8 +571,9 @@ bool attach() {
   g_vtable[kNodeVtGetName] = reinterpret_cast<void*>(&node_get_name);
   g_attached = attach_hook(kFactoryRegister, kFactoryRegisterRet, reinterpret_cast<void*>(&d_register),
                            reinterpret_cast<void**>(&g_orig), "rend::NodeGraphFactory::Register");
+  gpu_timing::set_node_timing(g_attached && (g_debug.load() || g_wrap_all.load()));
   g_sdk->logger->InfoF(g_handle, "render nodes: %u node(s) of ours, %u wrap(s)%s, graph builder %s", g_nn.load(),
-                       g_nw.load(), g_debug.load() ? ", graph debug (every class wrapped)" : "",
+                       g_nw.load(), g_debug.load() || g_wrap_all.load() ? ", every class wrapped (graph debug / GPU timing)" : "",
                        g_attached ? "ATTACHED (NodeGraphFactory::Register)" : "NOT attached - none inserted");
   return g_attached;
 }
@@ -746,6 +774,17 @@ rg_handle client_removal(const char* node_name) {
   for (uint32_t i = 0; i < n; ++i)
     if (g_w[i].rm >= 0 && g_w[i].target == hash && g_rm[g_w[i].rm].on.load(std::memory_order_relaxed))
       return static_cast<rg_handle>(i + 1);
+  return 0;
+}
+
+int32_t node_remove_clear(rg_handle h, uint32_t name_hash, const float* value) {
+  if (!registration_open()) return RG_E_LATE;
+  Removal* r = removal_of(h);
+  if (!r || !value) return RG_E_ARG;
+  if (r->nclears >= kMaxClears) return RG_E_FULL;
+  render_flow::RemoveClear& c = r->clears[r->nclears++];
+  c.name_hash = name_hash;
+  std::memcpy(c.value, value, sizeof c.value);
   return 0;
 }
 

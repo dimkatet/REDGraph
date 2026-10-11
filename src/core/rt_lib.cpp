@@ -42,6 +42,7 @@
 
 #include "core/engine_231.hpp"
 #include "core/clients.hpp"
+#include "core/gpu_timing.hpp"
 #include "core/internal.hpp"
 #include "core/prof.hpp"
 #include "dxil_hash.hpp"
@@ -500,6 +501,33 @@ void arm_variant(uint32_t so, uint32_t group) {
   if (best) t_ovr = {id, group, best, true};
 }
 
+// GPU timing (gpu_timing kRays*): a DispatchRays of a state object holding a client library - keyed by the raygen's
+// variant registration (whether it runs or not, so switching it compares the two), else by the library. 0 = not.
+using GetCtx_t = uint8_t* (*)();
+uint32_t time_rays(uint32_t so, uint32_t group, ID3D12GraphicsCommandList** cl_out) {
+  uint32_t id = 0;
+  const uint8_t* entry = rt_entry(so, &id);
+  const uint64_t libs = entry ? libs_at(entry) : 0;
+  if (!libs) return 0;
+  uint8_t* ctx = reinterpret_cast<GetCtx_t>(g_base + kGetCommandListContext)();
+  if (!ctx) return 0;
+  gpu_timing::Kind kind = gpu_timing::kRaysLib;
+  unsigned long first = 0;
+  _BitScanForward64(&first, libs);
+  int32_t h = static_cast<int32_t>(first + 1);
+  if (const wchar_t* name = group_name(entry, group)) {
+    const uint32_t n = g_nvar.load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < n; ++i)
+      if ((libs >> g_var[i].lib & 1) && std::wcscmp(name, g_var[i].raygen) == 0) {
+        kind = gpu_timing::kRaysVariant;
+        h = static_cast<int32_t>(i + 1);
+        break;
+      }
+  }
+  *cl_out = *reinterpret_cast<ID3D12GraphicsCommandList**>(ctx + kCtxCmdList);
+  return *cl_out ? gpu_timing::begin(*cl_out, kind, h, false) : 0;
+}
+
 void d_rays(uint32_t so, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5, uint32_t a6, uint32_t a7, uint32_t a8,
             uint32_t buffer) {
   // Entered from the hooked function's entry: our return address is the engine caller's.
@@ -509,10 +537,13 @@ void d_rays(uint32_t so, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5, uin
                                   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(_ReturnAddress()) - g_base - 5));
   t_ovr.set = false;
   if (g_gsgi_attached && g_nvar.load(std::memory_order_relaxed)) arm_variant(so, a4);
+  ID3D12GraphicsCommandList* tcl = nullptr;
+  const uint32_t timed = gpu_timing::active() ? time_rays(so, a4, &tcl) : 0;
   {
     prof::Pause engine;
     g_orig_rays(so, a2, a3, a4, a5, a6, a7, a8, buffer);
   }
+  if (timed) gpu_timing::end(tcl, timed, false);  // DispatchRays records on the list it found
   t_ovr.set = false;
 }
 
@@ -643,9 +674,10 @@ void variant_stats(rg_handle h, rg_rt_variant_stats* out) {
   out->on = v.on.load();
 }
 
-void attach_rays(bool census) {
+void attach_rays(bool census, bool timing) {
   const bool variants = g_nvar.load() != 0 && g_attached;
-  if (!census && !variants) return;
+  const bool timed = timing && g_attached && g_n.load() != 0;  // GPU timing on at the start + client libraries
+  if (!census && !variants && !timed) return;
   g_rays_attached = attach_hook(kDispatchRays, kDispatchRaysRet, reinterpret_cast<void*>(&d_rays),
                                 reinterpret_cast<void**>(&g_orig_rays), "DispatchRays (global)");
   g_rays_census = g_rays_attached && census;

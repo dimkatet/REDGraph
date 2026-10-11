@@ -102,12 +102,23 @@ local function gpu_refresh()
         local t = {}
         for f in (line .. "\t"):gmatch("([^\t]*)\t") do t[#t + 1] = f end
         if t[1] == "gpu" then
-            T.head = { frames = t[2], late = t[3], overflow = t[4], overhead = tonumber(t[5]) or -1 }
+            T.head = { frames = t[2], late = t[3], overflow = t[4], overhead = tonumber(t[5]) or -1, nodes = t[6] == "1" }
         elseif t[1] == "item" then
             T.items[#T.items + 1] = { kind = t[2], client = t[3], name = t[4], ms = tonumber(t[5]) or -1,
                                       last = tonumber(t[6]) or 0, per_frame = t[7], frames = t[8],
                                       rejected = t[9], late = t[10] }
         end
+    end
+    table.sort(T.items, function(a, b) return a.ms > b.ms end)
+end
+
+local function draw_item(it)
+    local name = it.kind == "node" and it.name:gsub("^CRenderNode_", "") or it.name
+    local text = string.format("%8.4f ms  (last %.4f, x%s per frame)  [%s] %s / %s", it.ms, it.last,
+        it.per_frame, it.kind, it.client, name)
+    if it.ms < 0 then ImGui.TextDisabled(text) else ImGui.Text(text) end
+    if (tonumber(it.rejected) or 0) > 0 or (tonumber(it.late) or 0) > 0 then
+        note("rejected " .. it.rejected .. ", late " .. it.late)
     end
 end
 
@@ -116,7 +127,9 @@ local function draw_gpu()
     check("GPU timing", "Diagnostics.GpuTiming",
         "Measures the GPU time of every mod companion and pass REDGraph records on the game's command\n" ..
         "lists (GPU timestamps, read a few frames later - never waits) and marks each one as a debug\n" ..
-        "event for Nsight / RenderDoc. A number per item, smoothed; not an absolute truth. Live.")
+        "event for Nsight / RenderDoc. On at the game's START it also times every node of the game's\n" ..
+        "render graph - switch a mod's change off and on to see what it adds to its node.\n" ..
+        "A number per item, smoothed; not an absolute truth. Live.")
     if not on("Diagnostics.GpuTiming") then return end
     local now = os.clock()
     if now - T.at > 0.5 then
@@ -129,18 +142,23 @@ local function draw_gpu()
     end
     note(string.format("frames read %s, late pairs %s, frames over budget %s, timing's own cost %.4f ms",
         T.head.frames, T.head.late, T.head.overflow, T.head.overhead))
-    if #T.items == 0 then
-        note("nothing timed yet - no companion or pass has run")
-        return
+    if not T.head.nodes then
+        note("the game's render graph nodes are not timed: GPU timing was off when the game started")
     end
+    local nodes, total = {}, 0
     for _, it in ipairs(T.items) do
-        local text = string.format("%8.4f ms  (last %.4f, x%s per frame)  [%s] %s / %s", it.ms, it.last,
-            it.per_frame, it.kind, it.client, it.name)
-        if it.ms < 0 then ImGui.TextDisabled(text) else ImGui.Text(text) end
-        if (tonumber(it.rejected) or 0) > 0 or (tonumber(it.late) or 0) > 0 then
-            note("rejected " .. it.rejected .. ", late " .. it.late)
+        if it.kind == "node" then
+            nodes[#nodes + 1] = it
+            if it.ms > 0 then total = total + it.ms end
+        else
+            draw_item(it)
         end
     end
+    if #nodes > 0 and ImGui.TreeNode(string.format("Game render graph nodes (%d, sum %.2f ms)", #nodes, total)) then
+        for _, it in ipairs(nodes) do draw_item(it) end
+        ImGui.TreePop()
+    end
+    if #T.items == 0 then note("nothing timed yet") end
 end
 
 local function draw_host()

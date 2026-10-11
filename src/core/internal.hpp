@@ -137,7 +137,7 @@ void stats(rg_handle h, rg_rtlib_stats* out);
 rg_handle variant_add(rg_handle lib, const char* raygen, const char* variant, const char* node);
 int32_t variant_set(rg_handle v, uint32_t on);
 void variant_stats(rg_handle v, rg_rt_variant_stats* out);
-void attach_rays(bool census);
+void attach_rays(bool census, bool timing);  // timing: GpuTiming on at the start (raygens of client libraries)
 void detach_rays();
 }  // namespace rtlib
 
@@ -199,7 +199,14 @@ struct FlowRecord {
 void want_requests();  // attach the HandleRequest detour (a census or a removal); before attach()
 bool requests_attached();
 void record_into(FlowRecord* r);  // this thread's requests go into r from now on; nullptr = stop
-void replay(const void* node_ctx, const FlowRecord& r);
+// node_remove_clear's rules: a resource (RenderFlow name hash, 0 = every one the node writes) and its clear value
+// (RGBA; a depth target: depth, stencil).
+struct RemoveClear {
+  uint32_t name_hash;
+  float value[4];
+};
+void replay(const void* node_ctx, const FlowRecord& r, const RemoveClear* clears = nullptr, uint32_t nclears = 0);
+void clear_stats(uint64_t* cleared, uint64_t* skipped);
 uint32_t gpu_descriptors(uint32_t count, rg_descriptors* out);  // M10
 }  // namespace render_flow
 
@@ -220,6 +227,10 @@ void node_wrap_uses(rg_handle h, uint32_t* uses, uint64_t* requests, uint32_t* g
 rg_handle node_remove(const char* target, uint32_t on);
 void node_remove_set(rg_handle h, uint32_t on);
 void node_remove_stats(rg_handle h, rg_remove_stats* out);
+int32_t node_remove_clear(rg_handle h, uint32_t name_hash, const float* value);
+// GPU timing on at the start: every engine node class is wrapped (as for the graph debug module) and each node's
+// Execute is timed. Before attach.
+void wrap_all_classes();
 // The client removal (node_remove) of the class `node_name` that is ON now - its handle, else 0. For the debug window.
 rg_handle client_removal(const char* node_name);
 // A node vtable's Execute as the engine built it (the original when slot [1] is wrapped) - for the graph dump.

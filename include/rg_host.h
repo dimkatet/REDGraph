@@ -624,6 +624,18 @@ typedef struct rg_host {
    * compiler is not installed; RG_E_COMPILE = errors in `error` (NUL-terminated, cut to error_size; may be NULL).
    * Warnings of a successful compile are logged. Thread-safe (one compile at a time). */
   int32_t (*compile_hlsl)(const rg_hlsl_desc* desc, rg_blob* out, char* error, uint32_t error_size);
+
+  /* M9: what a REMOVED node leaves in its outputs (2026-10-11). Without this they keep old / undefined contents (a
+   * transient: aliased memory - flicker). With it, in the node's place in the frame, each texture the node DECLARED it
+   * writes (RTUseBegin with write access - its own declarations, nothing guessed) that matches `name_hash` (the
+   * engine's RenderFlow name hash, as flow_register) is cleared, mip 0 and every slice. name_hash 0 = only the textures
+   * the node ALLOCATES itself (its own outputs, nobody else fills them); a SHARED target it only writes into (scene
+   * colour, which e.g. the clouds composite onto) is cleared only when named - clearing it wipes the frame:
+   * a render target to value[0..3] (RGBA), a depth target to depth value[0] and stencil value[1]. Which value is
+   * neutral is the CLIENT's call (motion vectors 0, a mask 0 or 1, depth per the engine's Z convention). Not cleared
+   * (logged once, counted): UAV-only textures, buffers, 1D. The first matching rule wins, in registration order; up to
+   * 4 per removal. Register-time. 0 = ok. */
+  int32_t (*node_remove_clear)(rg_handle remove, uint32_t name_hash, const float value[4]);
 } rg_host;
 
 RG_HOST_EXPORT const rg_host* rg_host_get(uint32_t version);
