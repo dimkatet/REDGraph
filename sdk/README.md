@@ -108,6 +108,8 @@ The header documents each call in detail. This table is the map: which call you 
 | another mod's transient | `flow_register("<theirmod>/<name>", 0)` + `node_use` | the only way clients share a resource - see section 8 |
 | code before / after an engine node | `node_wrap` (M8), `node_wrap_use` | any number of wraps per node; `node_wrap_use` declares a resource on the wrapped node (not on a group) |
 | an engine node's work switched off (or replaced) | `node_remove` + `node_remove_set` (M9), plus a wrap for a replacement | **one** removal per node class across all clients |
+| ... and its outputs cleared instead of left stale | `node_remove_clear` | the node's own textures, or a named one; the value is yours. See section 7 |
+| HLSL compiled into a blob at load | `compile_hlsl` | `cs/vs/ps_6_x`; needs `dxcompiler.dll` + `dxil.dll` next to REDGraph.dll - **not shipped** with REDGraph, else `RG_E_UNAVAILABLE` |
 | shader-visible descriptors for your own pass | `gpu_descriptors` (M10) | from the engine's per-frame ring: allocate per use, never keep |
 | the engine's `ID3D12Device*` | `device`, `device_ready` | create your objects on THIS device (it is ReShade's proxy when ReShade is loaded) |
 
@@ -151,7 +153,10 @@ Notes:
 
 1. **Extract and disassemble** the shader (section 4).
 2. **Edit the `.ll`.** Edit the vanilla shader's own DXIL rather than recompiling HLSL: the result keeps the engine's
-   resource layout and signature exactly.
+   resource layout and signature exactly. (Your OWN shaders - a companion, a pass - can be HLSL compiled at load with
+   `compile_hlsl` and registered like any blob. The engine's root signatures are global and the DXIL's own one is never
+   read: declare the engine's registers / free space0 registers, nothing else. The compiler DLLs are the user's to
+   install for now - check `RG_E_UNAVAILABLE` and fall back to a precompiled blob.)
 3. **Your data, if any: lease a free register.** Your edit reads a buffer at a register the vanilla shader does not
    use: space0, CBV `b0-b13`, UAV `u0-u18`, SRV `t0-t126` for VS / PS but only **`t0-t92` for CS and RT** - what
    the engine's tables cover (the log's `native table: CS covers ...` line). Outside it the patch stays vanilla and a
@@ -236,6 +241,11 @@ host->rt_variant_set(v, 1);   /* live, any thread; 0 = the engine's raygen */
 * **Remove** (`node_remove`): the node stays in the graph and its resource declarations are replayed, so lifetimes and
   barriers stay intact. Only its GPU work is gone. Add a wrap on the same node to put your own pass in its place.
   Groups and job-builder nodes cannot be removed (`rg_remove_stats.refused`).
+  What the node would have written keeps old / undefined contents - a transient may flicker. `node_remove_clear(remove,
+  name_hash, value)` clears it in the node's place: `name_hash` 0 = only the textures the node ALLOCATES itself; a
+  SHARED target it only writes into (scene colour, which e.g. the clouds composite onto) only by its name - clearing
+  that wipes the frame. The neutral value is yours to choose (motion vectors 0, a mask 0 or 1, depth per the engine's
+  Z). Render / depth targets only; a UAV-only texture is skipped (logged).
 * **Your own node** (`node_register(name, after, fn)`): it is inserted after a group member, in the same group. Declare
   what it reads and writes with `node_use` and allocate transients with `node_alloc`, before the window closes.
 * **Your own pipeline:**
@@ -278,6 +288,10 @@ The log has the same information in one line at startup: `registration CLOSED - 
     `red4ext/plugins/REDGraph/render-graph/`.
   * `RenderGraphDebug`: the live graph window (section 4).
   * `Dred`: GPU page-fault address and breadcrumbs in the crash log, for a GPU hang or device removal.
+  * `GpuTiming` (live): GPU time of your companions, draw companions and passes (with a debug event each, for Nsight /
+    RenderDoc), of DispatchRays with your RT libraries, and - when on at the START - of every node of the engine's render
+    graph (groups and job-builder nodes not yet). Switch your patch off and on and read its node's time: that is what
+    it costs. Shown under **Host -> GPU time** and in the status report.
 * **REDGraph window → Host:**
   * **Status into the log** writes REDGraph's counters and settings.
   * **Profile** measures REDGraph's own CPU time per hook point. About 0.3 % of a frame is normal.
@@ -295,5 +309,7 @@ The log has the same information in one line at startup: `registration CLOSED - 
   a whole-library swap (`rtlib_register` without variants) does not.
 * Leases are space0 registers of the engine's tables: the count is limited, and each depends on the stage.
 * Up to 4 variants per patch and 4 scope nodes per patch.
+* Up to 256 patches, 32 leases (8 per patch / companion, 16 owners per lease), and a lease reaches up to 64 different
+  engine shaders (one ShaderRef each - the log says when a lease is full).
 * The engine's texture formats in `rg_flow_desc` are its own enum, not DXGI. Only what the header documents is
   decoded.

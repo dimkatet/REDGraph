@@ -1,15 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
-- GPU timing (Host tab, off by default): the GPU time of every mod companion and pass, and each one marked as a
-  debug event for GPU capture tools.
-- Mods can compile HLSL through REDGraph while the game starts (needs the shader compiler DLLs next to REDGraph).
+- GPU timing (Host tab, off by default): the GPU time of every mod companion and pass (each one marked as a debug
+  event for GPU capture tools), of the ray dispatches mods change, and - when on at the game's start - of every pass of
+  the game's render graph: switch a mod's change off and on to see what it costs.
+- Mods can compile HLSL through REDGraph while the game starts. The shader compiler is not included: it works
+  only with `dxcompiler.dll` and `dxil.dll` put next to REDGraph.dll.
 - Higher limits for mods that patch many shaders: 256 patches, 32 leases, and a lease now reaches up to 64 different
   game shaders (it stopped at 8 without a word; now the log says when it is full).
 - The render graph window shows the nodes a mod removed.
-- GPU timing, when on at the game's start, also times every pass of the game's render graph and the ray dispatches
-  mods change - switch a mod's change off and on to see what it costs.
 - A mod that removes a game node can have that node's outputs cleared to a value it chooses, instead of leaving them
   stale.
 
