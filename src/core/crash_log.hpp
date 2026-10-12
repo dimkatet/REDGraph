@@ -30,5 +30,10 @@ void attach_engine();
 void set_device(void* device);
 // At Unload: a game that quits on its own after losing the GPU never crashes - ask once more, then remove the handler.
 void close();
+// [Diagnostics] Dred was on at Load (rtlib's DispatchRays markers ride on the same switch).
+bool dred_armed();
+// Called after DRED in a device-removal report (rtlib: which DispatchRays the GPU was inside); `line` = one log line.
+using ExtraDump = void (*)(void (*line)(const char*));
+void set_extra_dump(ExtraDump fn);
 
 }  // namespace crash_log

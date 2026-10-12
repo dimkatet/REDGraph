@@ -199,6 +199,7 @@ struct FlowRecord {
 void want_requests();  // attach the HandleRequest detour (a census or a removal); before attach()
 bool requests_attached();
 void record_into(FlowRecord* r);  // this thread's requests go into r from now on; nullptr = stop
+constexpr uint32_t kMaxRemoveClears = 4;  // rules per removal (render_nodes)
 // node_remove_clear's rules: a resource (RenderFlow name hash, 0 = every one the node writes) and its clear value
 // (RGBA; a depth target: depth, stencil).
 struct RemoveClear {

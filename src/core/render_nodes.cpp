@@ -122,7 +122,7 @@ struct Instance {
   bool active = false;             // latched at the declaration run
   render_flow::FlowRecord rec{};
 };
-constexpr uint32_t kMaxClears = 4;
+constexpr uint32_t kMaxClears = render_flow::kMaxRemoveClears;
 struct Removal {
   std::atomic<bool> on{false};
   Instance inst[kMaxInstances];

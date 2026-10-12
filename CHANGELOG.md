@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.2
+
+- With `Dred = true`, ray-tracing structure builds are tracked too: a GPU crash while the game builds them names
+  which one, and a build given a missing buffer is written to the log when it happens, crash or not.
+- `node_remove_clear` now works on a node that is a member of a group (e.g.
+  `CRenderNode_ScreenSpacePlanarReflections`): name the texture it writes, and it is cleared in the node's place.
+  Before, nothing was cleared and the log said nothing.
+
+## 0.3.1
+
+- With `Dred = true`, a GPU crash in a ray-traced pass now names the ray dispatch the GPU was in, and whether a
+  mod's shader was running there.
+
 ## 0.3.0
 
 - GPU timing (Host tab, off by default): the GPU time of every mod companion and pass (each one marked as a debug

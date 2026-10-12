@@ -131,6 +131,32 @@ constexpr size_t kRtSoEntry = 24;
 constexpr uintptr_t kRtStateObjects = 0x13b2c48;  // in the device data: the state-object container's entries
 constexpr size_t kRtStateObjectStride = 0x38;     // = the creator's `out`: +0 ComPtr<ID3D12StateObject>, +0x10 names
 constexpr uintptr_t kFlushPendingBarriers = 0x1f7164;
+// Acceleration-structure builds (markers, 0.3.2). The BLAS batch builder (the symbols call it
+// BindAccelerationStructure+0x104 - a folded name) records per BLAS either the statically linked
+// NvAPI_D3D12_BuildRaytracingAccelerationStructureEx(cl, params) or ID3D12GraphicsCommandList4 vtable +0x240; args
+// (range {begin, end} of 32 B BLAS entries, geometry table, BufferRef). GpuApi::BuildTopLevelAccelerationStructure(
+// u32 dest AS, u32 instance count, BufferRef instances, u32, BufferRef scratch, u32 scratch offset): InstanceDescs =
+// the instance buffer's VA with NO offset, and 0 when the ref is invalid ((id - 1) > 0x7ffffffe) - the count is kept.
+constexpr uintptr_t kBuildBlasBatch = 0x2a40df4;
+constexpr uintptr_t kBuildBlasBatchRet = 0x2a40dec;  // its thunk -> it
+constexpr uintptr_t kNvBuildAsEx = 0x9430;
+constexpr uintptr_t kNvBuildAsExRet = 0x2a410dc;     // the BLAS batch builder -> it
+constexpr uintptr_t kBuildTlas = 0x2a413f4;
+constexpr uintptr_t kBuildTlasRet = 0x290a91e;       // CRenderLightVolumeCollector::UpdateAccelerationStructures -> it
+constexpr uintptr_t kBufferVa = 0x5c0b00;            // in the device data: + (id - 1) * 0xb0 = a buffer's GPU VA
+constexpr size_t kBufferStride = 0xb0;
+// AS lifetime (light-volume check, 0.3.2): an AS id is a 16-bit slot (free list of u16) of a 0x58 B entry at device
+// data + 0xd1b6a0 (+0 refcount, +0x20 the pool resource, +0x40 its offset). Create(desc*) -> id in eax; Release drops
+// the refcount and at 0 QUEUES the id; EvictQueuedDeletions later calls Destroy(const AccelerationStructureRef*), which
+// frees the memory and returns the id to the free list. GetAccelerationStructureHandle(id) = resource VA + offset -
+// never 0. The light-volume collector (CRenderLightVolumeCollector::UpdateAccelerationStructures) caches its BLAS ids
+// by volume data hash and calls GetAccelerationStructureHandle once per instance it puts in its TLAS.
+constexpr uintptr_t kCreateAs = 0x87b948;
+constexpr uintptr_t kCreateAsRet = 0x290a743;        // the light-volume collector -> it
+constexpr uintptr_t kDestroyAs = 0x87c4d4;
+constexpr uintptr_t kDestroyAsRet = 0x647c2d;        // GpuApi::EvictQueuedDeletions -> it
+constexpr uintptr_t kAsHandle = 0x2a41cc0;
+constexpr uintptr_t kAsHandleLightVolumeRet = 0x290a85e;  // the light-volume collector -> it
 
 // ---- CommandListContext layout ----
 constexpr uintptr_t kCtxCmdList = 0x30;       // ID3D12GraphicsCommandList*

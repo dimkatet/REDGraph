@@ -498,7 +498,36 @@ The engine has its own GPU-crash path, `GpuApi::GpuCrashReport` (from `Present` 
 `CheckHR_Internal`): breadcrumbs, Aftermath, then the fatal error "Gpu Crash for unknown reasons!"
 (`gpuApiDX12Error.cpp:42`) that ends the process - inside the watchdog's 500 ms, so a GPU crash used to leave nothing
 in our log. It is hooked at the host's attach (after every plugin's Load): `[gpu] the ENGINE reports a GPU crash`,
-then the removal reason and DRED, then the engine's path unchanged.
+then the removal reason and DRED, then the engine's path unchanged. A DRED query that fails is logged with its
+HRESULT (0.3.1: on a user's machine `GetAutoBreadcrumbsOutput` returned nothing - the engine's Aftermath likely holds
+the breadcrumbs).
+
+DispatchRays markers (0.3.1, `rt_lib.cpp`, only with `Dred = true`): every engine DispatchRays (the one hook) takes a
+slot in an 8192-slot ring - its description on the CPU (state object, raygen group + name, grid, node, thread, our
+variant ran or the engine's raygen) and two `WriteBufferImmediate` of its seq on the engine's list into a mapped
+READBACK buffer (MARKER_IN before, MARKER_OUT after). At removal `crash_log` calls rtlib's dump (`set_extra_dump`):
+every slot begun and not ended = `INSIDE`, else the newest done and oldest queued. Answers "was the GPU inside a
+client's raygen" for any client. Foreign DispatchRays (another mod at D3D12 level) are not seen. MARKER_IN may be
+written before the dispatch really starts: two or three INSIDE at once read together.
+
+AS build markers (0.3.2, same ring, same switch): after own repros faulted in the DRIVER's acceleration-structure
+build (`AS Build or Refit`, VA 0) between two DispatchRays, three engine functions are hooked by call site
+(`engine_231.hpp` "Acceleration-structure builds"): the BLAS batch builder (one bracket for the batch - its D3D12 path
+is a vtable call), `NvAPI_D3D12_BuildRaytracingAccelerationStructureEx` (one bracket per BLAS) and
+`GpuApi::BuildTopLevelAccelerationStructure`. Each build is also checked on the CPU before it is recorded: dest,
+scratch, update source, every geometry's vertices / indices / AABBs (NvAPI path), the TLAS instance buffer - an input
+of 0 where the build reads one logs `[gpu] AS build #n with a ZERO input address` at once (first 32). The engine's
+TLAS builder passes InstanceDescs = 0 for an invalid instance BufferRef and keeps the count. Not covered: a BLAS
+through the plain D3D12 path is bracketed only as its batch, unchecked; foreign builds (another mod) not seen.
+
+AS lifetime + the light-volume TLAS (0.3.2, same switch): a crash named the light-volume TLAS (built inside
+`CRenderNode_RenderRayTracedReflections` by `CRenderLightVolumeCollector::UpdateAccelerationStructures`, BLAS ids
+cached by volume data hash) as the build the GPU was in, with a garbage fault VA. `CreateAccelerationStructure`,
+`GpuApi::Destroy` (AS) and the batch's entries stamp per 16-bit AS id when it was last created / destroyed / built
+(marker seq); `GetAccelerationStructureHandle` called from the collector collects the ids of its instances. At that
+TLAS's build each id is judged: never built since the hooks, destroyed after its last build, or re-created after it
+= STALE -> `[gpu] light-volume TLAS #n has k STALE BLAS` at once (first 32 bad AS events), and a count in the crash
+dump. The first such TLAS logs a self-test line (ids seen, an example id's stamps).
 
 A first-chance access violation is logged even when an SEH handler elsewhere will catch it. Never read engine memory
 under `__try`: the engine's crash handler freezes the game on any first-chance AV.

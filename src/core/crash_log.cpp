@@ -27,6 +27,7 @@ std::atomic<int> g_reports{0};
 std::atomic<ID3D12Device*> g_device{nullptr};
 std::atomic<bool> g_dred_armed{false};
 std::atomic<bool> g_removed_reported{false};
+std::atomic<ExtraDump> g_extra{nullptr};
 // The watchdog: a game that loses the GPU often closes itself without any CPU fault (the 0.7.1 4080S reports,
 // fog_crash.7z) - so the device is also polled, off the render threads, from set_device until Unload.
 constexpr DWORD kWatchMs = 500;
@@ -87,7 +88,8 @@ void report_dred(ID3D12Device* dev) {
     return;
   }
   D3D12_DRED_PAGE_FAULT_OUTPUT pf{};
-  if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf))) {
+  const HRESULT pf_hr = dred->GetPageFaultAllocationOutput(&pf);
+  if (SUCCEEDED(pf_hr)) {
     linef("[gpu] page fault VA 0x%llx", static_cast<unsigned long long>(pf.PageFaultVA));
     int k = 0;
     for (auto* a = pf.pHeadExistingAllocationNode; a != nullptr && k < 8; a = a->pNext, ++k) {
@@ -100,10 +102,15 @@ void report_dred(ID3D12Device* dev) {
             static_cast<int>(a->AllocationType));
     }
   } else {
-    line("[gpu] no page-fault record (a hang/TDR rather than a bad address, or the driver did not report one)");
+    linef("[gpu] no page-fault record, hr 0x%08lx (a hang/TDR rather than a bad address, or the driver did not report "
+          "one)", static_cast<unsigned long>(pf_hr));
   }
   D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc{};
-  if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc))) {
+  const HRESULT bc_hr = dred->GetAutoBreadcrumbsOutput(&bc);
+  if (FAILED(bc_hr)) {
+    // 0x887a0022 DXGI_ERROR_NOT_CURRENTLY_AVAILABLE = breadcrumbs were off for this device (e.g. taken by Aftermath).
+    linef("[gpu] no auto-breadcrumbs: GetAutoBreadcrumbsOutput failed, hr 0x%08lx", static_cast<unsigned long>(bc_hr));
+  } else {
     int shown = 0, unfinished = 0;
     for (auto* nd = bc.pHeadAutoBreadcrumbNode; nd != nullptr; nd = nd->pNext) {
       if (nd->pLastBreadcrumbValue == nullptr || nd->pCommandHistory == nullptr) continue;
@@ -144,6 +151,7 @@ void check_device(const char* when) {
                                                               : "?";
   linef("[gpu] D3D12 DEVICE REMOVED, seen at %s: reason 0x%08lx %s", when, static_cast<unsigned long>(hr), what);
   report_dred(dev);
+  if (ExtraDump fn = g_extra.load()) fn(&line);
 }
 
 DWORD WINAPI watch(void*) {
@@ -267,6 +275,10 @@ void open(RED4ext::v1::PluginHandle handle, const RED4ext::v1::Sdk* sdk, bool dr
                      g_dred_armed.load() ? "ARMED (page faults + auto-breadcrumbs, costs a little GPU time)"
                                          : "off ([Diagnostics] Dred = true, then restart)");
 }
+
+bool dred_armed() { return g_dred_armed.load(); }
+
+void set_extra_dump(ExtraDump fn) { g_extra.store(fn); }
 
 void set_device(void* device) {
   ID3D12Device* expected = nullptr;

@@ -632,7 +632,10 @@ typedef struct rg_host {
    * the node ALLOCATES itself (its own outputs, nobody else fills them); a SHARED target it only writes into (scene
    * colour, which e.g. the clouds composite onto) is cleared only when named - clearing it wipes the frame:
    * a render target to value[0..3] (RGBA), a depth target to depth value[0] and stencil value[1]. Which value is
-   * neutral is the CLIENT's call (motion vectors 0, a mask 0 or 1, depth per the engine's Z convention). Not cleared
+   * neutral is the CLIENT's call (motion vectors 0, a mask 0 or 1, depth per the engine's Z convention). A member of
+   * a command-list group (graph dump: an `m` line) declares nothing itself - its group does: name its texture, and a
+   * named rule that met no write in the node's own declarations is cleared at the node's place if that texture is live
+   * there (0.3.2); name_hash 0 finds nothing on a member (logged once). Not cleared
    * (logged once, counted): UAV-only textures, buffers, 1D. The first matching rule wins, in registration order; up to
    * 4 per removal. Register-time. 0 = ok. */
   int32_t (*node_remove_clear)(rg_handle remove, uint32_t name_hash, const float value[4]);

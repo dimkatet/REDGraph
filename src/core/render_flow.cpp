@@ -386,6 +386,7 @@ std::atomic<uint32_t> g_rtv_next{0}, g_dsv_next{0};
 std::once_flag g_clear_once;
 std::atomic<uint64_t> g_cleared{0}, g_clear_skipped{0};
 std::atomic<bool> g_skip_logged{false};
+std::atomic<bool> g_member_logged{false}, g_named_logged{false};
 
 void clear_setup() {
   const auto* data = *reinterpret_cast<const uint8_t* const*>(g_base + kDeviceData);
@@ -510,6 +511,7 @@ void replay(const void* node_ctx, const FlowRecord& r, const RemoveClear* clears
   // the whole screen magenta) - so a shared target is cleared only by its name.
   constexpr uint32_t kMaxOwn = 32;
   uint32_t own[kMaxOwn], nown = 0;
+  bool fired[kMaxRemoveClears] = {};
   for (uint32_t i = 0; i < r.n; ++i) {
     std::memcpy(req, r.req[i], sizeof req);
     g_handle_request(data, req, r.thread[i]);
@@ -524,7 +526,31 @@ void replay(const void* node_ctx, const FlowRecord& r, const RemoveClear* clears
       uint32_t id = 0;
       g_get_resource(data, &id, &tag, r.thread[i], false);
       if (id) clear_texture(id, tag, clears[c].value);
+      if (c < kMaxRemoveClears) fired[c] = true;
       break;  // the first matching rule, in registration order
+    }
+  }
+  // A member of a command-list group declares nothing itself (its group declares for it, 2026-10-12: a client removing
+  // CRenderNode_ScreenSpacePlanarReflections got no clear and no log). A NAMED rule that met no write in the node's own
+  // record is cleared here, at the node's place, if that texture is live now - as flow_texture resolves one.
+  for (uint32_t c = 0; c < nclears && c < kMaxRemoveClears; ++c) {
+    if (fired[c]) continue;
+    if (!clears[c].name_hash) {
+      if (!nown && !g_member_logged.exchange(true))
+        g_sdk->logger->WarnF(g_handle, "node_remove_clear: a rule with name_hash 0 found nothing - the node allocates "
+                             "no texture of its own (a member of a command-list group declares nothing itself): name "
+                             "the texture it writes (logged once)");
+      continue;
+    }
+    const uint32_t tag = tag_of(ctx, clears[c].name_hash);
+    uint32_t id = 0;
+    g_get_resource(data, &id, &tag, rd<uint8_t>(ctx, kNodeCtxFlowThread), false);
+    if (texture_resource(id)) {
+      clear_texture(id, tag, clears[c].value);
+    } else if (!g_named_logged.exchange(true)) {
+      g_clear_skipped.fetch_add(1, std::memory_order_relaxed);
+      g_sdk->logger->WarnF(g_handle, "node_remove_clear: name %08x NOT cleared - the node declared no write of it and "
+                           "it is not live at the node's place (logged once)", clears[c].name_hash);
     }
   }
 }

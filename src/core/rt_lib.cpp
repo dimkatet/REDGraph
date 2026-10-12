@@ -42,6 +42,7 @@
 
 #include "core/engine_231.hpp"
 #include "core/clients.hpp"
+#include "core/crash_log.hpp"
 #include "core/gpu_timing.hpp"
 #include "core/internal.hpp"
 #include "core/prof.hpp"
@@ -434,6 +435,7 @@ struct Override {
   bool set;
 };
 thread_local Override t_ovr{};
+thread_local bool t_ran = false;  // d_gsgi handed out a variant's identifier in this DispatchRays
 // the raygen group names seen per library, for the log (the first few)
 std::atomic<uint32_t> g_names_logged{0};
 
@@ -528,6 +530,473 @@ uint32_t time_rays(uint32_t so, uint32_t group, ID3D12GraphicsCommandList** cl_o
   return *cl_out ? gpu_timing::begin(*cl_out, kind, h, false) : 0;
 }
 
+// ---- GPU markers ([Diagnostics] Dred; 2026-10-12: a user's GPU fault in a raygen, read of VA 0, and DRED's own
+// breadcrumbs came back empty; then our own repro faulted in the DRIVER's acceleration-structure build, between two
+// DispatchRays) ----
+// Every engine DispatchRays and acceleration-structure build takes a slot in a ring: its description on the CPU, and on
+// the GPU two WriteBufferImmediate into a READBACK buffer (starts and stays in COPY_DEST, mapped for good) on the
+// engine's own list - the seq with MARKER_IN before the call, again with MARKER_OUT after it. At device removal
+// (crash_log) a slot whose begin holds its seq and whose end does not is a call the GPU was INSIDE. Lists are recorded
+// on many threads and run in submission order, so seq is the recording order only.
+// AS builds are also CHECKED on the CPU before they are recorded: an input address of 0 where the build reads one
+// (instances, vertices, indices, AABBs, scratch, the source of an update) is logged at once - with no crash needed.
+constexpr uint32_t kMarkSlots = 16384;  // ~15-40 DispatchRays + the AS builds a frame: hundreds of frames
+enum MarkKind : uint8_t { kMarkRays, kMarkBlasBatch, kMarkBlasNv, kMarkTlas };
+struct Mark {
+  std::atomic<uint32_t> seq;
+  MarkKind kind;
+  uint32_t so, id, group, w, h;  // rays: state object, its id, raygen group, grid; AS: w = count, h = zero inputs
+  int32_t var;  // rays: the Var that RAN + 1; 0 = the engine's raygen; -1 = a variant was armed, the engine's ran
+  uint64_t node;
+  bool job;
+  DWORD tid;
+  char what[96];  // rays: the raygen's name; AS: what was built and the first zero input
+};
+Mark g_marks[kMarkSlots];
+std::atomic<uint32_t> g_mark_seq{0};
+std::atomic<int> g_mark_state{0};  // 0 not yet, 1 creating, 2 ready, 3 failed
+ID3D12Resource* g_mark_buf = nullptr;
+D3D12_GPU_VIRTUAL_ADDRESS g_mark_va = 0;
+const volatile uint32_t* g_mark_mem = nullptr;  // [2 * slot] begin, [2 * slot + 1] end
+bool g_marks_on = false;                         // Dred armed at attach_rays
+std::atomic<uint32_t> g_as_bad{0};               // AS builds with a zero input, logged live (the first kAsBadLog)
+constexpr uint32_t kAsBadLog = 32;
+std::atomic<uint32_t> g_lv_tlas{0}, g_lv_stale{0};  // light-volume TLAS builds checked / with a stale BLAS
+std::atomic<uint32_t> g_lv_fresh{0};  // ... with a BLAS built by the same call, just before it
+
+bool mark_create() {
+  int expect = 0;
+  if (!g_mark_state.compare_exchange_strong(expect, 1)) return g_mark_state.load(std::memory_order_acquire) == 2;
+  const auto* data = *reinterpret_cast<const uint8_t* const*>(g_base + kDeviceData);
+  auto* engine_dev = data ? *reinterpret_cast<IUnknown* const*>(data + kDeviceInData) : nullptr;
+  ID3D12Device* dev = nullptr;
+  HRESULT hr = engine_dev ? engine_dev->QueryInterface(IID_PPV_ARGS(&dev)) : E_POINTER;
+  D3D12_RESOURCE_DESC rd{};
+  rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  rd.Width = static_cast<UINT64>(kMarkSlots) * 8;
+  rd.Height = 1;
+  rd.DepthOrArraySize = 1;
+  rd.MipLevels = 1;
+  rd.SampleDesc.Count = 1;
+  rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  D3D12_HEAP_PROPERTIES hp{};
+  hp.Type = D3D12_HEAP_TYPE_READBACK;
+  if (SUCCEEDED(hr))
+    hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                      IID_PPV_ARGS(&g_mark_buf));
+  void* p = nullptr;
+  if (SUCCEEDED(hr)) hr = g_mark_buf->Map(0, nullptr, &p);  // stays mapped: read after the device is gone
+  if (dev) dev->Release();
+  if (FAILED(hr)) {
+    g_sdk->logger->WarnF(g_handle, "gpu markers: setup FAILED (0x%08x) - no DispatchRays / AS build markers",
+                         static_cast<unsigned>(hr));
+    if (g_mark_buf) g_mark_buf->Release(), g_mark_buf = nullptr;
+    g_mark_state.store(3);
+    return false;
+  }
+  std::memset(p, 0, static_cast<size_t>(rd.Width));
+  g_mark_va = g_mark_buf->GetGPUVirtualAddress();
+  g_mark_mem = static_cast<const volatile uint32_t*>(p);
+  g_mark_state.store(2, std::memory_order_release);
+  g_sdk->logger->InfoF(g_handle, "rt markers: ON - every DispatchRays and AS build brackets itself in a %u-slot ring "
+                       "(Dred); a device removal logs the ones the GPU was inside", kMarkSlots);
+  return true;
+}
+
+// The engine's list of the current thread as ID3D12GraphicsCommandList2 (WriteBufferImmediate); nullptr = none.
+ID3D12GraphicsCommandList2* mark_list() {
+  uint8_t* ctx = reinterpret_cast<GetCtx_t>(g_base + kGetCommandListContext)();
+  auto* cl = ctx ? *reinterpret_cast<ID3D12GraphicsCommandList**>(ctx + kCtxCmdList) : nullptr;
+  ID3D12GraphicsCommandList2* cl2 = nullptr;
+  if (cl && FAILED(cl->QueryInterface(IID_PPV_ARGS(&cl2)))) cl2 = nullptr;
+  return cl2;
+}
+
+void mark_write(ID3D12GraphicsCommandList2* cl, uint32_t slot, uint32_t which, uint32_t seq) {
+  const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER prm{g_mark_va + (static_cast<UINT64>(slot) * 2 + which) * 4, seq};
+  const D3D12_WRITEBUFFERIMMEDIATE_MODE mode =
+      which == 0 ? D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN : D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+  cl->WriteBufferImmediate(1, &prm, &mode);
+}
+
+// A new slot (seq never 0), its common fields filled; the caller fills the rest, then mark_open.
+Mark& mark_take(MarkKind kind, uint32_t* seq_out) {
+  uint32_t seq = g_mark_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (!seq) seq = g_mark_seq.fetch_add(1, std::memory_order_relaxed) + 1;  // wrapped
+  Mark& m = g_marks[seq % kMarkSlots];
+  m.seq.store(0, std::memory_order_relaxed);  // half-written: the dump skips it
+  m.kind = kind;
+  m.so = m.id = m.group = m.w = m.h = 0;
+  m.var = 0;
+  const void* node = render_flow::current_node();
+  m.node = node ? render_flow::node_name_hash(node) : 0;
+  m.job = node && render_flow::current_is_job();
+  m.tid = GetCurrentThreadId();
+  m.what[0] = 0;
+  *seq_out = seq;
+  return m;
+}
+
+void mark_open(ID3D12GraphicsCommandList2* cl, Mark& m, uint32_t seq) {
+  m.seq.store(seq, std::memory_order_release);
+  mark_write(cl, seq % kMarkSlots, 0, seq);
+}
+
+// The slot's seq for this DispatchRays (never 0).
+uint32_t mark_begin(ID3D12GraphicsCommandList2* cl, uint32_t so, uint32_t w, uint32_t h, uint32_t group) {
+  uint32_t seq = 0;
+  Mark& m = mark_take(kMarkRays, &seq);
+  uint32_t id = 0;
+  const uint8_t* entry = rt_entry(so, &id);
+  m.so = so;
+  m.id = id;
+  m.group = group;
+  m.w = w;
+  m.h = h;
+  if (const wchar_t* n = entry ? group_name(entry, group) : nullptr) {
+    size_t i = 0;
+    for (; n[i] && i + 1 < sizeof m.what; ++i) m.what[i] = n[i] < 0x80 ? static_cast<char>(n[i]) : '?';
+    m.what[i] = 0;
+  }
+  mark_open(cl, m, seq);
+  return seq;
+}
+
+void mark_end(ID3D12GraphicsCommandList2* cl, uint32_t seq, const Var* armed) {
+  Mark& m = g_marks[seq % kMarkSlots];
+  if (armed) m.var = t_ran ? static_cast<int32_t>(armed - g_var) + 1 : -1;
+  mark_write(cl, seq % kMarkSlots, 1, seq);
+}
+
+void node_text(const Mark& m, char* out, size_t size) {
+  std::snprintf(out, size, "(none)");
+  if (!m.node) return;
+  const char* s = RED4ext::CName(m.node).ToString();
+  std::snprintf(out, size, "%s%s", s && *s ? s : "?", m.job ? " (job)" : "");
+}
+
+void mark_line(void (*line)(const char*), const char* state, const Mark& m, uint32_t seq) {
+  char nm[96];
+  node_text(m, nm, sizeof nm);
+  char b[600];
+  if (m.kind == kMarkRays) {
+    char var[200] = "the engine's";
+    if (m.var > 0) std::snprintf(var, sizeof var, "OUR VARIANT %s", g_var[m.var - 1].label);
+    else if (m.var < 0) std::snprintf(var, sizeof var, "the engine's (a variant was armed, not handed out)");
+    std::snprintf(b, sizeof b, "[gpu]   %s DispatchRays #%u: so %u (state object %u), raygen group %u '%s', %ux%u, "
+                  "node %s, thread %lu - raygen %s", state, seq, m.so, m.id, m.group, m.what, m.w, m.h, nm,
+                  static_cast<unsigned long>(m.tid), var);
+  } else {
+    std::snprintf(b, sizeof b, "[gpu]   %s AS build #%u: %s, node %s, thread %lu", state, seq, m.what, nm,
+                  static_cast<unsigned long>(m.tid));
+  }
+  line(b);
+}
+
+// crash_log, at device removal: the calls the GPU was inside; else where it stood (newest done, oldest queued).
+void mark_dump(void (*line)(const char*)) {
+  if (g_mark_state.load(std::memory_order_acquire) != 2) {
+    line("[gpu] rt markers: none (no DispatchRays / AS build since the start, or the buffer failed)");
+    return;
+  }
+  const uint32_t last = g_mark_seq.load();
+  uint32_t inside = 0, done = 0, queued = 0, newest_done = 0;
+  for (uint32_t i = 0; i < kMarkSlots; ++i) {
+    const uint32_t seq = g_marks[i].seq.load(std::memory_order_acquire);
+    if (!seq) continue;
+    const uint32_t b = g_mark_mem[2 * i], e = g_mark_mem[2 * i + 1];
+    if (e == seq) {
+      ++done;
+      if (seq > newest_done) newest_done = seq;
+    } else if (b == seq) {
+      if (inside++ < 16) mark_line(line, "INSIDE", g_marks[i], seq);
+    } else {
+      ++queued;
+    }
+  }
+  char b[300];
+  std::snprintf(b, sizeof b, "[gpu] rt markers: %u DispatchRays / AS builds recorded; in the ring: %u the GPU was "
+                "INSIDE, %u done (newest #%u), %u not started; AS builds with a zero input this session: %u", last,
+                inside, done, newest_done, queued, g_as_bad.load());
+  line(b);
+  std::snprintf(b, sizeof b, "[gpu] light-volume TLAS builds checked: %u, with a STALE BLAS: %u, with a FRESH BLAS: "
+                "%u", g_lv_tlas.load(), g_lv_stale.load(), g_lv_fresh.load());
+  line(b);
+  for (uint32_t k = 0; k < 6 && newest_done > k; ++k) {
+    const uint32_t seq = newest_done - k, i = seq % kMarkSlots;
+    if (g_marks[i].seq.load() == seq && g_mark_mem[2 * i + 1] == seq) mark_line(line, "done  ", g_marks[i], seq);
+  }
+  for (uint32_t seq = newest_done + 1, k = 0; seq <= last && k < 6; ++seq) {
+    const uint32_t i = seq % kMarkSlots;
+    if (g_marks[i].seq.load() != seq || g_mark_mem[2 * i] == seq) continue;
+    mark_line(line, "queued", g_marks[i], seq);
+    ++k;
+  }
+}
+
+// ---- AS builds: the markers + the zero-input check ----
+uint64_t rd64(const uint8_t* p) {
+  uint64_t v;
+  std::memcpy(&v, p, 8);
+  return v;
+}
+uint32_t rd32(const uint8_t* p) {
+  uint32_t v;
+  std::memcpy(&v, p, 4);
+  return v;
+}
+
+void as_bad(const Mark& m, uint32_t seq) {
+  if (g_as_bad.fetch_add(1, std::memory_order_relaxed) >= kAsBadLog) return;
+  char nm[96];
+  node_text(m, nm, sizeof nm);
+  g_sdk->logger->WarnF(g_handle, "[gpu] AS build #%u with a ZERO input address: %s, node %s, thread %lu (logged for "
+                       "the first %u)", seq, m.what, nm, static_cast<unsigned long>(m.tid), kAsBadLog);
+}
+
+// ---- AS lifetime, for the light-volume TLAS (crash 9 in the client's docs: INSIDE its build, garbage VA) ----
+// Per AS id (16-bit), the marker seq of its last Create, BLAS build (the batch) and Destroy. The light-volume TLAS's
+// instances are the ids GetAccelerationStructureHandle was asked for by the collector on this thread; at its build an
+// id is STALE when it was never built since the hooks, destroyed after its last build, or re-created after it.
+constexpr uint32_t kAsIds = 65536;
+std::atomic<uint32_t> g_as_created[kAsIds], g_as_built[kAsIds], g_as_destroyed[kAsIds];
+constexpr uint32_t kLvMax = 256;
+thread_local uint32_t t_lv[kLvMax];
+thread_local uint32_t t_nlv = 0, t_lv_over = 0, t_lv_seq0 = 0;  // seq0: before the collector's first handle
+
+
+uint32_t seq_now() { return g_mark_seq.load(std::memory_order_relaxed); }
+bool as_id_ok(uint32_t id) { return id - 1u < kAsIds - 1u; }
+
+using CreateAs_t = uint32_t (*)(const void* desc);
+using DestroyAs_t = void (*)(const uint32_t* ref);
+using AsHandle_t = uint64_t (*)(uint32_t id);
+CreateAs_t g_orig_create_as = nullptr;
+DestroyAs_t g_orig_destroy_as = nullptr;
+AsHandle_t g_orig_as_handle = nullptr;
+bool g_create_as_attached = false, g_destroy_as_attached = false, g_as_handle_attached = false;
+
+uint32_t d_create_as(const void* desc) {
+  const uint32_t id = g_orig_create_as(desc);
+  if (as_id_ok(id)) g_as_created[id].store(seq_now() + 1, std::memory_order_relaxed);
+  return id;
+}
+
+void d_destroy_as(const uint32_t* ref) {
+  if (ref && as_id_ok(*ref)) g_as_destroyed[*ref].store(seq_now() + 1, std::memory_order_relaxed);
+  g_orig_destroy_as(ref);
+}
+
+uint64_t d_as_handle(uint32_t id) {
+  if (reinterpret_cast<uintptr_t>(_ReturnAddress()) == g_base + kAsHandleLightVolumeRet) {
+    if (!t_nlv && !t_lv_over) t_lv_seq0 = seq_now() + 1;
+    if (t_nlv < kLvMax) t_lv[t_nlv++] = id;
+    else ++t_lv_over;
+  }
+  return g_orig_as_handle(id);
+}
+
+// At the light-volume TLAS build (its thread, after the collector's loop): judge every id it asked a handle for.
+void lv_check(Mark& m, uint32_t seq, uint32_t count) {
+  const uint32_t n = t_nlv;
+  uint32_t stale = 0, never = 0, freed = 0, recreated = 0, first = 0, fb = 0, fd = 0, fc = 0, fresh = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint32_t id = t_lv[i];
+    if (!as_id_ok(id)) continue;
+    const uint32_t b = g_as_built[id].load(std::memory_order_relaxed);
+    fresh += b >= t_lv_seq0;  // built by the batch of this same call, just before this TLAS
+    const uint32_t d = g_as_destroyed[id].load(std::memory_order_relaxed);
+    const uint32_t c = g_as_created[id].load(std::memory_order_relaxed);
+    const bool nv = !b, fr = d > b, rc = c > b;
+    if (!(nv || fr || rc)) continue;
+    never += nv;
+    freed += fr;
+    recreated += rc;
+    if (!stale++) first = id, fb = b, fd = d, fc = c;
+  }
+  const uint32_t k = g_lv_tlas.fetch_add(1, std::memory_order_relaxed);
+  m.h = stale;
+  if (fresh) g_lv_fresh.fetch_add(1, std::memory_order_relaxed);
+  std::snprintf(m.what, sizeof m.what, "LIGHT-VOLUME TLAS of %u, %u ids%s, %u FRESH, %u STALE", count, n,
+                t_lv_over ? " (list full)" : "", fresh, stale);
+  static std::atomic<bool> said_first{false};
+  static std::atomic<uint32_t> ids_total{0};
+  ids_total.fetch_add(n, std::memory_order_relaxed);
+  if ((k + 1) % 4096 == 0)  // a heartbeat: the check keeps seeing ids (~ once a minute or two)
+    g_sdk->logger->InfoF(g_handle, "rt markers: light-volume TLAS builds checked %u, ids judged %u, with a STALE BLAS "
+                         "%u, with a FRESH BLAS %u", k + 1, ids_total.load(), g_lv_stale.load(), g_lv_fresh.load());
+  if (n && !said_first.exchange(true)) {
+    char eg[96] = "";
+    if (n && as_id_ok(t_lv[0]))
+      std::snprintf(eg, sizeof eg, " - e.g. id %u: built #%u, created #%u", t_lv[0], g_as_built[t_lv[0]].load(),
+                    g_as_created[t_lv[0]].load());
+    g_sdk->logger->InfoF(g_handle, "rt markers: first light-volume TLAS #%u - %u instances, %u ids asked, %u stale%s "
+                         "(self-test: ids seen = the check runs)", seq, count, n, stale, eg);
+  }
+  if (stale) {
+    g_lv_stale.fetch_add(1, std::memory_order_relaxed);
+    char nm[96];
+    node_text(m, nm, sizeof nm);
+    if (g_as_bad.fetch_add(1, std::memory_order_relaxed) < kAsBadLog)
+      g_sdk->logger->WarnF(g_handle, "[gpu] light-volume TLAS #%u has %u STALE BLAS of %u (never built %u, freed after "
+                           "build %u, re-created after build %u) - first id %u: built #%u, destroyed #%u, created #%u; "
+                           "node %s", seq, stale, n, never, freed, recreated, first, fb, fd, fc, nm);
+  }
+  t_nlv = 0;
+  t_lv_over = 0;
+}
+
+using BlasBatch_t = void (*)(void* range, void* geoms, uint32_t buffer);
+using NvBuildAs_t = int (*)(void* cl, const void* params);
+using Tlas_t = void (*)(uint32_t dest, uint32_t count, uint32_t instances, uint32_t a4, uint32_t scratch,
+                        uint32_t scratch_off);
+BlasBatch_t g_orig_blas = nullptr;
+NvBuildAs_t g_orig_nv = nullptr;
+Tlas_t g_orig_tlas = nullptr;
+bool g_blas_attached = false, g_nv_attached = false, g_tlas_attached = false;
+
+// The whole batch: the D3D12 path of a BLAS (vtable +0x240, not hookable by call site) is bracketed only here.
+void d_blas(void* range, void* geoms, uint32_t buffer) {
+  // Each 32 B entry starts with the AS id it builds (+0 -> device data + 0xd1b6a0 + (id - 1) * 0x58).
+  if (const auto* r = static_cast<const uint8_t*>(range)) {
+    const uint8_t *e = reinterpret_cast<const uint8_t*>(rd64(r)), *end = reinterpret_cast<const uint8_t*>(rd64(r + 8));
+    const uint32_t now = seq_now() + 1;
+    for (; e && e < end; e += 0x20)
+      if (const uint32_t id = rd32(e); as_id_ok(id)) g_as_built[id].store(now, std::memory_order_relaxed);
+  }
+  ID3D12GraphicsCommandList2* cl = mark_create() ? mark_list() : nullptr;
+  uint32_t seq = 0;
+  if (cl) {
+    Mark& m = mark_take(kMarkBlasBatch, &seq);
+    const auto* r = static_cast<const uint8_t*>(range);
+    const uint64_t n = r ? (rd64(r + 8) - rd64(r)) / 0x20 : 0;
+    m.w = static_cast<uint32_t>(n);
+    std::snprintf(m.what, sizeof m.what, "BLAS batch of %llu", static_cast<unsigned long long>(n));
+    mark_open(cl, m, seq);
+  }
+  g_orig_blas(range, geoms, buffer);
+  if (cl) {
+    mark_write(cl, seq % kMarkSlots, 1, seq);
+    cl->Release();
+  }
+}
+
+// One BLAS through NVAPI: NVAPI_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_EX_PARAMS {u32 version, pDesc, ...};
+// pDesc = {dest, inputs {u32 type, flags, count, layout, u64 geometry stride, geometries}, source, scratch} - the
+// engine's own layout (version 0x10020, stride 0x68). A geometry: u32 type (0 triangles, 1 AABBs, 2 triangles + OMM),
+// flags, then D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC / _AABBS_DESC at +8.
+int d_nv(void* cl_engine, const void* params) {
+  ID3D12GraphicsCommandList2* cl = mark_create() ? mark_list() : nullptr;
+  uint32_t seq = 0;
+  if (cl) {
+    Mark& m = mark_take(kMarkBlasNv, &seq);
+    const auto* p = static_cast<const uint8_t*>(params);
+    const uint8_t* d = p && rd32(p) == 0x10020 ? reinterpret_cast<const uint8_t*>(rd64(p + 8)) : nullptr;
+    if (!d) {
+      std::snprintf(m.what, sizeof m.what, "BLAS (NvAPI), params not read (version 0x%x)", p ? rd32(p) : 0u);
+    } else {
+      const uint32_t type = rd32(d + 8), flags = rd32(d + 0xc), count = rd32(d + 0x10), layout = rd32(d + 0x14);
+      const uint64_t stride = rd64(d + 0x18), geoms = rd64(d + 0x20);
+      const bool update = (flags & 0x20) != 0;
+      char first[48] = "";
+      uint32_t bad = 0;
+      auto zero = [&](const char* what, uint32_t i) {
+        if (!bad++) std::snprintf(first, sizeof first, "%s of geometry %u", what, i);
+      };
+      if (!rd64(d)) zero("dest", 0);
+      if (!rd64(d + 0x30)) zero("scratch", 0);
+      if (update && !rd64(d + 0x28)) zero("update source", 0);
+      if (count && !geoms) zero("geometry list", 0);
+      for (uint32_t i = 0; i < count && geoms && type == 1 /* BLAS */; ++i) {
+        const uint8_t* g = layout == 0 ? reinterpret_cast<const uint8_t*>(geoms + i * stride)
+                                       : reinterpret_cast<const uint8_t*>(rd64(reinterpret_cast<const uint8_t*>(geoms) + 8ull * i));
+        if (!g) {
+          zero("geometry pointer", i);
+          continue;
+        }
+        const uint32_t gt = rd32(g);
+        if (gt == 0 || gt == 2) {
+          if (rd32(g + 0x1c) && !rd64(g + 0x28)) zero("vertices", i);
+          if (rd32(g + 0x10) && rd32(g + 0x18) && !rd64(g + 0x20)) zero("indices", i);
+        } else if (gt == 1) {
+          if (rd64(g + 8) && !rd64(g + 0x10)) zero("AABBs", i);
+        }
+      }
+      m.w = count;
+      m.h = bad;
+      std::snprintf(m.what, sizeof m.what, "BLAS %s (NvAPI), %u geometries%s%s", update ? "UPDATE" : "build", count,
+                    bad ? ", ZERO: " : "", first);
+      if (bad) as_bad(m, seq);
+    }
+    mark_open(cl, m, seq);
+  }
+  const int r = g_orig_nv(cl_engine, params);
+  if (cl) {
+    mark_write(cl, seq % kMarkSlots, 1, seq);
+    cl->Release();
+  }
+  return r;
+}
+
+void d_tlas(uint32_t dest, uint32_t count, uint32_t instances, uint32_t a4, uint32_t scratch, uint32_t scratch_off) {
+  ID3D12GraphicsCommandList2* cl = mark_create() ? mark_list() : nullptr;
+  uint32_t seq = 0;
+  if (cl) {
+    Mark& m = mark_take(kMarkTlas, &seq);
+    const auto* data = *reinterpret_cast<const uint8_t* const*>(g_base + kDeviceData);
+    auto va = [&](uint32_t buf) -> uint64_t {
+      return data && buf - 1u <= 0x7ffffffeu ? rd64(data + kBufferVa + size_t(buf - 1) * kBufferStride) : 0;
+    };
+    const uint64_t inst = va(instances), scr = va(scratch);
+    const uint32_t bad = (count && !inst ? 1u : 0u) + (!scr ? 1u : 0u);
+    m.w = count;
+    m.h = bad;
+    std::snprintf(m.what, sizeof m.what, "TLAS of %u instances, instance buffer %u VA 0x%llx, scratch VA 0x%llx%s",
+                  count, instances, static_cast<unsigned long long>(inst), static_cast<unsigned long long>(scr),
+                  bad ? " - ZERO" : "");
+    if (bad) as_bad(m, seq);
+    if (reinterpret_cast<uintptr_t>(_ReturnAddress()) == g_base + kBuildTlasRet) lv_check(m, seq, count);
+    mark_open(cl, m, seq);
+  }
+  t_nlv = t_lv_over = 0;
+  g_orig_tlas(dest, count, instances, a4, scratch, scratch_off);
+  if (cl) {
+    mark_write(cl, seq % kMarkSlots, 1, seq);
+    cl->Release();
+  }
+}
+
+void attach_as() {
+  g_blas_attached = attach_hook(kBuildBlasBatch, kBuildBlasBatchRet, reinterpret_cast<void*>(&d_blas),
+                                reinterpret_cast<void**>(&g_orig_blas), "the BLAS batch builder");
+  g_nv_attached = attach_hook(kNvBuildAsEx, kNvBuildAsExRet, reinterpret_cast<void*>(&d_nv),
+                              reinterpret_cast<void**>(&g_orig_nv), "NvAPI_D3D12_BuildRaytracingAccelerationStructureEx");
+  g_tlas_attached = attach_hook(kBuildTlas, kBuildTlasRet, reinterpret_cast<void*>(&d_tlas),
+                                reinterpret_cast<void**>(&g_orig_tlas), "GpuApi::BuildTopLevelAccelerationStructure");
+  g_create_as_attached = attach_hook(kCreateAs, kCreateAsRet, reinterpret_cast<void*>(&d_create_as),
+                                     reinterpret_cast<void**>(&g_orig_create_as), "GpuApi::CreateAccelerationStructure");
+  g_destroy_as_attached = attach_hook(kDestroyAs, kDestroyAsRet, reinterpret_cast<void*>(&d_destroy_as),
+                                      reinterpret_cast<void**>(&g_orig_destroy_as), "GpuApi::Destroy (AS)");
+  g_as_handle_attached = attach_hook(kAsHandle, kAsHandleLightVolumeRet, reinterpret_cast<void*>(&d_as_handle),
+                                     reinterpret_cast<void**>(&g_orig_as_handle),
+                                     "GpuApi::GetAccelerationStructureHandle");
+  auto h = [](bool b) { return b ? "HOOKED" : "NOT hooked"; };
+  g_sdk->logger->InfoF(g_handle, "rt markers: AS builds - BLAS batch %s, NvAPI BLAS %s, TLAS %s; AS lifetime - create "
+                       "%s, destroy %s, light-volume handles %s", h(g_blas_attached), h(g_nv_attached),
+                       h(g_tlas_attached), h(g_create_as_attached), h(g_destroy_as_attached), h(g_as_handle_attached));
+}
+
+void detach_as() {
+  if (g_as_handle_attached) detach_hook(kAsHandle);
+  if (g_destroy_as_attached) detach_hook(kDestroyAs);
+  if (g_create_as_attached) detach_hook(kCreateAs);
+  g_create_as_attached = g_destroy_as_attached = g_as_handle_attached = false;
+  if (g_tlas_attached) detach_hook(kBuildTlas);
+  if (g_nv_attached) detach_hook(kNvBuildAsEx);
+  if (g_blas_attached) detach_hook(kBuildBlasBatch);
+  g_blas_attached = g_nv_attached = g_tlas_attached = false;
+}
+
 void d_rays(uint32_t so, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5, uint32_t a6, uint32_t a7, uint32_t a8,
             uint32_t buffer) {
   // Entered from the hooked function's entry: our return address is the engine caller's.
@@ -536,13 +1005,19 @@ void d_rays(uint32_t so, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5, uin
     graph_probe::on_dispatch_rays(so, a2, a3, a5,
                                   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(_ReturnAddress()) - g_base - 5));
   t_ovr.set = false;
+  t_ran = false;
   if (g_gsgi_attached && g_nvar.load(std::memory_order_relaxed)) arm_variant(so, a4);
+  const Var* const armed = t_ovr.set ? t_ovr.v : nullptr;
   ID3D12GraphicsCommandList* tcl = nullptr;
   const uint32_t timed = gpu_timing::active() ? time_rays(so, a4, &tcl) : 0;
+  ID3D12GraphicsCommandList2* mcl = g_marks_on && mark_create() ? mark_list() : nullptr;
+  const uint32_t mseq = mcl ? mark_begin(mcl, so, a2, a3, a4) : 0;
   {
     prof::Pause engine;
     g_orig_rays(so, a2, a3, a4, a5, a6, a7, a8, buffer);
   }
+  if (mseq) mark_end(mcl, mseq, armed);
+  if (mcl) mcl->Release();
   if (timed) gpu_timing::end(tcl, timed, false);  // DispatchRays records on the list it found
   t_ovr.set = false;
 }
@@ -597,6 +1072,7 @@ const void* d_gsgi(uint32_t id, uint32_t group) {
     if (slot) std::memcpy(&props, slot + kRtEntryProps, sizeof props);
     const void* ident = props ? identifier(slot, props, v) : nullptr;
     if (ident) {
+      t_ran = true;
       if (v.swapped.fetch_add(1, std::memory_order_relaxed) == 0)
         g_sdk->logger->InfoF(g_handle, "rt variant: %s - first dispatch RUNS the variant (state object %u, group %u)",
                              v.label, id, group);
@@ -677,10 +1153,14 @@ void variant_stats(rg_handle h, rg_rt_variant_stats* out) {
 void attach_rays(bool census, bool timing) {
   const bool variants = g_nvar.load() != 0 && g_attached;
   const bool timed = timing && g_attached && g_n.load() != 0;  // GPU timing on at the start + client libraries
-  if (!census && !variants && !timed) return;
+  const bool marks = ::crash_log::dred_armed();  // DispatchRays markers for a device-removal report
+  if (!census && !variants && !timed && !marks) return;
   g_rays_attached = attach_hook(kDispatchRays, kDispatchRaysRet, reinterpret_cast<void*>(&d_rays),
                                 reinterpret_cast<void**>(&g_orig_rays), "DispatchRays (global)");
   g_rays_census = g_rays_attached && census;
+  g_marks_on = g_rays_attached && marks;
+  if (g_marks_on) ::crash_log::set_extra_dump(&mark_dump);
+  if (g_marks_on) attach_as();
   if (g_rays_attached && variants)
     g_gsgi_attached = attach_hook(kGetShaderGroupIdentifier, kGpuDispatchRaysGsgiRet, reinterpret_cast<void*>(&d_gsgi),
                                   reinterpret_cast<void**>(&g_orig_gsgi), "GpuApi::GetShaderGroupIdentifier");
@@ -692,7 +1172,9 @@ void attach_rays(bool census, bool timing) {
 void detach_rays() {
   if (g_gsgi_attached) detach_hook(kGetShaderGroupIdentifier);
   if (g_rays_attached) detach_hook(kDispatchRays);
-  g_gsgi_attached = g_rays_attached = g_rays_census = false;
+  if (g_marks_on) ::crash_log::set_extra_dump(nullptr);
+  detach_as();
+  g_gsgi_attached = g_rays_attached = g_rays_census = g_marks_on = false;
 }
 
 rg_handle add(const char* name, const uint8_t* hash16, rg_blob lib, int32_t priority) {
