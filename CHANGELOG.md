@@ -20,6 +20,7 @@
   the game's render graph: switch a mod's change off and on to see what it costs.
 - Mods can compile HLSL through REDGraph while the game starts. The shader compiler is not included: it works
   only with `dxcompiler.dll` and `dxil.dll` put next to REDGraph.dll.
+- Thanks to Spuddeh, whose work both of the above grew out of.
 - Higher limits for mods that patch many shaders: 256 patches, 32 leases, and a lease now reaches up to 64 different
   game shaders (it stopped at 8 without a word; now the log says when it is full).
 - The render graph window shows the nodes a mod removed.

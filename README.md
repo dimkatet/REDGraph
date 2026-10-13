@@ -55,6 +55,16 @@ cmake -B build -A x64 -DRG_GAME_DIR="C:/.../Cyberpunk 2077" -DRG_DXC_DIR="C:/...
 [`docs/internals.md`](docs/internals.md): the engine hooks, every mechanism, the render graph's structure as far as it
 is decoded, and what is still missing. Contributions: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
+## Thanks
+
+* [WopsS](https://github.com/WopsS) and the RED4ext contributors - RED4ext and its SDK, which REDGraph runs on.
+* The Cyber Engine Tweaks team - the window lives in CET.
+* bartmoss and [cp2077-symbols](https://codeberg.org/bartmoss/cp2077-symbols) - the game's function names by address.
+* [clshortfuse](https://github.com/clshortfuse) and [RenoDX](https://github.com/clshortfuse/renodx) - the prior art
+  for replacing game shaders, and the main reference for learning how any of this works.
+* **Spuddeh** ([GitHub](https://github.com/spuddeh), [Nexus](https://www.nexusmods.com/profile/Spuddeh?gameId=3333)) -
+  for sharing their work on native shaders: REDGraph's GPU timing and HLSL compiling grew out of it.
+
 ## License
 
 [MIT](LICENSE). Cyberpunk 2077 and REDengine are trademarks of CD PROJEKT S.A.; REDGraph is not affiliated with or
