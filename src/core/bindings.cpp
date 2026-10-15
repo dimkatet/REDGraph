@@ -274,12 +274,14 @@ FrSave* find_fr(uintptr_t fr) {
   return nullptr;
 }
 
-void stage(uint8_t* fr, uint32_t gi, int32_t idx, Lease& l, uint64_t cur) {
+// What stage() did: bound ours now / ours was there already / no staging array / FrSave full (the engine's stays).
+enum StageOut : uint8_t { kStaged, kAlready, kNoSlot, kLost };
+StageOut stage(uint8_t* fr, uint32_t gi, int32_t idx, Lease& l, uint64_t cur) {
   Group& g = g_groups[gi];
   uint64_t* slot = staging_slot(fr, idx);
-  if (!slot) return;
+  if (!slot) return kNoSlot;
   const uint64_t had = *slot;
-  if (had == cur) return;
+  if (had == cur) return kAlready;
   if (!ours(had)) {  // remember the engine's handle (an older ring slot of ours is not one)
     FrSave* s = find_fr(reinterpret_cast<uintptr_t>(fr));
     if (!s) {
@@ -294,7 +296,7 @@ void stage(uint8_t* fr, uint32_t gi, int32_t idx, Lease& l, uint64_t cur) {
     }
     if (!s) {  // more than 64 contexts at once - stage nothing rather than lose the engine's handle
       g.lost.fetch_add(1, std::memory_order_relaxed);
-      return;
+      return kLost;
     }
     s->old[gi] = had;
     s->mask |= 1u << gi;
@@ -302,6 +304,7 @@ void stage(uint8_t* fr, uint32_t gi, int32_t idx, Lease& l, uint64_t cur) {
   const D3D12_CPU_DESCRIPTOR_HANDLE h{static_cast<SIZE_T>(cur)};
   g_bind(fr, g.stage, kKinds[g.kind].range, g.reg, &h, false);
   l.stages.fetch_add(1, std::memory_order_relaxed);
+  return kStaged;
 }
 
 void restore(uint8_t* fr, uint32_t gi, int32_t idx) {
@@ -346,6 +349,56 @@ void log_coverage(const uint8_t* fr) {
   }
 }
 
+// ---- RT lease delivery (2026-10-14: a client's raygen variant faulted reading VA 0 at a rare DispatchRays, ~once in
+// 30 min; the only input it has that the engine's raygen lacks is an RT lease - docs/internals.md "RT lease delivery")
+// GpuApi::DispatchRays calls UpdateRootParams(rays = 1) BEFORE GetShaderGroupIdentifier, on one thread. So per
+// DispatchRays the recording thread keeps what every RT slot group got - and, AFTER the engine's UpdateRootParams has
+// copied the tables, whether OUR descriptor still sits in the staging slot and the table is not a STATIC one (a static
+// table is bound as it is, the staging array is not copied). rt_lib asks rt_delivered() before it hands out a variant:
+// a variant whose lease did not land runs the engine's raygen for that one dispatch (counted, logged).
+enum RtOut : uint8_t { kRtNotSeen, kRtOurs, kRtAlready, kRtNull, kRtStaticSkip, kRtLost, kRtNoSlot, kRtGone,
+                       kRtStatic, kRtCount };
+const char* const kRtOutName[kRtCount] = {"NOT STAGED", "staged", "already ours", "NULL staged", "skipped: STATIC table",
+                                          "LOST (64 contexts)", "no staging array",
+                                          "GONE from the slot after the engine's copy",
+                                          "the table stayed STATIC (ours not copied)"};
+bool rt_good(uint8_t o) { return o == kRtOurs || o == kRtAlready || o == kRtNull; }
+struct RtCall {
+  bool seen;  // UpdateRootParams(rays = 1) ran since rt_begin()
+  uint8_t out[kMaxGroups];
+  int32_t idx[kMaxGroups];
+  bool static_before[kMaxGroups];
+  int32_t desc[kMaxGroups];  // after the engine's copy: the slot's descriptor, as an index into OUR heap; -1 = not ours
+};
+thread_local RtCall t_rt{};
+std::atomic<uint64_t> g_rt_out[kRtCount] = {};
+std::atomic<uint64_t> g_rt_static_before{0};  // the group's table was STATIC when we came (a CBV / UAV: we bind anyway)
+std::atomic<uint32_t> g_rt_bad_logged{0};
+
+void rt_after(uint8_t* fr) {
+  const uint64_t statics = *reinterpret_cast<const uint64_t*>(fr + kFrStatic);
+  for (uint32_t gi = 0; gi < g_ngroups; ++gi) {
+    uint8_t& o = t_rt.out[gi];
+    if (o == kRtNotSeen) continue;
+    const uint64_t* slot = staging_slot(fr, t_rt.idx[gi]);
+    t_rt.desc[gi] = slot && ours(*slot) && g_inc ? static_cast<int32_t>((*slot - g_handle0) / g_inc) : -1;
+    if (rt_good(o)) {
+      const int32_t p = g_groups[gi].bucket.load(std::memory_order_relaxed);
+      if (!slot || !ours(*slot)) o = kRtGone;
+      else if (p >= 0 && ((statics >> p) & 1)) o = kRtStatic;
+    }
+    g_rt_out[o].fetch_add(1, std::memory_order_relaxed);
+    if (t_rt.static_before[gi]) g_rt_static_before.fetch_add(1, std::memory_order_relaxed);
+    if (!rt_good(o) && g_rt_bad_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+      const Group& g = g_groups[gi];
+      g_sdk->logger->ErrorF(g_handle, "native table: RT lease %s %c%u at a DispatchRays: %s%s (thread %lu; logged 16 "
+                            "times, counted)", stage_name(g.stage), letter(g.kind), g.reg, kRtOutName[o],
+                            t_rt.static_before[gi] ? ", its table was STATIC before" : "",
+                            static_cast<unsigned long>(GetCurrentThreadId()));
+    }
+  }
+}
+
 // Before the engine's own UpdateRootParams: the dirty bit BindDescriptor sets makes THIS call copy our handle.
 uint64_t d_update_root_params(void* fr_v, void* ctx_v, uint8_t rays) {
   prof::Scope prof_scope(prof::kUrp);
@@ -354,6 +407,11 @@ uint64_t d_update_root_params(void* fr_v, void* ctx_v, uint8_t rays) {
     if (!g_coverage_logged.load(std::memory_order_relaxed)) log_coverage(fr);
     const auto* ctx = static_cast<const uint8_t*>(ctx_v);
     const uint64_t baked = rays ? rtlib::baked_mask() : 0;
+    if (rays) {
+      t_rt.seen = true;
+      std::memset(t_rt.out, kRtNotSeen, sizeof t_rt.out);
+      std::memset(t_rt.static_before, 0, sizeof t_rt.static_before);
+    }
     for (uint32_t gi = 0; gi < g_ngroups; ++gi) {
       Group& g = g_groups[gi];
       int32_t idx = g.idx.load(std::memory_order_relaxed);
@@ -386,7 +444,10 @@ uint64_t d_update_root_params(void* fr_v, void* ctx_v, uint8_t rays) {
         }
         const int32_t p = g.bucket.load(std::memory_order_relaxed);
         const uint64_t statics = *reinterpret_cast<const uint64_t*>(fr + kFrStatic);
+        t_rt.idx[gi] = idx;
+        t_rt.static_before[gi] = p >= 0 && ((statics >> p) & 1);
         if (g.kind == RG_KIND_SRV && p >= 0 && ((statics >> p) & 1)) {
+          t_rt.out[gi] = kRtStaticSkip;
           if (hit->static_skips.fetch_add(1, std::memory_order_relaxed) == 0)
             g_sdk->logger->ErrorF(g_handle, "native table: RT lease '%s' %s %c%u NOT STAGED - its table %d is a STATIC "
                                   "one at this DispatchRays (logged once; counted)", hit->name, stage_name(g.stage),
@@ -394,11 +455,14 @@ uint64_t d_update_root_params(void* fr_v, void* ctx_v, uint8_t rays) {
           continue;
         }
         uint64_t h = src_valid(*hit) ? src_handle(*hit) : 0;
-        if (!h) {
+        const bool null = !h;
+        if (null) {
           hit->null_stages.fetch_add(1, std::memory_order_relaxed);
           h = null_handle(*hit);
         }
-        stage(fr, gi, idx, *hit, h);
+        const StageOut s = stage(fr, gi, idx, *hit, h);
+        t_rt.out[gi] = s == kLost ? kRtLost : s == kNoSlot ? kRtNoSlot : null ? kRtNull : s == kStaged ? kRtOurs
+                                                                                                        : kRtAlready;
         continue;
       }
       const uint32_t ref = *reinterpret_cast<const uint32_t*>(ctx + stage_ref_offset(g.stage));
@@ -414,8 +478,13 @@ uint64_t d_update_root_params(void* fr_v, void* ctx_v, uint8_t rays) {
         restore(fr, gi, idx);
     }
   }
-  prof::Pause engine;
-  return g_orig_urp(fr_v, ctx_v, rays);
+  uint64_t r;
+  {
+    prof::Pause engine;
+    r = g_orig_urp(fr_v, ctx_v, rays);
+  }
+  if (rays && t_rt.seen && fr_v) rt_after(static_cast<uint8_t*>(fr_v));
+  return r;
 }
 
 const char* dim_name(uint32_t d) {
@@ -1113,6 +1182,77 @@ void lease_stats(rg_handle h, rg_lease_stats* out) {
   uint32_t baked = 0;
   for (uint64_t m = l.rt_mask & rtlib::baked_mask(); m; m &= m - 1) ++baked;
   out->rt_baked = baked;
+}
+
+void rt_begin() { t_rt.seen = false; }
+
+bool rt_delivered(uint64_t lib_bit, char* why, size_t n) {
+  if (why && n) why[0] = 0;
+  for (uint32_t gi = 0; gi < g_ngroups; ++gi) {
+    const Group& g = g_groups[gi];
+    bool mine = false;
+    for (uint32_t k = 0; k < g.nleases && !mine; ++k) mine = (g_leases[g.leases[k]].rt_mask & lib_bit) != 0;
+    if (!mine) continue;
+    const uint8_t o = t_rt.seen ? t_rt.out[gi] : kRtNotSeen;
+    if (rt_good(o)) continue;
+    if (why && n)
+      std::snprintf(why, n, "RT lease %s %c%u: %s", stage_name(g.stage), letter(g.kind), g.reg,
+                    t_rt.seen ? kRtOutName[o] : "UpdateRootParams did not run in this DispatchRays");
+    return false;
+  }
+  return true;
+}
+
+void rt_state_text(char* out, size_t n) {
+  if (!out || !n) return;
+  out[0] = 0;
+  if (!t_rt.seen) {
+    std::snprintf(out, n, "leases: no UpdateRootParams");
+    return;
+  }
+  static const char* const kShort[kRtCount] = {"-", "new", "ours", "null", "STATIC-SKIP", "LOST", "NOSLOT", "GONE",
+                                               "STATIC"};
+  size_t k = static_cast<size_t>(std::snprintf(out, n, "leases:"));
+  for (uint32_t gi = 0; gi < g_ngroups && k + 1 < n; ++gi) {
+    const uint8_t o = t_rt.out[gi];
+    if (o == kRtNotSeen) continue;
+    const Group& g = g_groups[gi];
+    k += static_cast<size_t>(std::snprintf(out + k, n - k, " %c%u=%s#%d%s", letter(g.kind), g.reg, kShort[o],
+                                           t_rt.desc[gi], t_rt.static_before[gi] ? "(was static)" : ""));
+  }
+}
+
+void rt_counts_text(char* out, size_t n) {
+  if (!out || !n) return;
+  size_t k = static_cast<size_t>(std::snprintf(out, n, "RT lease delivery this session:"));
+  for (uint32_t o = 1; o < kRtCount && k + 1 < n; ++o)
+    k += static_cast<size_t>(std::snprintf(out + k, n - k, " %s %llu;", kRtOutName[o],
+                                           static_cast<unsigned long long>(g_rt_out[o].load())));
+  if (k + 1 < n)
+    std::snprintf(out + k, n - k, " table STATIC on arrival %llu",
+                  static_cast<unsigned long long>(g_rt_static_before.load()));
+}
+
+void rt_layout_text(char* out, size_t n) {
+  if (!out || !n) return;
+  size_t k = static_cast<size_t>(std::snprintf(out, n, "RT leases in our heap:"));
+  const uint32_t nl = g_nleases.load();
+  for (uint32_t i = 0; i < nl && k + 1 < n; ++i) {
+    const Lease& l = g_leases[i];
+    if (!l.rt_mask) continue;
+    if (l.cb >= 0)
+      k += static_cast<size_t>(std::snprintf(out + k, n - k, " '%s' %c%u = cbuffer #%u-#%u (now #%u);", l.name,
+                                             letter(l.kind), l.reg, g_cb[l.cb].first,
+                                             g_cb[l.cb].first + g_cb[l.cb].ring - 1,
+                                             g_cb[l.cb].first + g_cb[l.cb].cur.load()));
+    else
+      k += static_cast<size_t>(std::snprintf(out + k, n - k, " '%s' %c%u = view #%u-#%u (now #%u);", l.name,
+                                             letter(l.kind), l.reg, g_view[l.view].first,
+                                             g_view[l.view].first + g_view[l.view].ring - 1,
+                                             g_view[l.view].first + g_view[l.view].cur.load()));
+  }
+  if (k + 1 < n) std::snprintf(out + k, n - k, " NULL CBV/SRV/UAV = #%u/#%u/#%u", g_null_first, g_null_first + 1,
+                               g_null_first + 2);
 }
 
 void on_rt_library(const void* code, size_t size, const char* name) {

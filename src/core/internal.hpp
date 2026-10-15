@@ -121,6 +121,15 @@ bool companion_staged(rg_handle comp, const void* ctx);
 // ours - false = a lease of it is refused, keep the engine's library.
 void on_rt_library(const void* code, size_t size, const char* name);
 bool rtlib_may_bake(rg_handle lib);
+// RT lease delivery, per DispatchRays on the recording thread (bindings.cpp "RT lease delivery"): rt_begin() at its
+// start; after its UpdateRootParams, rt_delivered(bit of a library) = every RT lease of that library holds OUR
+// descriptor (or our NULL one) in the table the dispatch uses - false + why otherwise; rt_state_text = the groups'
+// outcome of this dispatch for a marker; rt_counts_text = the session's totals.
+void rt_begin();
+bool rt_delivered(uint64_t lib_bit, char* why, size_t n);
+void rt_state_text(char* out, size_t n);
+void rt_counts_text(char* out, size_t n);
+void rt_layout_text(char* out, size_t n);  // where every RT lease lives in our heap (decodes the #n above)
 }  // namespace bindings
 
 // rt_lib.cpp - M3

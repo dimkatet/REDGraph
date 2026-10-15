@@ -405,8 +405,11 @@ struct Var {
   uint64_t node;  // CName hash, 0 = everywhere
   std::atomic<uint32_t> on{1};
   std::atomic<uint64_t> swapped{0}, out_of_scope{0}, off{0}, missing{0};
+  std::atomic<uint64_t> undelivered{0};  // a lease of its library did not land - the engine's raygen ran instead
   std::atomic<bool> said_in{false}, said_out{false}, said_missing{false};
 };
+// RT lease delivery checks at a variant's hand-out (bindings.cpp "RT lease delivery"): all / failed; the log lines.
+std::atomic<uint64_t> g_deliv_checks{0}, g_deliv_fail{0};
 Var g_var[kMaxVar];
 std::atomic<uint32_t> g_nvar{0};
 
@@ -436,6 +439,7 @@ struct Override {
 };
 thread_local Override t_ovr{};
 thread_local bool t_ran = false;  // d_gsgi handed out a variant's identifier in this DispatchRays
+thread_local bool t_undelivered = false;  // ... did NOT, because a lease of its library did not land
 // the raygen group names seen per library, for the log (the first few)
 std::atomic<uint32_t> g_names_logged{0};
 
@@ -546,11 +550,13 @@ struct Mark {
   std::atomic<uint32_t> seq;
   MarkKind kind;
   uint32_t so, id, group, w, h;  // rays: state object, its id, raygen group, grid; AS: w = count, h = zero inputs
-  int32_t var;  // rays: the Var that RAN + 1; 0 = the engine's raygen; -1 = a variant was armed, the engine's ran
+  int32_t var;  // rays: the Var that RAN + 1; 0 = the engine's raygen; -1 = a variant was armed, the engine's ran;
+                //   -2 = ... because a lease of its library did not land (bindings::rt_delivered)
   uint64_t node;
   bool job;
   DWORD tid;
   char what[96];  // rays: the raygen's name; AS: what was built and the first zero input
+  char lease[96];  // rays: what every RT lease got in this dispatch (bindings::rt_state_text)
 };
 Mark g_marks[kMarkSlots];
 std::atomic<uint32_t> g_mark_seq{0};
@@ -633,6 +639,7 @@ Mark& mark_take(MarkKind kind, uint32_t* seq_out) {
   m.job = node && render_flow::current_is_job();
   m.tid = GetCurrentThreadId();
   m.what[0] = 0;
+  m.lease[0] = 0;
   *seq_out = seq;
   return m;
 }
@@ -664,7 +671,8 @@ uint32_t mark_begin(ID3D12GraphicsCommandList2* cl, uint32_t so, uint32_t w, uin
 
 void mark_end(ID3D12GraphicsCommandList2* cl, uint32_t seq, const Var* armed) {
   Mark& m = g_marks[seq % kMarkSlots];
-  if (armed) m.var = t_ran ? static_cast<int32_t>(armed - g_var) + 1 : -1;
+  if (armed) m.var = t_ran ? static_cast<int32_t>(armed - g_var) + 1 : t_undelivered ? -2 : -1;
+  bindings::rt_state_text(m.lease, sizeof m.lease);
   mark_write(cl, seq % kMarkSlots, 1, seq);
 }
 
@@ -682,10 +690,11 @@ void mark_line(void (*line)(const char*), const char* state, const Mark& m, uint
   if (m.kind == kMarkRays) {
     char var[200] = "the engine's";
     if (m.var > 0) std::snprintf(var, sizeof var, "OUR VARIANT %s", g_var[m.var - 1].label);
+    else if (m.var == -2) std::snprintf(var, sizeof var, "the engine's (a variant was armed; its lease did not land)");
     else if (m.var < 0) std::snprintf(var, sizeof var, "the engine's (a variant was armed, not handed out)");
     std::snprintf(b, sizeof b, "[gpu]   %s DispatchRays #%u: so %u (state object %u), raygen group %u '%s', %ux%u, "
-                  "node %s, thread %lu - raygen %s", state, seq, m.so, m.id, m.group, m.what, m.w, m.h, nm,
-                  static_cast<unsigned long>(m.tid), var);
+                  "node %s, thread %lu - raygen %s; %s", state, seq, m.so, m.id, m.group, m.what, m.w, m.h, nm,
+                  static_cast<unsigned long>(m.tid), var, m.lease[0] ? m.lease : "leases: -");
   } else {
     std::snprintf(b, sizeof b, "[gpu]   %s AS build #%u: %s, node %s, thread %lu", state, seq, m.what, nm,
                   static_cast<unsigned long>(m.tid));
@@ -722,6 +731,15 @@ void mark_dump(void (*line)(const char*)) {
   std::snprintf(b, sizeof b, "[gpu] light-volume TLAS builds checked: %u, with a STALE BLAS: %u, with a FRESH BLAS: "
                 "%u", g_lv_tlas.load(), g_lv_stale.load(), g_lv_fresh.load());
   line(b);
+  std::snprintf(b, sizeof b, "[gpu] variant hand-outs checked: %llu, the engine's raygen instead (lease not landed): %llu",
+                static_cast<unsigned long long>(g_deliv_checks.load()),
+                static_cast<unsigned long long>(g_deliv_fail.load()));
+  line(b);
+  char big[700];
+  bindings::rt_counts_text(big, sizeof big);
+  line(big);
+  bindings::rt_layout_text(big, sizeof big);
+  line(big);
   for (uint32_t k = 0; k < 6 && newest_done > k; ++k) {
     const uint32_t seq = newest_done - k, i = seq % kMarkSlots;
     if (g_marks[i].seq.load() == seq && g_mark_mem[2 * i + 1] == seq) mark_line(line, "done  ", g_marks[i], seq);
@@ -1006,6 +1024,8 @@ void d_rays(uint32_t so, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5, uin
                                   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(_ReturnAddress()) - g_base - 5));
   t_ovr.set = false;
   t_ran = false;
+  t_undelivered = false;
+  bindings::rt_begin();
   if (g_gsgi_attached && g_nvar.load(std::memory_order_relaxed)) arm_variant(so, a4);
   const Var* const armed = t_ovr.set ? t_ovr.v : nullptr;
   ID3D12GraphicsCommandList* tcl = nullptr;
@@ -1066,6 +1086,33 @@ const void* d_gsgi(uint32_t id, uint32_t group) {
   if (o.set && o.id == id && o.group == group) {
     o.set = false;
     Var& v = *o.v;
+    // The variant reads OUR leases; the engine's raygen does not. Hand it out only if they landed in THIS dispatch's
+    // tables (UpdateRootParams ran just before, in GpuApi::DispatchRays).
+    char why[128];
+    const uint64_t checks = g_deliv_checks.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!bindings::rt_delivered(1ull << v.lib, why, sizeof why)) {
+      t_undelivered = true;
+      v.undelivered.fetch_add(1, std::memory_order_relaxed);
+      const uint64_t f = g_deliv_fail.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (f <= 16 || (f & (f - 1)) == 0) {
+        const void* node = render_flow::current_node();
+        const char* nn = node ? RED4ext::CName(render_flow::node_name_hash(node)).ToString() : nullptr;
+        g_sdk->logger->ErrorF(g_handle, "rt variant: %s - %s, node %s, thread %lu: the ENGINE's raygen ran this "
+                              "dispatch instead (#%llu of %llu hand-outs; the first 16 and every 2^n logged)", v.label,
+                              why, nn && *nn ? nn : "(none)", static_cast<unsigned long>(GetCurrentThreadId()),
+                              static_cast<unsigned long long>(f), static_cast<unsigned long long>(checks));
+      }
+      prof::Pause engine;
+      return g_orig_gsgi(id, group);
+    }
+    if ((checks & (checks - 1)) == 0 && (checks == 1 || checks >= 1024)) {
+      char st[200], cnt[600];
+      bindings::rt_state_text(st, sizeof st);
+      bindings::rt_counts_text(cnt, sizeof cnt);
+      g_sdk->logger->InfoF(g_handle, "rt variant: lease delivery checked at %llu hand-outs (%llu failed); this one %s; "
+                           "%s", static_cast<unsigned long long>(checks),
+                           static_cast<unsigned long long>(g_deliv_fail.load()), st, cnt);
+    }
     auto* dev = *reinterpret_cast<uint8_t* const*>(g_base + kDeviceData);
     const uint8_t* slot = dev ? dev + kRtStateObjects + size_t(id - 1) * kRtStateObjectStride : nullptr;
     ID3D12StateObjectProperties* props = nullptr;

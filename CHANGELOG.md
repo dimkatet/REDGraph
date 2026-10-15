@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.3
+
+- Fixed a rare GPU crash with ray tracing or path tracing on (seen with Cyberpunk Render Tweaks' grass shadows,
+  about once in half an hour of play).
+
 ## 0.3.2
 
 - With `Dred = true`, ray-tracing structure builds are tracked too: a GPU crash while the game builds them names

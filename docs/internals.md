@@ -181,6 +181,18 @@ raygens read. A `DispatchRays` carries no shader identity, so an RT lease stages
 because every library the engine creates is checked (its `RDAT`) not to declare the register; a source not ready
 stages a NULL descriptor. Hence **one RT lease per register in the process** - a second gets `RG_E_TAKEN`.
 
+**RT lease delivery** (0.3.3, after a client's raygen variant faulted reading VA 0 at a rare `DispatchRays` - ~once in
+30 min, two users, the Aftermath shader hash = the client's library; its only input the engine's raygen lacks is an RT
+lease). `GpuApi::DispatchRays` calls `UpdateRootParams(rays = 1)` BEFORE `GetShaderGroupIdentifier` (0x142a40756 vs
+0x142a407e1), on one thread. So per dispatch the recording thread keeps what every RT slot group got (staged / already
+ours / NULL / static-skip / lost / no staging array) and, AFTER the engine's copy, re-checks the staging slot: not ours
+any more = GONE, its table's STATIC bit still set = STATIC (a static table is bound as it is; the staging array is not
+copied - before 0.3.3 only an SRV's static table was caught). `d_gsgi` hands a variant out only if every RT lease of
+its library landed; otherwise THAT dispatch runs the engine's raygen (`rt variant: ... the ENGINE's raygen ran this
+dispatch instead`, the first 16 and every 2^n). Totals: at hand-out 1 and every 2^n from 1024, and in the crash log;
+a rays marker carries the dispatch's lease state (`leases: b3=new#12 b4=ours#20 t26=null#33`, # = our heap index,
+decoded by the crash log's `RT leases in our heap` line).
+
 **Companions' leases** stage at every dispatch of the engine shader they accompany (inert for the vanilla shader);
 `companion_request` is accepted only when the descriptors sit in that dispatch's table.
 
