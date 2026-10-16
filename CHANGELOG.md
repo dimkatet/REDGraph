@@ -1,9 +1,28 @@
 # Changelog
 
+## 0.3.4
+
+- Fixed ray-traced client features (e.g. Cyberpunk Render Tweaks' grass shadows and reflection fog) switching off for
+  the rest of the session after a long play: a table of 64 render-context entries leaked one entry per context the
+  engine retired, and once full every new context's leases were LOST (`LOST (64 contexts)` in the log). An entry
+  unused for 600 frames is now taken over.
+- Log: the peak of context entries in use, each take-over (the first 16, then every 2^n), and the totals on the
+  `RT lease delivery this session` line.
+
 ## 0.3.3
 
-- Fixed a rare GPU crash with ray tracing or path tracing on (seen with Cyberpunk Render Tweaks' grass shadows,
-  about once in half an hour of play).
+- Fixed a rare GPU crash (page fault at VA 0, `DEVICE_HUNG`) inside a client's raygen variant with ray tracing or
+  path tracing on - seen with Cyberpunk Render Tweaks' grass shadows, about once in 30-45 min of play. At a rare
+  `DispatchRays` an RT lease did not reach the descriptor table the dispatch used, and the variant read a descriptor
+  that was not ours.
+- RT leases are now checked at every `DispatchRays`: what each one got, and whether ours is still in the slot after
+  the engine's `UpdateRootParams` copy (catches a slot overwritten by the engine, and a STATIC table of any kind - before,
+  only an SRV's static table was caught). A variant is handed out only if every RT lease of its library landed;
+  otherwise that one dispatch runs the engine's raygen.
+- Log: `rt variant: ... the ENGINE's raygen ran this dispatch instead` (the first 16, then every 2^n) and
+  `rt variant: lease delivery checked at N hand-outs` (at the first, then every 2^n from 1024). With `Dred = true`
+  every DispatchRays marker carries its lease state (`leases: b3=new#12 b4=ours#20 ...`), and the crash log prints the
+  session's totals and where each RT lease lives in our heap.
 
 ## 0.3.2
 

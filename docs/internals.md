@@ -193,6 +193,14 @@ dispatch instead`, the first 16 and every 2^n). Totals: at hand-out 1 and every 
 a rays marker carries the dispatch's lease state (`leases: b3=new#12 b4=ours#20 t26=null#33`, # = our heap index,
 decoded by the crash log's `RT leases in our heap` line).
 
+**Context entries** (0.3.4). Staging over an ENGINE handle remembers it per `SFrameResources` in one of 64 entries, freed
+when the last group is given back. A context the engine retires with a group still pending never gives it back - before
+0.3.4 its entry leaked, and a user session filled all 64 after 38 min: from then on every lease of every NEW context
+was LOST (RT: the engine's raygen ran; raster / compute: `lease_bind_ok` kept the engine's PSO) until a restart. Now an
+entry unused for 600 frames is taken over. Log: a new peak of entries in use (from 16), `took over the entry of a
+context unused for N frames` and `all 64 context entries are in use` (the first 16 and every 2^n); the RT totals line
+ends with `context entries: in use, peak, taken over, all in use`.
+
 **Companions' leases** stage at every dispatch of the engine shader they accompany (inert for the vanilla shader);
 `companion_request` is accepted only when the descriptors sit in that dispatch's table.
 

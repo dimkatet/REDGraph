@@ -210,14 +210,21 @@ bool src_valid(const Lease& l) {
 }
 
 // Per frame-resources: the engine's handle we displaced, per group, to give back. A context is used by one thread at
-// a time.
+// a time. An entry is freed when its last group is given back - and a context the engine retires with one still
+// pending never gives it back: its entry is taken over once unused for kFrStaleFrames (2026-10-16: a user session
+// filled all 64 after 38 min, then every lease of every NEW context was LOST until the game was restarted). A context
+// idle that long has rebound its tables since; what it loses is a handle to restore that it no longer reads.
 constexpr uint32_t kMaxFr = 64;
+constexpr uint64_t kFrStaleFrames = 600;
 struct FrSave {
   std::atomic<uintptr_t> fr{0};
+  std::atomic<uint64_t> used{0};  // g_frame of its last stage / restore
   uint64_t old[kMaxGroups];
   uint32_t mask;
 };
 FrSave g_fr[kMaxFr];
+std::atomic<uint32_t> g_fr_live{0}, g_fr_peak{0};
+std::atomic<uint64_t> g_fr_taken{0}, g_fr_full{0};
 
 using UpdateRootParams_t = uint64_t (*)(void* fr, void* ctx, uint8_t rays);
 using BindDescriptor_t = void (*)(void* fr, uint32_t type, uint32_t range, uint32_t slot,
@@ -274,6 +281,49 @@ FrSave* find_fr(uintptr_t fr) {
   return nullptr;
 }
 
+bool pow2(uint64_t n) { return (n & (n - 1)) == 0; }
+
+// A free entry, else one unused for kFrStaleFrames (see FrSave). nullptr = 64 contexts in use right now.
+FrSave* claim_fr(uintptr_t fr) {
+  const uint64_t now = g_frame.load(std::memory_order_relaxed);
+  for (FrSave& f : g_fr) {
+    uintptr_t expect = 0;
+    if (f.fr.compare_exchange_strong(expect, fr, std::memory_order_acq_rel)) {
+      f.mask = 0;
+      f.used.store(now, std::memory_order_relaxed);
+      const uint32_t live = g_fr_live.fetch_add(1, std::memory_order_relaxed) + 1;
+      uint32_t peak = g_fr_peak.load(std::memory_order_relaxed);
+      while (live > peak && !g_fr_peak.compare_exchange_weak(peak, live, std::memory_order_relaxed)) {}
+      if (live > peak && live >= 16)
+        g_sdk->logger->InfoF(g_handle, "native table: %u contexts hold a displaced engine handle (a new peak; %u "
+                             "entries; thread %lu, frame %llu)", live, kMaxFr,
+                             static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned long long>(now));
+      return &f;
+    }
+  }
+  for (FrSave& f : g_fr) {
+    uintptr_t old_fr = f.fr.load(std::memory_order_acquire);
+    const uint64_t used = f.used.load(std::memory_order_relaxed);
+    if (!old_fr || used + kFrStaleFrames > now) continue;
+    if (!f.fr.compare_exchange_strong(old_fr, fr, std::memory_order_acq_rel)) continue;
+    f.mask = 0;
+    f.used.store(now, std::memory_order_relaxed);
+    const uint64_t n = g_fr_taken.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 16 || pow2(n))
+      g_sdk->logger->InfoF(g_handle, "native table: took over the entry of a context unused for %llu frames (#%llu; "
+                           "%u entries in use; thread %lu, frame %llu)", static_cast<unsigned long long>(now - used),
+                           static_cast<unsigned long long>(n), g_fr_live.load(std::memory_order_relaxed),
+                           static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned long long>(now));
+    return &f;
+  }
+  const uint64_t n = g_fr_full.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n <= 16 || pow2(n))
+    g_sdk->logger->ErrorF(g_handle, "native table: all %u context entries are in use - this lease is NOT staged here "
+                          "(#%llu; thread %lu, frame %llu)", kMaxFr, static_cast<unsigned long long>(n),
+                          static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned long long>(now));
+  return nullptr;
+}
+
 // What stage() did: bound ours now / ours was there already / no staging array / FrSave full (the engine's stays).
 enum StageOut : uint8_t { kStaged, kAlready, kNoSlot, kLost };
 StageOut stage(uint8_t* fr, uint32_t gi, int32_t idx, Lease& l, uint64_t cur) {
@@ -284,17 +334,9 @@ StageOut stage(uint8_t* fr, uint32_t gi, int32_t idx, Lease& l, uint64_t cur) {
   if (had == cur) return kAlready;
   if (!ours(had)) {  // remember the engine's handle (an older ring slot of ours is not one)
     FrSave* s = find_fr(reinterpret_cast<uintptr_t>(fr));
-    if (!s) {
-      for (FrSave& f : g_fr) {
-        uintptr_t expect = 0;
-        if (f.fr.compare_exchange_strong(expect, reinterpret_cast<uintptr_t>(fr), std::memory_order_acq_rel)) {
-          f.mask = 0;
-          s = &f;
-          break;
-        }
-      }
-    }
-    if (!s) {  // more than 64 contexts at once - stage nothing rather than lose the engine's handle
+    if (s) s->used.store(g_frame.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    else s = claim_fr(reinterpret_cast<uintptr_t>(fr));
+    if (!s) {  // every entry in use right now - stage nothing rather than lose the engine's handle
       g.lost.fetch_add(1, std::memory_order_relaxed);
       return kLost;
     }
@@ -315,7 +357,12 @@ void restore(uint8_t* fr, uint32_t gi, int32_t idx) {
   if (!s || !(s->mask & (1u << gi))) return;
   const uint64_t old = s->old[gi];
   s->mask &= ~(1u << gi);
-  if (!s->mask) s->fr.store(0, std::memory_order_release);
+  if (!s->mask) {
+    s->fr.store(0, std::memory_order_release);
+    g_fr_live.fetch_sub(1, std::memory_order_relaxed);
+  } else {
+    s->used.store(g_frame.load(std::memory_order_relaxed), std::memory_order_relaxed);
+  }
   if (!old) return;  // never seen - cannot happen for a fully copied table; ours stays (a valid descriptor)
   const D3D12_CPU_DESCRIPTOR_HANDLE h{static_cast<SIZE_T>(old)};
   g_bind(fr, g.stage, kKinds[g.kind].range, g.reg, &h, false);
@@ -359,7 +406,7 @@ void log_coverage(const uint8_t* fr) {
 enum RtOut : uint8_t { kRtNotSeen, kRtOurs, kRtAlready, kRtNull, kRtStaticSkip, kRtLost, kRtNoSlot, kRtGone,
                        kRtStatic, kRtCount };
 const char* const kRtOutName[kRtCount] = {"NOT STAGED", "staged", "already ours", "NULL staged", "skipped: STATIC table",
-                                          "LOST (64 contexts)", "no staging array",
+                                          "LOST (all context entries in use)", "no staging array",
                                           "GONE from the slot after the engine's copy",
                                           "the table stayed STATIC (ours not copied)"};
 bool rt_good(uint8_t o) { return o == kRtOurs || o == kRtAlready || o == kRtNull; }
@@ -1229,8 +1276,10 @@ void rt_counts_text(char* out, size_t n) {
     k += static_cast<size_t>(std::snprintf(out + k, n - k, " %s %llu;", kRtOutName[o],
                                            static_cast<unsigned long long>(g_rt_out[o].load())));
   if (k + 1 < n)
-    std::snprintf(out + k, n - k, " table STATIC on arrival %llu",
-                  static_cast<unsigned long long>(g_rt_static_before.load()));
+    std::snprintf(out + k, n - k, " table STATIC on arrival %llu; context entries: %u in use, peak %u, taken over "
+                  "%llu, all in use %llu", static_cast<unsigned long long>(g_rt_static_before.load()),
+                  g_fr_live.load(), g_fr_peak.load(), static_cast<unsigned long long>(g_fr_taken.load()),
+                  static_cast<unsigned long long>(g_fr_full.load()));
 }
 
 void rt_layout_text(char* out, size_t n) {
