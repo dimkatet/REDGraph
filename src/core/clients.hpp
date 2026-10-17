@@ -15,7 +15,7 @@ namespace core::clients {
 
 enum Kind : uint8_t {
   kPatch, kPatchScope, kCompanion, kCompanionScope, kLease, kCbuffer, kFeed, kView, kRtLib, kRtVariant, kPass,
-  kSubscribe, kDeviceReady, kFlow, kNode, kNodeUse, kNodeAlloc, kWrap, kRemove, kPatchState, kWrapUse, kDrawSubscribe, kDrawCompanion, kDrawCompanionScope, kKinds
+  kSubscribe, kDeviceReady, kFlow, kNode, kNodeUse, kNodeAlloc, kWrap, kRemove, kPatchState, kWrapUse, kDrawSubscribe, kDrawCompanion, kDrawCompanionScope, kCensusWatch, kEngineBlock, kKinds
 };
 
 // A client reached the table: rg_host_get from module of `addr`, or the host ran its waiting init `fn`.

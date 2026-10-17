@@ -73,6 +73,8 @@ enum rg_kind { RG_KIND_CBV = 0, RG_KIND_SRV = 1, RG_KIND_UAV = 2 };
 enum rg_log_level { RG_LOG_INFO = 0, RG_LOG_WARN = 1, RG_LOG_ERROR = 2, RG_LOG_DEBUG = 3 };
 /* The engine's own constant blocks the host captures (GpuApi::UpdateBuffer / SetComputeShaderConstsRaw at known call
  * sites) - a cbuffer can be fed from one (rg_host::cbuffer_feed). */
+/* The first four entries of the host's catalog of engine constant blocks (engine_block_find, by the engine's name of
+ * the writing function) - kept for clients of API v1, always captured. Prefer engine_block_find. */
 enum rg_engine_block {
   RG_ENGINE_FOG_B6 = 0,          /* CRenderVolumetricFogManager::Update - the fog CS b6 (SVolFogConstants) */
   RG_ENGINE_CLOUD_BAKE_B6 = 1,   /* the cloud self-shadow bake 53c455b6's b6 */
@@ -639,6 +641,23 @@ typedef struct rg_host {
    * (logged once, counted): UAV-only textures, buffers, 1D. The first matching rule wins, in registration order; up to
    * 4 per removal. Register-time. 0 = ok. */
   int32_t (*node_remove_clear)(rg_handle remove, uint32_t name_hash, const float value[4]);
+
+  /* 2026-10-17: the BLAS census's watch list ([Diagnostics] BlasCensus - is a mesh in the ray-traced BVH, does it
+   * move there). stage RG_STAGE_VS: every indexed draw of that vertex shader is joined to the BLAS geometries the
+   * engine built (STATIC / DYNAMIC / NONE in the host's log); RG_STAGE_CS: its dispatches are counted, and inside which
+   * deform-pool writes (CRenderMesh::EvaluatePositions) - for the engine's BVH pool writers, m_computeSkinning_*. A
+   * watch is a host subscription (it shares their tables with every client). Up to 32 per stage, all clients together.
+   * 0 = watched; RG_E_UNAVAILABLE = the census is off this session (nothing done - call it unconditionally); RG_E_LATE
+   * after registration. NVIDIA only (the census reads the NvAPI BLAS builds). Register-time. */
+  int32_t (*census_watch)(uint32_t stage, const uint8_t* hash16, const char* name);
+
+  /* 2026-10-17: an engine constant block from the host's CATALOG, by the engine's name of the function that writes it
+   * (e.g. "CRenderInterface::CalculateSharedConstants" = cb12, "CRenderVolumetricFogManager::Update" = the fog CS b6;
+   * the list: the SDK guide / docs/internals.md "Engine constant blocks"). Returns its id - the `which` of
+   * engine_block / cbuffer_feed - and from then on the host captures it (a writer's hook goes on only when one of its
+   * blocks is asked for). RG_E_ARG = no such entry (the catalog grows by appending; an id never changes); RG_E_LATE
+   * after registration. Register-time. */
+  int32_t (*engine_block_find)(const char* name);
 } rg_host;
 
 RG_HOST_EXPORT const rg_host* rg_host_get(uint32_t version);

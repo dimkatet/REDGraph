@@ -397,7 +397,7 @@ bool d_create(void* out, const uint32_t* in) {
 }
 
 // ---- M12: raygen variants + the one DispatchRays hook ----
-constexpr uint32_t kMaxVar = 64;  // 31 fog + 4 grass + the self-test
+constexpr uint32_t kMaxVar = 64;  // raygen variants, every client together
 struct Var {
   uint32_t lib;
   wchar_t raygen[64], variant[64];
@@ -904,7 +904,11 @@ void d_blas(void* range, void* geoms, uint32_t buffer) {
 // engine's own layout (version 0x10020, stride 0x68). A geometry: u32 type (0 triangles, 1 AABBs, 2 triangles + OMM),
 // flags, then D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC / _AABBS_DESC at +8.
 int d_nv(void* cl_engine, const void* params) {
-  ID3D12GraphicsCommandList2* cl = mark_create() ? mark_list() : nullptr;
+  if (blas_census::on()) {
+    const auto* p = static_cast<const uint8_t*>(params);
+    blas_census::on_nv(p && rd32(p) == 0x10020 ? reinterpret_cast<const uint8_t*>(rd64(p + 8)) : nullptr);
+  }
+  ID3D12GraphicsCommandList2* cl = g_marks_on && mark_create() ? mark_list() : nullptr;
   uint32_t seq = 0;
   if (cl) {
     Mark& m = mark_take(kMarkBlasNv, &seq);
@@ -987,8 +991,9 @@ void d_tlas(uint32_t dest, uint32_t count, uint32_t instances, uint32_t a4, uint
 void attach_as() {
   g_blas_attached = attach_hook(kBuildBlasBatch, kBuildBlasBatchRet, reinterpret_cast<void*>(&d_blas),
                                 reinterpret_cast<void**>(&g_orig_blas), "the BLAS batch builder");
-  g_nv_attached = attach_hook(kNvBuildAsEx, kNvBuildAsExRet, reinterpret_cast<void*>(&d_nv),
-                              reinterpret_cast<void**>(&g_orig_nv), "NvAPI_D3D12_BuildRaytracingAccelerationStructureEx");
+  if (!g_nv_attached)  // the BLAS census may have attached it first
+    g_nv_attached = attach_hook(kNvBuildAsEx, kNvBuildAsExRet, reinterpret_cast<void*>(&d_nv),
+                                reinterpret_cast<void**>(&g_orig_nv), "NvAPI_D3D12_BuildRaytracingAccelerationStructureEx");
   g_tlas_attached = attach_hook(kBuildTlas, kBuildTlasRet, reinterpret_cast<void*>(&d_tlas),
                                 reinterpret_cast<void**>(&g_orig_tlas), "GpuApi::BuildTopLevelAccelerationStructure");
   g_create_as_attached = attach_hook(kCreateAs, kCreateAsRet, reinterpret_cast<void*>(&d_create_as),
@@ -1214,6 +1219,13 @@ void attach_rays(bool census, bool timing) {
   g_sdk->logger->InfoF(g_handle, "rt swap: DispatchRays %s - census rows %s, raygen variants %s (%u)",
                        g_rays_attached ? "HOOKED" : "NOT hooked", g_rays_census ? "on" : "off",
                        g_gsgi_attached ? "ON" : (variants ? "NOT attached" : "none"), g_nvar.load());
+}
+
+bool attach_nv_census() {
+  if (!g_nv_attached)
+    g_nv_attached = attach_hook(kNvBuildAsEx, kNvBuildAsExRet, reinterpret_cast<void*>(&d_nv),
+                                reinterpret_cast<void**>(&g_orig_nv), "NvAPI BLAS builds (BLAS census)");
+  return g_nv_attached;
 }
 
 void detach_rays() {

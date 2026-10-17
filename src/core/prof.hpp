@@ -24,7 +24,7 @@ enum Point : uint8_t {
   kNodeExec,   // render_nodes: a wrapped node's Execute (wraps, removals, the debug module)
   kRays,       // rt_lib: DispatchRays (variant choice)
   kGsgi,       // rt_lib: GetShaderGroupIdentifier
-  kEngineBlock,// cb_hooks: the engine constant-block copies (UpdateBuffer / SetComputeShaderConstsRaw)
+  kEngineBlock,// engine_blocks: the engine constant-block copies (UpdateBuffer / SetComputeShaderConstsRaw)
   kDraw,       // passes: around every GpuApi draw (draw subscriptions, draw companions, passes after a draw)
   kPoints
 };
@@ -73,6 +73,7 @@ struct Pause {
 void attach_frames();      // after the core's attach: its own ExecuteParallel hook unless graph_probe has one
 void detach();
 void on_graph_execute();   // from graph_probe's ExecuteParallel detour (when that one is attached)
+void set_frame_timer(bool on);  // [Diagnostics] FrameTimer: the frame time every 10 s in the log ([frame])
 std::string arm(double delay_s, double seconds);  // "" = armed, else why not
 std::string state();       // one line: idle / starts in / measuring, s left
 std::string report();      // the last measurement ("" = none yet)

@@ -9,7 +9,7 @@ local status = ""
 local G                 -- the render graph debug window's state (below)
 
 local kNames = { "Diagnostics.VerboseLog", "Diagnostics.RenderGraphDebug", "Diagnostics.RenderGraphDump", "Diagnostics.Dred",
-                 "Diagnostics.GpuTiming" }
+                 "Diagnostics.GpuTiming", "Diagnostics.BlasCensus", "Diagnostics.FrameTimer" }
 
 local function log(text) print("[REDGraph] " .. text) end
 
@@ -186,6 +186,12 @@ local function draw_host()
     check("DRED in crash reports (restart)", "Diagnostics.Dred",
         "Asks the driver for the GPU page-fault address and breadcrumbs, written to the log on a device\n" ..
         "removal. Costs a little GPU time. Takes effect from the next start.")
+    check("BLAS census (restart)", "Diagnostics.BlasCensus",
+        "Every 10 s in the log: which watched meshes are in the ray-traced scene (static / animated / absent)\n" ..
+        "and what the game's BVH pool writers did. The mods using REDGraph name what is watched.\n" ..
+        "Takes effect from the next start.")
+    check("Frame timer", "Diagnostics.FrameTimer",
+        "The frame time every 10 s in the log - for an on / off comparison of any mod's feature.")
     ImGui.Spacing()
     if ImGui.Button("Status into the log") then
         local ok, s = pcall(function() return Game.RG_Status() end)

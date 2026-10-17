@@ -77,7 +77,7 @@ std::atomic<uint64_t> g_after_accepted{0}, g_after_restored{0}, g_after_stale{0}
 
 // M4c: subscriptions. The engine PSOs carrying a subscribed shader are mapped at creation (pso), and the bind funnel
 // leaves the bound PSO's subscription mask in a thread_local for the dispatch it serves (pso::bound_subs_*).
-constexpr uint32_t kMaxSubs = 8;
+constexpr uint32_t kMaxSubs = 32;  // the mask is a u32
 struct Sub {
   const char* name;
   uint8_t hash[16];
@@ -191,7 +191,7 @@ void d_dispatch_indirect() {
 
 // ---- the graphics wing ----
 
-constexpr uint32_t kMaxDrawSubs = 16;
+constexpr uint32_t kMaxDrawSubs = 32;  // the mask is a u32
 struct DrawSub {
   const char* name;
   uint32_t stage;

@@ -94,7 +94,7 @@ The header documents each call in detail. This table is the map: which call you 
 | ... only inside one node | `patch_scope` (M11) | up to 4 nodes; elsewhere the engine's shader stays |
 | change the engine PSO's pipeline state (cull, fill, depth, blend, write masks, formats) per variant, with or without new bytecode | `patch_state` (M1) | a variant blob `{NULL, 0}` keeps the engine's shader |
 | data into your patched shader | `cbuffer_create` / `cbuffer_write`, `view_create` / `view_create_texture` / `view_set_resource`, `lease_register` (M2) | binds into a **free space0 register of the engine's own tables**, so it costs 0 root-signature DWORDs. See section 5 |
-| the engine's own constants | `cbuffer_feed`, `engine_block` | fog, clouds, `cb12` (the shared per-frame constants) |
+| the engine's own constants | `engine_block_find` (by the writer's name), `cbuffer_feed`, `engine_block` | the host's catalog: fog, clouds, `cb12` (the shared per-frame constants) - `docs/internals.md` "Engine constant blocks" lists it |
 | an extra compute pass right after an engine dispatch, with all its bindings | `companion_register` + `companion_request` (M4a), `companion_scope` | the companion reads exactly what the engine's dispatch had bound |
 | to know when an engine CS dispatches | `dispatch_subscribe` (M4c) | direct and indirect dispatches |
 | raw D3D12 work after a dispatch | `pass_register` + `pass_after_dispatch` (M4b) | |
@@ -292,6 +292,11 @@ The log has the same information in one line at startup: `registration CLOSED - 
     RenderDoc), of DispatchRays with your RT libraries, and - when on at the START - of every node of the engine's render
     graph (groups and job-builder nodes not yet). Switch your patch off and on and read its node's time: that is what
     it costs. Shown under **Host -> GPU time** and in the status report.
+  * `BlasCensus`: is your mesh in the ray-traced BVH (static / updatable / absent), and what the engine's BVH pool
+    writers did - every 10 s as `[blas]`. Name what to watch from your init with `host->census_watch(RG_STAGE_VS, hash,
+    name)` (its draws joined to the BLAS) or `RG_STAGE_CS` (dispatches; for the `m_computeSkinning_*` pool writers);
+    it returns `RG_E_UNAVAILABLE` and costs nothing while the census is off. NVIDIA only.
+  * `FrameTimer` (live): the frame time every 10 s as `[frame]` - switch your feature off and on and compare.
 * **REDGraph window → Host:**
   * **Status into the log** writes REDGraph's counters and settings.
   * **Profile** measures REDGraph's own CPU time per hook point. About 0.3 % of a frame is normal.

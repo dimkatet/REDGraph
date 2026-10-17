@@ -141,6 +141,16 @@ constexpr uintptr_t kBuildBlasBatch = 0x2a40df4;
 constexpr uintptr_t kBuildBlasBatchRet = 0x2a40dec;  // its thunk -> it
 constexpr uintptr_t kNvBuildAsEx = 0x9430;
 constexpr uintptr_t kNvBuildAsExRet = 0x2a410dc;     // the BLAS batch builder -> it
+// CRenderMesh::EvaluatePositions(this, const SRenderNodeImplContext&, const CRenderProxy_Mesh*, char lod, u32 chunk,
+// BufferRef pool, u32 pool offset, UpdateContext&) - writes one chunk's deform pool slot with the m_computeSkinning_*
+// CS its vertex factory / material picks (the BLAS census). Callers: AddProxies (x2, a BLAS's birth) and the update
+// path of UpdateSkinnedInstances (ret below). The chunk's material = *(proxy[+0x118] + (proxy[+0x122 + 2*lod] + chunk)
+// * 48 + 8), its [+0x58] = the RT material handler's index. UpdateSkinnedInstances reuses a built BLAS while
+// proxy[+0x90] < blas[+0x1c] (a change-driven refit).
+constexpr uintptr_t kEvaluatePositions = 0x2930410;
+constexpr uintptr_t kEvaluatePositionsRet = 0x291fa0d;  // UpdateSkinnedInstances' per-instance helper -> it
+constexpr uintptr_t kAddProxiesEvalRet1 = 0x291daef;    // CRenderAccelerationStructure::AddProxies -> it (x2)
+constexpr uintptr_t kAddProxiesEvalRet2 = 0x291dc22;
 constexpr uintptr_t kBuildTlas = 0x2a413f4;
 constexpr uintptr_t kBuildTlasRet = 0x290a91e;       // CRenderLightVolumeCollector::UpdateAccelerationStructures -> it
 constexpr uintptr_t kBufferVa = 0x5c0b00;            // in the device data: + (id - 1) * 0xb0 = a buffer's GPU VA

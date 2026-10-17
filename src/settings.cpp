@@ -12,6 +12,7 @@
 
 #include "rg_host.h"
 #include "core/gpu_timing.hpp"
+#include "core/prof.hpp"
 #include "ini_file.hpp"
 
 namespace rg_settings {
@@ -35,6 +36,12 @@ const Def kDefs[] = {
     {"Diagnostics", "Dred", false, "DRED"},
     // GPU time of every companion / pass (timestamps on the engine's lists, core/gpu_timing) + their debug events.
     {"Diagnostics", "GpuTiming", true, "GPU timing"},
+    // Raster draws of the VS clients watch (rg_host::census_watch) joined to the BLAS geometries the engine
+    // builds - static / updatable / not in the BVH - and the deform pool's writers, every 10 s as [blas]
+    // (core/blas_census). At the start only.
+    {"Diagnostics", "BlasCensus", false, "BLAS census"},
+    // The frame time every 10 s as [frame] (core/prof) - an on/off A/B of any feature against its own log's switches.
+    {"Diagnostics", "FrameTimer", true, "frame timer"},
 };
 constexpr size_t kCount = sizeof(kDefs) / sizeof(kDefs[0]);
 
@@ -64,6 +71,7 @@ void apply_live(size_t i) {
   const rg_host* h = rg_host_get(RG_HOST_API_VERSION);
   if (h && std::strcmp(kDefs[i].key, "VerboseLog") == 0) h->log_set_verbose(g_val[i] > 0.5f ? 1u : 0u);
   if (std::strcmp(kDefs[i].key, "GpuTiming") == 0) core::gpu_timing::set_enabled(g_val[i] > 0.5f);
+  if (std::strcmp(kDefs[i].key, "FrameTimer") == 0) core::prof::set_frame_timer(g_val[i] > 0.5f);
 }
 
 bool parse_bool(const std::string& t, float* out) {

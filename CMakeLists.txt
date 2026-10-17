@@ -7,7 +7,7 @@
 cmake_minimum_required(VERSION 3.20)
 # The release version (the DLL's RED4ext version, the log, the SDK package). The API version is RG_HOST_API_VERSION in
 # include/rg_host.h and changes only with the ABI.
-project(REDGraph VERSION 0.3.4 LANGUAGES CXX)
+project(REDGraph VERSION 0.4.0 LANGUAGES CXX)
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "Cyberpunk 2077 is 64-bit only; configure with a 64-bit generator (-A x64)")
@@ -74,6 +74,7 @@ add_library(redgraph SHARED
   src/core/pso_patch.cpp
   src/core/bindings.cpp
   src/core/rt_lib.cpp
+  src/core/blas_census.cpp
   src/core/passes.cpp
   src/core/graph_probe.cpp
   src/core/graph_debug.cpp
@@ -83,8 +84,8 @@ add_library(redgraph SHARED
   src/core/hlsl.cpp
   src/core/render_flow.cpp
   src/core/render_nodes.cpp
-  src/core/cb_hooks.cpp
-  src/core/cb_hooks.hpp
+  src/core/engine_blocks.cpp
+  src/core/engine_blocks.hpp
   src/core/crash_log.cpp
   src/core/crash_log.hpp
 )

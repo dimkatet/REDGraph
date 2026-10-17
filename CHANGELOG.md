@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0
+
+- New API call `engine_block_find(name)`: the engine constant blocks are now a catalog keyed by the engine's name of the
+  function that writes them (`CRenderInterface::CalculateSharedConstants` = cb12, ...); a block's writer is hooked only
+  when a client asks for it. The four `rg_engine_block` values keep working as before (ids 0-3, always captured).
+- New API call `census_watch(stage, hash, name)` and a new diagnostic `[Diagnostics] BlasCensus`: is a mesh in the
+  ray-traced BVH (static / updatable / absent), and what the engine's BVH pool writers did - every 10 s in the log.
+  The client names the shaders to watch; with the census off the call does nothing.
+- New diagnostic `[Diagnostics] FrameTimer` (live): the frame time every 10 s in the log, for an on / off comparison
+  of any feature. Both new diagnostics are in the REDGraph window.
+- Subscription limits raised: 32 dispatch and 32 draw subscriptions (were 8 / 16).
+- Existing API calls unchanged; API version stays 1 (the two calls are appended to the table).
+
 ## 0.3.4
 
 - Fixed ray-traced client features (e.g. Cyberpunk Render Tweaks' grass shadows and reflection fog) switching off for

@@ -219,7 +219,55 @@ void add(Point p, uint64_t cycles) {
   }
 }
 
+// [Diagnostics] FrameTimer (2026-10-17): the frame time in 10-s windows, measured between two ExecuteParallel calls
+// (one per rendered frame) - the instrument of an on/off A/B of any client's feature, whose switches are in the
+// client's own log with their time. Gaps over 0.25 s (menus, loading) are left out; a window with no frame is not logged.
+namespace {
+std::atomic<bool> g_ft_on{false};
+LONGLONG g_ft_last = 0, g_ft_next = 0;  // the frame thread only
+uint64_t g_ft_frames = 0;
+double g_ft_sec = 0, g_ft_worst = 0;
+
+void frame_timer_tick() {
+  if (!g_ft_on.load(std::memory_order_relaxed)) {
+    g_ft_last = g_ft_next = 0;
+    return;
+  }
+  const LONGLONG now = qpc_now();
+  const double f = qpc_freq();
+  if (g_ft_last) {
+    const double dt = static_cast<double>(now - g_ft_last) / f;
+    if (dt > 0 && dt < 0.25) {
+      ++g_ft_frames;
+      g_ft_sec += dt;
+      if (dt > g_ft_worst) g_ft_worst = dt;
+    }
+  }
+  g_ft_last = now;
+  if (!g_ft_next) {
+    g_ft_next = now + static_cast<LONGLONG>(10.0 * f);
+    g_ft_frames = 0;
+    g_ft_sec = g_ft_worst = 0;
+    return;
+  }
+  if (now < g_ft_next) return;
+  if (g_ft_frames)
+    g_sdk->logger->InfoF(g_handle, "[frame] last 10 s: %llu frames, %.2f fps, frame %.3f ms (worst %.1f)",
+                         static_cast<unsigned long long>(g_ft_frames), g_ft_frames / g_ft_sec,
+                         1000.0 * g_ft_sec / g_ft_frames, 1000.0 * g_ft_worst);
+  g_ft_next = now + static_cast<LONGLONG>(10.0 * f);
+  g_ft_frames = 0;
+  g_ft_sec = g_ft_worst = 0;
+}
+}  // namespace
+
+void set_frame_timer(bool on) {
+  if (g_ft_on.exchange(on) != on)
+    g_sdk->logger->InfoF(g_handle, "[frame] frame timer %s", on ? "ON - a line every 10 s" : "off");
+}
+
 void on_graph_execute() {
+  frame_timer_tick();
   if (g_own_hook) return;
   frame();
   pso::frame_tick();

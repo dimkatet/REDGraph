@@ -6,6 +6,9 @@
 #include <string>
 #include <vector>
 
+// First: it defines RED4EXT_HEADER_ONLY, which Api/v1/SemVer.hpp tests without including it - included after it, the
+// TU gets std::to_wstring(SemVer) declared but never defined (LNK2019 from Relocation's error path).
+#include <RED4ext/Common.hpp>
 #include <RED4ext/Api/v1/PluginHandle.hpp>
 #include <RED4ext/Api/v1/Sdk.hpp>
 
@@ -86,7 +89,7 @@ void draw_companion_count(rg_handle h);
 namespace bindings {
 rg_handle cbuffer_create(uint32_t bytes, uint32_t ring, const void* initial);
 int32_t cbuffer_feed(rg_handle h, uint32_t which, uint32_t offset, uint32_t size);
-// From cb_hooks, after it stored an engine block: copy it into every cbuffer fed from `which`.
+// From engine_blocks, after it stored an engine block: copy it into every cbuffer fed from `which`.
 void on_engine_block(uint32_t which, const void* data, uint32_t size);
 void cbuffer_write(rg_handle h, uint32_t offset, const void* data, uint32_t size);
 rg_handle lease_register(const rg_lease_desc* d);
@@ -148,7 +151,18 @@ int32_t variant_set(rg_handle v, uint32_t on);
 void variant_stats(rg_handle v, rg_rt_variant_stats* out);
 void attach_rays(bool census, bool timing);  // timing: GpuTiming on at the start (raygens of client libraries)
 void detach_rays();
+bool attach_nv_census();  // the NvAPI BLAS build hook for the BLAS census (attached once, shared with the markers)
 }  // namespace rtlib
+
+// blas_census.cpp - [Diagnostics] BlasCensus: raster draws of watched VS joined to the BLAS geometries
+namespace blas_census {
+bool on();
+void enable();  // at Load, before the clients register: their census_watch calls subscribe from then on
+int32_t watch(uint32_t stage, const uint8_t* hash16, const char* name);  // rg_host::census_watch
+void attach();  // at attach: the index-buffer hook + the NvAPI BLAS hook
+void detach();
+void on_nv(const uint8_t* desc);  // from rt_lib's NvAPI BuildEx detour; NULL = params not read
+}  // namespace blas_census
 
 // passes.cpp - M4
 namespace passes {

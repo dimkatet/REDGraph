@@ -14,7 +14,7 @@
 #include <RED4ext/Api/v1/Version.hpp>
 
 #include "rg_host.h"
-#include "core/cb_hooks.hpp"
+#include "core/engine_blocks.hpp"
 #include "core/crash_log.hpp"
 #include "core/graph_debug.hpp"
 #include "core/host.hpp"
@@ -34,7 +34,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle handle, RED4ex
                                         const RED4ext::v1::Sdk* sdk) {
   if (reason == RED4ext::v1::EMainReason::Load) {
     sdk->logger->InfoF(handle, "REDGraph %s loaded (host API %u)", RG_VERSION_STRING, RG_HOST_API_VERSION);
-    cb_hooks::attach(handle, sdk);
+    engine_blocks::attach(handle, sdk);
     core::open(handle, sdk);  // rg_host_get answers from here on
     rg_settings::load();
     float dred = 0.0f, graph = 0.0f, debug = 0.0f;
@@ -44,6 +44,9 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle handle, RED4ex
     rg_settings::get("Diagnostics.RenderGraphDebug", &debug);
     if (graph > 0.5f || debug > 0.5f) core::graph_probe::enable();  // before attach: it widens pso's hooks
     if (debug > 0.5f) core::graph_debug::enable();                   // the CET window's graph debug module
+    float blas = 0.0f;
+    rg_settings::get("Diagnostics.BlasCensus", &blas);
+    if (blas > 0.5f) core::blas_census::enable();  // draw subscriptions: before the registration window closes
     core::drain_clients();  // the clients that loaded before us register now
     core::arm();            // registration stays open for the clients loading after us, until GpuApi::InitDevice
     rg_ui::attach();
@@ -51,7 +54,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle handle, RED4ex
     rg_ui::log_status("game closing");
     crash_log::close();
     core::detach();
-    cb_hooks::detach(handle, sdk);
+    engine_blocks::detach(handle, sdk);
   }
   return true;
 }

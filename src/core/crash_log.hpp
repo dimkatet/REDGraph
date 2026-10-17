@@ -16,6 +16,7 @@
 //   on BEFORE the engine's D3D12CreateDevice: `[Diagnostics] Dred = true` in the plugin's ini, read at Load (costs a
 //   little GPU time - off by default).
 
+#include <RED4ext/Common.hpp>  // first: defines RED4EXT_HEADER_ONLY for Api/v1/SemVer.hpp (see internal.hpp)
 #include <RED4ext/Api/v1/PluginHandle.hpp>
 #include <RED4ext/Api/v1/Sdk.hpp>
 

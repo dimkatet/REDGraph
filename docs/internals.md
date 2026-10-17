@@ -5,7 +5,7 @@ How the host works inside the engine - for people changing REDGraph itself. Modd
 
 Every address below is a Cyberpunk 2077 **2.31** RVA (the exe base is 0x140000000; "0x1401f7224" and "0x1f7224" name
 the same function). They all live in [`src/core/engine_231.hpp`](../src/core/engine_231.hpp) (the constant-block
-hooks keep theirs in `cb_hooks.cpp`). Section [Finding engine addresses](#finding-engine-addresses) says how they were
+hooks keep theirs in `engine_blocks.cpp`). Section [Finding engine addresses](#finding-engine-addresses) says how they were
 found and how to check a new one.
 
 Each mechanism carries the milestone tag the code comments use (M1..M12): the order they were built in.
@@ -22,7 +22,7 @@ src/core/                the host CORE - knows no client
   bindings.cpp           M2  leases: our descriptors staged into the engine's own tables
   rt_lib.cpp             M3  RT libraries at the state-object creator; M12 raygen variants
   passes.cpp             M4  dispatch subscriptions, companions, after-dispatch passes, RestoreState
-  cb_hooks.cpp               engine constant blocks (cb12, fog / cloud b6)
+  engine_blocks.cpp          the catalog of engine constant blocks (cb12, fog / cloud b6, ...), captured on request
   render_flow.cpp        M5  node context per thread, RenderFlow by name, request record / replay, jobs carry node
   render_nodes.cpp       M6-M9 our nodes, declarations, wrap / remove of engine nodes; the debug slots
   graph_probe.cpp            graph walk, dump, census (node -> shaders / resources / DispatchRays)
@@ -104,7 +104,7 @@ native part out (for a bisect).
 | `SRenderFlowInternalData::HandleRequest` 0x1f0f80 | M9 record / replay; census rows | every RenderFlow request | any removal, census |
 | `job::Dispatcher::RunJob` 0x14299c | jobs carry their node | every job submission | node context (scope / census / debug) |
 | `CRenderNodeGraph::ExecuteParallel` 0xa86438 | frame tick: census windows, graph walk, profile | once per frame | always (one detour per frame) |
-| `GpuApi::UpdateBuffer`, `SetComputeShaderConstsRaw` | engine constant blocks | filtered on return address | always unless `no_hooks` |
+| `GpuApi::UpdateBuffer`, `SetComputeShaderConstsRaw` | engine constant blocks (the catalog) | filtered on return address | when one of its entries is asked for (entries 0-3: always), unless `no_hooks` |
 | `GpuApi::InitDevice` 0x7e0bb4 | registration window | once | always |
 
 Detours go through RED4ext's hooking API (`sdk->hooking->Attach`). Other plugins compare prologues in their own Load,
@@ -314,10 +314,24 @@ Every other draw costs one thread-local load.
 
 ## Engine constant blocks
 
-`rg_engine_block` (`cbuffer_feed`, `engine_block`): copies of constant data the engine writes, caught at the write -
-`GpuApi::UpdateBuffer(BufferRef, size, data)` from `CRenderInterface::CalculateSharedConstants` (cb12, size 0x630) and
-`GpuApi::SetComputeShaderConstsRaw(size, data)` (the fog CS b6, the cloud bake's b6, the world clouds' b6). Both detours
-filter on their return address and size before taking a lock.
+A CATALOG of the constant data the engine writes (`engine_blocks.cpp`), each entry caught at its write: a call of
+`GpuApi::UpdateBuffer(BufferRef, size, data)` or `GpuApi::SetComputeShaderConstsRaw(size, data)` from one known engine
+function, matched by the return address (and the size, where fixed). An entry is named after that writer - the
+engine's own name, not a client's use of it. A client asks for one by name at registration,
+`engine_block_find(name)` -> its id (also the `which` of `engine_block` / `cbuffer_feed`; a `cbuffer_feed` is a request
+too); a GpuApi function is hooked only when one of its entries is wanted (at BaseInitialization, after its call site is
+checked, or at once when asked later). The catalog grows by APPENDING - an id never changes. Entries 0-3 are
+`rg_engine_block` of API v1 and are always captured (clients built before the catalog read them without asking).
+
+| id | name (the writer) | hooked call | what |
+|---|---|---|---|
+| 0 | `CRenderVolumetricFogManager::Update` | `SetComputeShaderConstsRaw` | the volumetric fog CS b6 (`SVolFogConstants`) |
+| 1 | `CRenderNode_RenderVolumetricCloudsLighting::Execute` | `SetComputeShaderConstsRaw` | the clouds lighting CS b6 (its self-shadow bake, `53c455b6`) |
+| 2 | `CRenderNode_RenderVolumetricClouds::Execute` | `SetComputeShaderConstsRaw` | the volumetric clouds CS b6 (`VolumetricCludsState`, 192 B; `3dd31a42`) |
+| 3 | `CRenderInterface::CalculateSharedConstants` | `UpdateBuffer` | cb12, the shared per-frame constants (1584 B) |
+
+To add one: find the writer's call into one of the two GpuApi functions (cp2077-symbols + `exe_re`), append
+`{name, function, return RVA, size or 0, what}` to `kCatalog` - one line, no API change.
 
 ## The render graph
 
@@ -489,6 +503,67 @@ RenderFlow requests by type and phase). The headers record the render mode both 
 (`Config::cvPathTracing` / `cvRayTracingEnable`, value at +0x30) and by what ran. [`scripts/sdk_node_reference.py`](../scripts/sdk_node_reference.py)
 turns census files into `sdk/reference/`.
 
+### BLAS census
+
+`[Diagnostics] BlasCensus = true` (at the start; `blas_census.cpp`, NVIDIA only) answers "is this mesh in the BVH, and
+does it move there" every 10 s in the log as `[blas]`:
+
+* **draws -> BLAS**: every indexed draw of a watched VS is joined to the BLAS triangle geometries the engine built, by
+  index-buffer GPU VA + index count - STATIC (no ALLOW_UPDATE), DYNAMIC (updatable, with this window's builds /
+  updates), NONE. Sources: the NvAPI BuildEx of the BLAS batch builder (`rt_lib` `d_nv`), the command list's
+  `IASetIndexBuffer` / `IASetVertexBuffers` (vtable slots 43 / 44, last views per recording thread), draw
+  subscriptions.
+* **the deform pool**: dispatches of the watched compute shaders (the engine's pool writers, `m_computeSkinning_*`),
+  and a detour on `CRenderMesh::EvaluatePositions` (0x2930410): per proxy its caller (birth = `AddProxies`, refit =
+  `UpdateSkinnedInstances`' helper), the chunk material's handler index `material[+0x58]`, the change stamp
+  `proxy[+0x90]` and the watched kernels dispatched inside the call, grouped by (handler, kernels); and which handler
+  each watched kernel ran for. The caller is read from the return address: right only while this detour is the
+  OUTERMOST - another plugin's detour on the same function (a client hooking it for a content fix) shows up as `other`.
+
+The census names no shader: CLIENTS register what it watches, `rg_host::census_watch(stage, hash, name)` (VS = draw
+joins, CS = dispatch counts; up to 32 per stage; register-time; `RG_E_UNAVAILABLE` and nothing subscribed when the
+census is off, so a client calls it unconditionally). Each watch is a host subscription in the shared tables.
+
+The engine's pool writers to watch with `RG_STAGE_CS` - every `m_computeSkinning_*` kernel of 2.31 (the engine's
+names from its shader caches; `(Garment)` = the plain and the garment vertex factory share the hash):
+
+| hash | `m_computeSkinning_...` |
+|---|---|
+| `87271083799749ef6436ca2e5d4e57cd` | MeshStatic |
+| `d1bfa6f08d88d0ef6638eb781d3e4ff0` | (Garment)MeshSkinned |
+| `4f3de49b3c2613f02e4062ac6e0f33d3` | (Garment)MeshExtSkinned |
+| `5ae062215931f69edfdab360b3d340cd` | (Garment)MeshSkinnedPositions |
+| `89f9a274c4063c59b6532766685db5c6` | (Garment)MeshSkinnedPositions_HalfFloat |
+| `75ac457f75f768f013a511c06cad9b10` | (Garment)MeshExtSkinnedPositions |
+| `f94d732e85e6bb5ca1e5edd21444a8ea` | (Garment)MeshExtSkinnedPositions_HalfFloat |
+| `22589590c37bbde464187c58a9e2df32` | MeshSkinnedSingleBonePositions |
+| `5febfc0dc7f181c8ebcdfe93c70e116a` | MeshSkinnedSingleBonePositions_HalfFloat |
+| `b5b904cdce1909ee230e59dddd898255` | (Garment)MeshSkinnedPositionsBatched |
+| `b6b4e954cc12d311b99f68ab6153f0b0` | (Garment)MeshSkinnedPositionsBatched_HalfFloat |
+| `659d02e69b1f62143afd49b7ab03f99e` | (Garment)MeshExtSkinnedPositionsBatched |
+| `6c1336aeaf25c85eb3f487f4ade07ce1` | (Garment)MeshExtSkinnedPositionsBatched_HalfFloat |
+| `3ca133dab2489494f915f856e7f81881` | SpeedTree |
+| `942ad7857ab53926e13b1e688b57f5d8` | SpeedTree_HalfFloat |
+| `beffff77ad7ecb5b0ee40a45e64e79c9` | SpeedTreeBatched |
+| `db18e315fc4fe5e7e894975ec78a1a28` | SpeedTreeBatched_HalfFloat |
+| `d4d296cbd3832626cf46ab08fd9ba8a0` | Vehicle |
+| `aff8bbef5112ae4f05cb6b67f46dc6f9` | Vehicle_HalfFloat |
+| `6fa560bb7edd223ea1c5c3cf9ce2b6f5` | ClothTarps |
+| `514e1a35c671a4c4a4ef8322d23a7aae` | ClothTarps_HalfFloat |
+| `58bc0a97ae62f1bc46742684d531a2b3` | SpidertankTarp |
+| `68721c5b0275ce81e1fc13588dd1d622` | SpidertankTarp_HalfFloat |
+| `0d6f3d14e6759524009f9bd8e7eb1c88` | VerMov |
+| `55243d5f15d3b655b2f9e68f3a818b60` | VerMov_HalfFloat |
+| `f0da288e7c017cfa01010b8afa8508e1` | PassThrough |
+| `fcac8c6cb4a9bfb40a1ef87d2842a6f0` | PassThrough_HalfFloat |
+
+### Frame timer
+
+`[Diagnostics] FrameTimer` (live, `prof.cpp`): the frame time between two `ExecuteParallel` calls, a `[frame]` line
+every 10 s (frames, fps, mean and worst ms; gaps over 0.25 s left out). The instrument of an on / off A/B of any
+client's feature: the client logs its switches, the windows on each side are compared (drop the window a switch falls
+in).
+
 ## Clients tab
 
 The API carries no client identity. Every registering entry of the table is a host-side wrapper (`host.cpp`, `w_*`)
@@ -633,3 +708,9 @@ validates an item; it does not set the order.
    spuddeh/cp2077-native-shaders, author's permission): [`plan-gpu-timing-and-hlsl.md`](plan-gpu-timing-and-hlsl.md).
    `[Diagnostics] GpuTiming` (companions, draw companions, passes; engine dispatches by hash and raygens not yet);
    `compile_hlsl` (cs/vs/ps_6_x; the DXC DLLs are NOT shipped - licence of a stable release unchecked; no hot reload).
+8. **Candidate, not planned: the deform pool** (2026-10-17). Clients that fix the BVH copy of deformed meshes hook the
+   engine's pool writers themselves today (CRT: cloth tarps, garment layers). Three primitives were weighed (CRT
+   `docs/deform-bvh-desync.md` 9c): a per-proxy **refresh** ("pool content changes without a CPU change": the engine's
+   own refit gate `proxy[+0x90]`), a per-chunk **record tag** written into a free field of a batch record (proven only
+   for the batched skinned layout), and per-proxy **custom data** (raw engine structs - rejected). Each has one
+   consumer; built when a second, independent one needs it - the refresh first.

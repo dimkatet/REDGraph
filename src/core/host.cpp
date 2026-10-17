@@ -13,7 +13,7 @@
 #include <cwchar>
 #include <string>
 
-#include "core/cb_hooks.hpp"
+#include "core/engine_blocks.hpp"
 #include "core/clients.hpp"
 #include "core/gpu_timing.hpp"
 #include "core/crash_log.hpp"
@@ -104,7 +104,7 @@ int32_t api_device_ready(rg_device_fn fn, void* user) {
 }
 
 uint64_t api_engine_block(uint32_t which, void* out, uint32_t max_bytes, uint32_t* size) {
-  return cb_hooks::engine_raw_consts(which, out, max_bytes, size);
+  return engine_blocks::latest(which, out, max_bytes, size);
 }
 
 void api_host_stats(rg_host_stats* out) {
@@ -386,6 +386,24 @@ void* h_flow_texture(rg_handle res, uint32_t* gpuapi_id) {
 uint32_t h_flow_transition(rg_handle res, uint32_t state) {
   return own(_ReturnAddress(), clients::sFlow, res, "flow_transition") ? render_flow::flow_transition(res, state) : 0u;
 }
+__declspec(noinline) int32_t w_engine_block_find(const char* name) {
+  int32_t r = RG_E_LATE;
+  if (registration_open()) {
+    const int32_t id = engine_blocks::find(name);
+    r = id < 0 ? RG_E_ARG : (engine_blocks::want(static_cast<uint32_t>(id)), id);
+  }
+  clients::note(_ReturnAddress(), clients::kEngineBlock, r, 0, name ? name : "", "");
+  return r;
+}
+
+__declspec(noinline) int32_t w_census_watch(uint32_t stage, const uint8_t* hash16, const char* name) {
+  const int32_t r = blas_census::watch(stage, hash16, name);
+  if (r != RG_E_UNAVAILABLE)  // census off: not a registration, nothing to show
+    clients::note(_ReturnAddress(), clients::kCensusWatch, r, 0, name,
+                  hash16 ? (std::string(stage == RG_STAGE_VS ? "VS " : "CS ") + hex(hash16)).c_str() : "");
+  return r;
+}
+
 __declspec(noinline) int32_t w_node_remove_clear(rg_handle remove, uint32_t name_hash, const float* value) {
   int32_t r = clients::owner_check(_ReturnAddress(), clients::sRemove, remove, "node_remove_clear");
   if (!r) r = render_nodes::node_remove_clear(remove, name_hash, value);
@@ -458,6 +476,8 @@ const rg_host kHost = {
     &h_after_draw,
     &hlsl::compile,
     &w_node_remove_clear,
+    &w_census_watch,
+    &w_engine_block_find,
 };
 
 }  // namespace
@@ -571,7 +591,8 @@ void attach() {
   if (graph_probe::census()) graph_probe::attach();
   // M12 variants, the census's DispatchRays rows and / or GPU timing of raygens in state objects with our libraries
   rtlib::attach_rays(graph_probe::rays_wanted(), gpu_timing::enabled());
-  prof::attach_frames();                           // the profile timer (RG_Profile)
+  blas_census::attach();  // [Diagnostics] BlasCensus only; after attach_rays (shares its NvAPI BLAS hook)
+  prof::attach_frames();                         // the profile timer (RG_Profile)
   auto s = [](bool want, bool ok) { return want ? (ok ? "on" : "FAILED") : "none"; };
   g_sdk->logger->InfoF(g_handle, "host: ATTACHED at %s - PSO patches %s, engine-table leases %s, RT libraries %s, "
                        "command-list passes %s", g_attach_at, s(want_pso, pso_ok), s(want_cbv, cbv_ok),
@@ -584,6 +605,7 @@ void attach() {
 void detach() {
   if (g_init_hooked) detach_hook(e231::kGpuInitDevice);
   g_init_hooked = false;
+  blas_census::detach();
   rtlib::detach_rays();
   prof::detach();
   graph_probe::detach();

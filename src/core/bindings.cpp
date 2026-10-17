@@ -43,6 +43,7 @@
 #include <cstring>
 #include <mutex>
 
+#include "core/engine_blocks.hpp"
 #include "core/dxbc.hpp"
 #include "core/engine_231.hpp"
 #include "core/clients.hpp"
@@ -1029,10 +1030,11 @@ void cbuffer_write(rg_handle h, uint32_t offset, const void* data, uint32_t size
 
 int32_t cbuffer_feed(rg_handle h, uint32_t which, uint32_t offset, uint32_t size) {
   if (!registration_open()) return RG_E_LATE;
-  if (h <= 0 || static_cast<uint32_t>(h) > g_ncb.load() || which > RG_ENGINE_CB12) return RG_E_ARG;
+  if (h <= 0 || static_cast<uint32_t>(h) > g_ncb.load() || which >= engine_blocks::count()) return RG_E_ARG;
   Cb& c = g_cb[h - 1];
   if (c.feed >= 0) return RG_E_TAKEN;
   if (size == 0 || offset > c.bytes || size > c.bytes - offset) return RG_E_ARG;
+  engine_blocks::want(which);  // a feed is a request: its writer's hook goes on
   c.feed = static_cast<int32_t>(which);
   c.feed_offset = offset;
   c.feed_size = size;
@@ -1048,8 +1050,8 @@ void on_engine_block(uint32_t which, const void* data, uint32_t size) {
     const uint32_t m = size < c.feed_size ? size : c.feed_size;
     cbuffer_write(static_cast<rg_handle>(i + 1), c.feed_offset, data, m);
     if (first && g_sdk)
-      g_sdk->logger->InfoF(g_handle, "native table: cbuffer #%u first filled from engine block %u (%u B) - its leases "
-                           "may swap from now on", i + 1, which, m);
+      g_sdk->logger->InfoF(g_handle, "native table: cbuffer #%u first filled from engine block %u %s (%u B) - its "
+                           "leases may swap from now on", i + 1, which, engine_blocks::name(which), m);
   }
 }
 

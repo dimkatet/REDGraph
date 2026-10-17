@@ -28,4 +28,10 @@ void attach();
 void detach();
 }  // namespace graph_probe
 
+// [Diagnostics] BlasCensus: raster draws of a watch list of VS joined to the BLAS geometries (blas_census.cpp).
+// enable() before arm(): it registers draw subscriptions.
+namespace blas_census {
+void enable();
+}  // namespace blas_census
+
 }  // namespace core
