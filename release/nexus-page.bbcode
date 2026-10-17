@@ -4,7 +4,7 @@
 
 [b]On its own it changes nothing.[/b] You install it because a mod you use needs it - [b]Cyberpunk Render Tweaks[/b] is the first one. Mods built on REDGraph share it: several of them can run at once, and REDGraph keeps them from stepping on each other.
 
-This is the first release. It runs every day under Cyberpunk Render Tweaks and is tested on real hardware, but on few machines - reports are very welcome.[/color]
+It runs every day under Cyberpunk Render Tweaks and is tested on real hardware, but on few machines - reports are very welcome.[/color]
 
 [size=4][b][color=#FF6B6B]Installation instructions[/color][/b][/size]
 
@@ -19,7 +19,9 @@ This is the first release. It runs every day under Cyberpunk Render Tweaks and i
 
 [color=#D4D4D8]Open the Cyber Engine Tweaks overlay: the [b]REDGraph[/b] window shows which mods use it and what each of them changed - every patched shader, every engine node they hook, and anything that was refused, with the reason. When something looks wrong, this is the first place to check which mod touches what.
 
-For the curious: with [font=Courier New]RenderGraphDebug = true[/font] in [font=Courier New]red4ext\plugins\REDGraph\REDGraph.ini[/font] (restart the game), a second window lists every pass the game renders in the current frame, with its shaders - and lets you switch any of them off live. Fun to explore, not something to leave on.[/color]
+For the curious: with [font=Courier New]RenderGraphDebug = true[/font] in [font=Courier New]red4ext\plugins\REDGraph\REDGraph.ini[/font] (restart the game), a second window lists every pass the game renders in the current frame, with its shaders - and lets you switch any of them off live. Fun to explore, not something to leave on.
+
+Two more diagnostics for modders sit in the same window: a [b]BLAS census[/b] (is a mesh in the ray-traced scene, and does it move there) and a [b]frame timer[/b] (the frame time in the log every 10 s, for an on / off comparison).[/color]
 
 [size=4][b][color=#FF6B6B]For modders[/color][/b][/size]
 
@@ -29,6 +31,7 @@ A client plugin can:
 • replace any engine shader (vertex, pixel, compute) with its own version and switch between versions [b]live[/b] - optionally only inside one pass of the frame; change how the game draws with it (culling, wireframe, depth, blending, write masks); several mods can patch different stages of the same draw;
 • feed its own data - buffers, its own textures or the game's - into that shader through the engine's own descriptor tables - no root-signature changes, so it stays out of other mods' way;
 • react to the game's compute dispatches and draws: run code right after one, issue the same dispatch or draw again with its own shader, or record its own work after it;
+• read the engine's own constant buffers (per-frame constants, fog, clouds, ...) by the name of the engine function that writes them, or feed them straight into its shader;
 • add [b]ray-tracing[/b] raygen variants next to the game's own and switch them live, per pass;
 • wrap, remove, replace or add passes of the engine's [b]render graph[/b], and record its own D3D12 work on the engine's command lists, with the engine's textures (by name), its transients and its descriptors;
 • run next to other clients: one target, one winner, by priority; resources are shared only through the render graph, by name.
