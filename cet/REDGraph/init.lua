@@ -2,16 +2,27 @@
 -- read with Game.RG_Get(name) and written with Game.RG_Set(name, value). The render graph debug window is here.
 -- No text below may contain a percent sign: CET's ImGui text calls treat their string as a format.
 
-local S = {}            -- the host's values, by name
+local S = {}            -- the host's values, by name (numbers)
+local D = {}            -- the same, typed for Window Utils' bound controls: booleans
 local plugin = nil      -- the RG_Ping string, nil = REDGraph is not there
 local overlay = false
 local status = ""
 local G                 -- the render graph debug window's state (below)
 
+-- Window Utils is optional (a separate mod): with it the windows are managed by it (position, taskbar, the shared
+-- look) and a right-click on a switch resets it to the shipped default; without it the plain ImGui ones do the job.
+local wu, bind = nil, nil
+local okDefaults, DEF = pcall(require, "options")   -- see options.lua
+if not okDefaults or type(DEF) ~= "table" then DEF = {} end
+
 local kNames = { "Diagnostics.VerboseLog", "Diagnostics.RenderGraphDebug", "Diagnostics.RenderGraphDump", "Diagnostics.Dred",
                  "Diagnostics.GpuTiming", "Diagnostics.BlasCensus", "Diagnostics.FrameTimer" }
 
 local function log(text) print("[REDGraph] " .. text) end
+
+local function refresh_data()
+    for _, n in ipairs(kNames) do D[n] = (S[n] or 0) > 0.5 end
+end
 
 local function refresh()
     local ok, ping = pcall(function() return Game.RG_Ping() end)
@@ -21,6 +32,7 @@ local function refresh()
         return
     end
     for _, n in ipairs(kNames) do S[n] = Game.RG_Get(n) end
+    refresh_data()
 end
 
 local function set(name, value)
@@ -28,6 +40,35 @@ local function set(name, value)
     local ok, res = pcall(function() return Game.RG_Set(name, value) end)
     if not ok or not res then log("RG_Set(" .. name .. ", " .. tostring(value) .. ") failed: " .. tostring(res)) end
     S[name] = Game.RG_Get(name)
+    refresh_data()
+end
+
+-- Window Utils' bound controls edit D and call this (also on a right-click reset): what differs from the host's value
+-- goes to the host. Collected first: a set() re-reads D and would drop the edits after it.
+local function on_bound_change()
+    local changes = {}
+    for _, n in ipairs(kNames) do
+        if D[n] ~= nil and D[n] ~= ((S[n] or 0) > 0.5) then changes[#changes + 1] = { n, D[n] and 1 or 0 } end
+    end
+    for _, c in ipairs(changes) do set(c[1], c[2]) end
+end
+
+-- Window Utils may load after this mod, so it is looked up when a window is first drawn, not only at init.
+local function connect_window_utils()
+    if bind then return end
+    local ok, mod = pcall(GetMod, "WindowUtils")
+    if not ok or not mod or not mod.Controls or not mod.Controls.bind or not mod.Begin or not mod.End then return end
+    wu = mod
+    bind = wu.Controls.bind(D, DEF, on_bound_change, { defs = {} })
+end
+
+local function begin_window(name)
+    if bind then return wu.Begin(name, ImGuiWindowFlags.None) end
+    return ImGui.Begin(name)
+end
+
+local function end_window()
+    if bind then wu.End() else ImGui.End() end
 end
 
 local function on(name) return (S[name] or 0) > 0.5 end
@@ -37,6 +78,10 @@ local function tip(text)
 end
 
 local function check(label, name, text)
+    if bind then
+        bind:Checkbox(label, name, { tooltip = text })
+        return on(name)
+    end
     local v, pressed = ImGui.Checkbox(label, on(name))
     if pressed then set(name, v and 1 or 0) end
     tip(text)
@@ -520,7 +565,7 @@ local function draw_graph_window()
         graph_refresh()
         if not G.head then return end
     end
-    if ImGui.Begin("Render Graph (debug)") then
+    if begin_window("Render Graph (debug)") then
         local h = G.head
         ImGui.Text("graph " .. h.sig:sub(1, 8) .. "  mode " .. h.mode .. "  classes wrapped " .. h.classes ..
             "  census: " .. h.census)
@@ -595,7 +640,7 @@ local function draw_graph_window()
             end
         end
     end
-    ImGui.End()
+    end_window()
 end
 
 registerForEvent("onInit", function()
@@ -613,9 +658,21 @@ registerForEvent("onOverlayOpen", function()
 end)
 registerForEvent("onOverlayClose", function() overlay = false end)
 
+-- Re-read the host's values while the window is open (another client of REDGraph's settings may change them).
+local sinceRefresh = 0
+registerForEvent("onUpdate", function(dt)
+    if not overlay or not plugin then return end
+    sinceRefresh = sinceRefresh + dt
+    if sinceRefresh < 0.5 then return end
+    sinceRefresh = 0
+    for _, n in ipairs(kNames) do S[n] = Game.RG_Get(n) end
+    refresh_data()
+end)
+
 registerForEvent("onDraw", function()
     if not overlay then return end
-    if ImGui.Begin("REDGraph") then
+    connect_window_utils()
+    if begin_window("REDGraph") then
         if not plugin then
             ImGui.TextWrapped("REDGraph's RED4ext plugin is not loaded. Install RED4ext and keep\n" ..
                 "red4ext/plugins/REDGraph/ from REDGraph's archive.")
@@ -631,6 +688,6 @@ registerForEvent("onDraw", function()
             ImGui.EndTabBar()
         end
     end
-    ImGui.End()
+    end_window()
     if plugin then draw_graph_window() end
 end)

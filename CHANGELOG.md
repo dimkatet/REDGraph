@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- The CET windows use Window Utils when it is installed (right-click on a switch resets it); without it they look as before.
+
 ## 0.4.1
 
 - Fixed: `[Diagnostics] FrameTimer` logged nothing unless `RenderGraphDump` was also on.
