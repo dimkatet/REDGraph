@@ -397,7 +397,7 @@ bool d_create(void* out, const uint32_t* in) {
 }
 
 // ---- M12: raygen variants + the one DispatchRays hook ----
-constexpr uint32_t kMaxVar = 64;  // raygen variants, every client together
+constexpr uint32_t kMaxVar = 128;  // raygen variants, every client together (64 was full in CRT 2026-10-19)
 struct Var {
   uint32_t lib;
   wchar_t raygen[64], variant[64];
@@ -1143,11 +1143,21 @@ const void* d_gsgi(uint32_t id, uint32_t group) {
 
 rg_handle variant_add(rg_handle lib, const char* raygen, const char* variant, const char* node) {
   if (!registration_open()) return RG_E_LATE;
-  if (lib <= 0 || static_cast<uint32_t>(lib) > g_n.load() || !raygen || !variant || !*raygen || !*variant ||
-      std::strlen(raygen) >= 64 || std::strlen(variant) >= 64)
-    return RG_E_ARG;
+  if (lib <= 0 || static_cast<uint32_t>(lib) > g_n.load()) return RG_E_ARG;
+  // Any refusal below takes the library with it: a variants-only blob without its variant would be SWAPPED in for
+  // the engine's library (M3) and break that RT pass (CRT 2026-10-19: RG_E_FULL left three such libraries in -> crash).
+  const auto refuse_lib = [&](int32_t code, const char* why) {
+    g_sdk->logger->ErrorF(g_handle, "host: RT raygen variant '%s' REFUSED - %s; library '%s' refused with it",
+                          variant ? variant : "?", why, g_libs[lib - 1].name);
+    clients::reason(why);
+    g_libs[lib - 1].refused = true;
+    clients::refused(clients::kRtLib, lib, why);
+    return static_cast<rg_handle>(code);
+  };
+  if (!raygen || !variant || !*raygen || !*variant || std::strlen(raygen) >= 64 || std::strlen(variant) >= 64)
+    return refuse_lib(RG_E_ARG, "bad raygen / variant name");
   const uint32_t n = g_nvar.load();
-  if (n >= kMaxVar) return RG_E_FULL;
+  if (n >= kMaxVar) return refuse_lib(RG_E_FULL, "the raygen variant table is full");
   // An export name is ONE function in a state object: a second library on the same engine library exporting the same
   // name is left out at the bake (arm_add), and GetShaderIdentifier would hand its variant the FIRST one's shader.
   for (uint32_t i = 0; i < n; ++i) {

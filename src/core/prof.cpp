@@ -185,7 +185,10 @@ void frame() {
   if (now >= g_end) finish(now);
 }
 
+void frame_timer_tick();  // [Diagnostics] FrameTimer, below - ticked here too: without the census this is the only hook
+
 void d_execute_parallel(const void* graph, const void* ctx, void* builder) {
+  frame_timer_tick();
   frame();
   pso::frame_tick();
   bindings::frame_tick();

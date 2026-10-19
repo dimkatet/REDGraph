@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1
+
+- Fixed: `[Diagnostics] FrameTimer` logged nothing unless `RenderGraphDump` was also on.
+- Fixed: a crash when an RT raygen variant was refused because the variant table was full - its library replaced the
+  game's own. Any refused variant now takes its library with it; the table holds 128 variants (was 64).
+
 ## 0.4.0
 
 - New API call `engine_block_find(name)`: the engine constant blocks are now a catalog keyed by the engine's name of the
