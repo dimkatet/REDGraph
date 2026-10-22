@@ -1,11 +1,8 @@
 # Changelog
 
-## Unreleased
-
-- The CET windows use Window Utils when it is installed (right-click on a switch resets it); without it they look as before.
-
 ## 0.4.1
 
+- The CET windows use Window Utils when it is installed (right-click on a switch resets it); without it they look as before.
 - Fixed: `[Diagnostics] FrameTimer` logged nothing unless `RenderGraphDump` was also on.
 - Fixed: a crash when an RT raygen variant was refused because the variant table was full - its library replaced the
   game's own. Any refused variant now takes its library with it; the table holds 128 variants (was 64).
