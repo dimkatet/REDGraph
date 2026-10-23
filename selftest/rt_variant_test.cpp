@@ -59,7 +59,7 @@ void register_with(const rg_host* host, int mode) {
   g_host = host;
   g_mode = mode;
   static const rg_blob blob = {patches::kRtVariantTest318cee44Bytes, patches::kRtVariantTest318cee44Size};
-  const auto h = hash_literal::hash_from_hex("318cee441b4f0c3b27de656dff3c59c0");
+  const auto h = hash_literal::hash_from_hex("535195dc118b6fb6d0efd79e8be4115a");
   const rg_handle lib = host->rtlib_register("rt_variant_test_318cee44 (M12 self-test)", h.data(), blob, 100);
   const char* node = mode == 1 ? "CRenderNode_RenderRayTracedGlobalShadow" : "CRenderNode_VolumetricFog";
   g_var = lib > 0 ? host->rt_variant(lib, "rgs_shadow_main", "rgtest_rgs_shadow_lit", node) : lib;

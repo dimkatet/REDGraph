@@ -13,7 +13,7 @@ if(RED4EXT_SDK_DIR)
 else()
   include(FetchContent)
   FetchContent_Declare(red4ext_sdk GIT_REPOSITORY https://github.com/WopsS/RED4ext.SDK.git
-                       GIT_TAG bbc8c5c7a4a68567f015968c5301e718e3fce238)  # the commit REDGraph is built against
+                       GIT_TAG 0f5eba42a4cf3a1161ad3de0b4ed6f1901ec169e)  # the commit REDGraph is built against
   FetchContent_MakeAvailable(red4ext_sdk)
 endif()
 

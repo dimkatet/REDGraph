@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.2
+
+- **Game 2.5.** This version runs on Cyberpunk 2077 2.5 only (needs RED4ext for 2.5); for 2.31 keep 0.4.1.
+- `RG_ENGINE_CB12` is 2512 bytes on 2.5 (was 1584): the game added fields to cb12.
+- API unchanged; API version stays 1.
+
 ## 0.4.1
 
 - The CET windows use Window Utils when it is installed (right-click on a switch resets it); without it they look as before.

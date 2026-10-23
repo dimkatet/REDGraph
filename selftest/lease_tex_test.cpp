@@ -359,7 +359,7 @@ void register_with(const rg_host* host, bool on, bool runtime_hlsl) {
     host->log(RG_LOG_ERROR, "lease tex test: the host is older than view_create_texture - not run");
     return;
   }
-  static constexpr auto kLutCs = hash_literal::hash_from_hex("88c57ef1799c4d87f1f6b68eaee49f75");
+  static constexpr auto kLutCs = hash_literal::hash_from_hex("e1c6df2fe4f82e7992a8a1e4d66df9d5");  // ACES2019, 2.5
   rg_blob cs{lease_tex::kCSBytes, lease_tex::kCSSize};
   if (runtime_hlsl) {
     cs = runtime_blob(host);

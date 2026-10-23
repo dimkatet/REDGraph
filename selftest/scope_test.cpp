@@ -51,7 +51,7 @@ void register_with(const rg_host* host, int mode) {
   rg_patch_desc d{};
   d.name = "selftest: PS 0c359133 swapped for itself (M11)";
   d.stage = RG_STAGE_PS;
-  const auto h = hash_literal::hash_from_hex("0c35913398007b9717872af88f5f480f");
+  const auto h = hash_literal::hash_from_hex("f8a34e57b02fda801d4a3f0e0a0c1a02");
   for (int k = 0; k < 16; ++k) d.hash[k] = h[k];
   d.variants = &blob;
   d.variant_count = 1;

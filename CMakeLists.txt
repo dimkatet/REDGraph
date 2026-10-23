@@ -7,7 +7,7 @@
 cmake_minimum_required(VERSION 3.20)
 # The release version (the DLL's RED4ext version, the log, the SDK package). The API version is RG_HOST_API_VERSION in
 # include/rg_host.h and changes only with the ABI.
-project(REDGraph VERSION 0.4.1 LANGUAGES CXX)
+project(REDGraph VERSION 0.4.2 LANGUAGES CXX)
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "Cyberpunk 2077 is 64-bit only; configure with a 64-bit generator (-A x64)")
@@ -40,7 +40,7 @@ elseif(RG_RED4EXT_SDK_DIR)
 else()
   include(FetchContent)
   FetchContent_Declare(red4ext_sdk GIT_REPOSITORY https://github.com/WopsS/RED4ext.SDK.git
-                       GIT_TAG bbc8c5c7a4a68567f015968c5301e718e3fce238)  # keep in sync with sdk/examples/
+                       GIT_TAG 0f5eba42a4cf3a1161ad3de0b4ed6f1901ec169e)  # keep in sync with sdk/examples/
   FetchContent_MakeAvailable(red4ext_sdk)
 endif()
 

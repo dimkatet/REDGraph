@@ -79,7 +79,7 @@ enum rg_engine_block {
   RG_ENGINE_FOG_B6 = 0,          /* CRenderVolumetricFogManager::Update - the fog CS b6 (SVolFogConstants) */
   RG_ENGINE_CLOUD_BAKE_B6 = 1,   /* the cloud self-shadow bake 53c455b6's b6 */
   RG_ENGINE_CLOUD_WORLD_B6 = 2,  /* the world clouds 3dd31a42's b6 (VolumetricCludsState, 192 B) */
-  RG_ENGINE_CB12 = 3             /* cb12, CRenderInterface::CalculateSharedConstants (1584 B) */
+  RG_ENGINE_CB12 = 3             /* cb12, CRenderInterface::CalculateSharedConstants (2512 B; 1584 before 2.5) */
 };
 /* A state of a patch / lease, as stats report it. */
 enum rg_state { RG_STATE_PENDING = 0, RG_STATE_OK = 1, RG_STATE_REFUSED = 2 };

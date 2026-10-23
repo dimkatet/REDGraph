@@ -26,8 +26,8 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 TOOLS = ROOT / "sdk" / "tools"
 
-RT_HASH = "318cee441b4f0c3b27de656dff3c59c0"
-SKY_HASH = "0c35913398007b9717872af88f5f480f"
+RT_HASH = "535195dc118b6fb6d0efd79e8be4115a"
+SKY_HASH = "f8a34e57b02fda801d4a3f0e0a0c1a02"
 SKY_VS_HASH = "69090ccdf2e91e0bd1cc70d88a0b8434"  # the sky passes' VS: with SKY_HASH in one PSO (ComposeTest)
 
 

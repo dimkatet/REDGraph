@@ -48,7 +48,7 @@ void register_with(const rg_host* host, int mode) {
 #else
   g_host = host;
   static const rg_blob blob = {patches::kRtSwapTest318cee44Bytes, patches::kRtSwapTest318cee44Size};
-  const auto h = hash_literal::hash_from_hex("318cee441b4f0c3b27de656dff3c59c0");
+  const auto h = hash_literal::hash_from_hex("535195dc118b6fb6d0efd79e8be4115a");
   g_lib = host->rtlib_register("rt_swap_test_318cee44 (M3 swap self-test)", h.data(), blob, 100);
   if (g_lib <= 0 || host->node_wrap("CRenderNode_RenderRayTracedGlobalShadow", &on_shadow, nullptr, nullptr) <= 0) {
     char line[120];

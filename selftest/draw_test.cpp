@@ -84,7 +84,7 @@ void register_with(const rg_host* host, bool on) {
     host->log(RG_LOG_ERROR, "draw test: the host is older than the draw wing - not run");
     return;
   }
-  const auto sky = hash_literal::hash_from_hex("5f079e105fa45ba904cd166a052372b8");
+  const auto sky = hash_literal::hash_from_hex("b932ca8eb30728a8635f07647830cfd9");
   const auto vs = hash_literal::hash_from_hex("69090ccdf2e91e0bd1cc70d88a0b8434");
   rg_pso_state wire{};
   wire.struct_size = sizeof wire;

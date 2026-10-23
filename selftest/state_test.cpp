@@ -62,7 +62,7 @@ void register_with(const rg_host* host, bool on) {
   rg_patch_desc d{};
   d.name = "selftest: sky PS 5f079e10, state only";
   d.stage = RG_STAGE_PS;
-  const auto h = hash_literal::hash_from_hex("5f079e105fa45ba904cd166a052372b8");
+  const auto h = hash_literal::hash_from_hex("b932ca8eb30728a8635f07647830cfd9");
   for (int k = 0; k < 16; ++k) d.hash[k] = h[k];
   d.variants = keep;
   d.variant_count = 2;

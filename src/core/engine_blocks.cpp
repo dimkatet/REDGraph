@@ -19,8 +19,8 @@ namespace engine_blocks {
 namespace {
 
 // 2.31 RVAs (cp2077-symbols data/names_by_address.csv, ea - 0x140000000).
-constexpr uintptr_t kUpdate3 = 0x1f088c;  // ?UpdateBuffer@GpuApi@@YAXUBufferRef@1@IPEBX@Z
-constexpr uintptr_t kRawCS = 0x1ee3cc;    // ?SetComputeShaderConstsRaw@GpuApi@@YAXIPEBX@Z
+constexpr uintptr_t kUpdate3 = 0x334328;  // ?UpdateBuffer@GpuApi@@YAXUBufferRef@1@IPEBX@Z
+constexpr uintptr_t kRawCS = 0x41a780;    // ?SetComputeShaderConstsRaw@GpuApi@@YAXIPEBX@Z
 enum Fn : uint8_t { kFnUpdate3 = 0, kFnRawCS = 1, kFns = 2 };
 
 // THE CATALOG - append only (an index is an id clients hold). name = the writing engine function (cp2077-symbols);
@@ -35,18 +35,18 @@ struct Entry {
 };
 const Entry kCatalog[] = {
     // 0-3: rg_engine_block of API v1 (RG_ENGINE_FOG_B6, _CLOUD_BAKE_B6, _CLOUD_WORLD_B6, _CB12) - always captured.
-    {"CRenderVolumetricFogManager::Update", kFnRawCS, 0x61afb0, 0,
+    {"CRenderVolumetricFogManager::Update", kFnRawCS, 0x7f93f0, 0,
      "the volumetric fog CS constants (b6, SVolFogConstants)"},
-    {"CRenderNode_RenderVolumetricCloudsLighting::Execute", kFnRawCS, 0x61c047, 0,
+    {"CRenderNode_RenderVolumetricCloudsLighting::Execute", kFnRawCS, 0x7f3896, 0,
      "the volumetric clouds lighting CS constants (b6 of its self-shadow bake, 53c455b6)"},
-    {"CRenderNode_RenderVolumetricClouds::Execute", kFnRawCS, 0x61b89c, 0,
+    {"CRenderNode_RenderVolumetricClouds::Execute", kFnRawCS, 0x7f2672, 0,
      "the volumetric clouds CS constants (b6, VolumetricCludsState, 192 B; 3dd31a42)"},
-    {"CRenderInterface::CalculateSharedConstants", kFnUpdate3, 0x78673a, 1584,
+    {"CRenderInterface::CalculateSharedConstants", kFnUpdate3, 0x229cf54, 2512,
      "the shared per-frame constants (cb12)"},
 };
 constexpr uint32_t kCount = sizeof(kCatalog) / sizeof(kCatalog[0]);
 constexpr uint32_t kLegacy = 4;      // always captured
-constexpr uint32_t kMaxBytes = 2048; // the most of one block kept
+constexpr uint32_t kMaxBytes = 4096; // the most of one block kept (cb12 is 2512 B since 2.5)
 
 // Every parameter is declared register-wide and forwarded untouched: BufferRef is 4 bytes and trivially copyable
 // (passed in a register).

@@ -577,7 +577,7 @@ void on_bake(void*, const rg_dispatch_info*) {
 void register_with(const rg_host* host) {
   g_host = host;
   g_t64 = host->flow_register("t64 (cloud shadow map)", 0x583c0f7fu);
-  const auto bake = hash_literal::hash_from_hex("53c455b664225ba5849d29badc41d3fe");
+  const auto bake = hash_literal::hash_from_hex("9de16e4e3fd705e2508d938f0c7f7231");
   const rg_handle sub = g_t64 > 0 ? host->dispatch_subscribe("flow probe: t64 at 53c455b6", bake.data(), &on_bake, nullptr)
                                    : g_t64;
   if (g_t64 <= 0 || sub <= 0) host->log(RG_LOG_ERROR, "flow probe: not registered");
@@ -609,7 +609,7 @@ void register_with(const rg_host* host) {
       host->node_use(g_reader, g_tmp_by_name, RG_FLOW_READ | RG_FLOW_KEEP) != 0 ||
       host->device_ready(&on_device, nullptr) <= 0)
     host->log(RG_LOG_ERROR, "node content test: not registered");
-  const auto fog_cs = hash_literal::hash_from_hex("a58d01db6b07b209253f108b5a0e8760");
+  const auto fog_cs = hash_literal::hash_from_hex("20e195825e065240442fe0cfe8d0c934");
   const auto fog_ind = hash_literal::hash_from_hex("5c7ab952808010eb4005e1858d4a864b");
   g_wrap_fog = host->node_wrap("CRenderNode_VolumetricFog", &on_fog_before, &on_fog_after, nullptr);
   g_wrap_lighting = host->node_wrap("Lighting", &on_lighting_before, &on_lighting_after, nullptr);
@@ -643,7 +643,7 @@ void register_with(const rg_host* host) {
   if (g_color <= 0 || g_depth <= 0 ||
       host->node_wrap("CRenderNode_RenderVolumetricClouds", nullptr, &on_clouds_after, nullptr) <= 0)
     host->log(RG_LOG_ERROR, "node replace test: not registered");
-  const auto clouds_cs = hash_literal::hash_from_hex("3dd31a426b94f2634802d20d2a04e88b");
+  const auto clouds_cs = hash_literal::hash_from_hex("c4a2262b1f9cc69459b9bab442f6c81e");
   if (g_remove <= 0 ||
       host->dispatch_subscribe("remove test: clouds CS 3dd31a42", clouds_cs.data(), &on_removed_dispatch, nullptr) <= 0)
     host->log(RG_LOG_ERROR, "node remove test: not registered");
