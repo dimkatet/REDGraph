@@ -217,7 +217,11 @@ bool known_ctx(const uint8_t* c) {
 // is ever noted) the TLS value is taken as is, as before.
 uint8_t* current_ctx() {
   uint8_t* c = g_get_ctx();
-  return !g_nctx.load(std::memory_order_relaxed) || known_ctx(c) ? c : nullptr;
+  // The bad TLS value is a small integer (0xff0000); a real context is a heap pointer. The known list alone is not
+  // enough: it is capped (kMaxCtx) and a node's context may be bound before the bind funnel noted it.
+  return !g_nctx.load(std::memory_order_relaxed) || known_ctx(c) || reinterpret_cast<uintptr_t>(c) >= 0x100000000ull
+             ? c
+             : nullptr;
 }
 
 // [-1] the template's RTTI locator (kept in place, nothing should need it), [0..5] the vtable.

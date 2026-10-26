@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.1
+
+- Fixed (0.5.0 only): a mod's code that runs at the end of a render node (for example Cyberpunk Render Tweaks'
+  reflection fog) could be skipped for good, so its option did nothing. The 0.5.0 crash fix on game 2.5 was too strict.
+
 ## 0.5.0
 
 - For mod developers: the A/B profile (`[Diagnostics] ABProfile`) - a mod registers a switch per feature
