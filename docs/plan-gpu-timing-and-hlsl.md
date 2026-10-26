@@ -138,7 +138,8 @@ and, with `LeaseTexTest` on, that test's companion compiled at runtime from `lea
 the "it runs" proof. `build_and_deploy.ps1 -Dxc <bin/x64>` copies the two DLLs for LOCAL testing.
 - NOT shipped: the local DXC is a PREVIEW (1.10.2605) under a TIME-LIMITED Microsoft licence (`LICENSE-MS.txt`:
   ends 30 days after the commercial release). Check a STABLE release zip's licence files before any package.
-- hot reload NOT built: a registered patch / companion cannot take a new blob (no such host mechanism - a gap of its own).
+- hot reload: BUILT 2026-10-24 as `[Dev] ShaderHotReload` (a watched folder, `.dxbc` / `.ll`, all-or-nothing clone
+  rebuild) - `internals.md` "Shader hot reload (dev)".
 - check: RED4ext scans `red4ext/plugins/<dir>/` for DLLs - it must not choke on `dxcompiler.dll` / `dxil.dll` there.
 
 ## 7. The current frame, read-only (framework item, agreed 2026-10-11) - NOT built

@@ -15,7 +15,7 @@ namespace core::clients {
 
 enum Kind : uint8_t {
   kPatch, kPatchScope, kCompanion, kCompanionScope, kLease, kCbuffer, kFeed, kView, kRtLib, kRtVariant, kPass,
-  kSubscribe, kDeviceReady, kFlow, kNode, kNodeUse, kNodeAlloc, kWrap, kRemove, kPatchState, kWrapUse, kDrawSubscribe, kDrawCompanion, kDrawCompanionScope, kCensusWatch, kEngineBlock, kKinds
+  kSubscribe, kDeviceReady, kFlow, kNode, kNodeUse, kNodeAlloc, kWrap, kRemove, kPatchState, kWrapUse, kDrawSubscribe, kDrawCompanion, kDrawCompanionScope, kCensusWatch, kEngineBlock, kAbSwitch, kKinds
 };
 
 // A client reached the table: rg_host_get from module of `addr`, or the host ran its waiting init `fn`.
@@ -49,6 +49,7 @@ void refused(Kind kind, rg_handle h, const char* why);
 // The name a registration got (for a scope / use line), "" = none.
 std::string name_of(Kind kind, rg_handle h);
 std::string target_of(Kind kind, rg_handle h);
+rg_handle parent_of(Kind kind, rg_handle h);  // the `parent` its note carried (rt_variant: the library)
 // The client (its module's file name) that made that registration, "" = unknown.
 std::string client_of(Kind kind, rg_handle h);
 

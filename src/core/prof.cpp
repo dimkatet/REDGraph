@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <mutex>
 
+#include "core/ab.hpp"
 #include "core/engine_231.hpp"
 #include "core/gpu_timing.hpp"
 #include "core/internal.hpp"
@@ -15,6 +16,7 @@ namespace core::prof {
 
 std::atomic<bool> g_on{false};
 thread_local uint64_t t_paused = 0;
+thread_local uint64_t t_ours = 0;
 
 namespace {
 
@@ -53,6 +55,7 @@ ExecuteParallel_t g_orig = nullptr;
 enum State { kIdle, kArmed, kMeasuring };
 std::mutex g_mu;
 std::atomic<State> g_state{kIdle};
+bool g_ab = false;  // the A/B profile runs (under g_mu): the points count, the timer profile is refused
 LONGLONG g_start = 0, g_end = 0;  // QPC: measuring starts / ends
 double g_seconds = 0;
 uint64_t g_frames = 0, g_tsc0 = 0;
@@ -94,7 +97,7 @@ void begin(LONGLONG now) {
 }
 
 void finish(LONGLONG now) {
-  g_on.store(false);
+  g_on.store(g_ab);
   g_state = kIdle;
   const double secs = static_cast<double>(now - g_qpc0.QuadPart) / qpc_freq();
   const double tsc_per_us = static_cast<double>(__rdtsc() - g_tsc0) / (secs * 1e6);  // the TSC rate, measured
@@ -193,7 +196,11 @@ void d_execute_parallel(const void* graph, const void* ctx, void* builder) {
   pso::frame_tick();
   bindings::frame_tick();
   gpu_timing::frame_tick();
+  shader_reload::frame_tick();
+  readback::frame_tick();
+  ab::frame_begin();
   g_orig(graph, ctx, builder);
+  ab::frame_end();
 }
 
 }  // namespace
@@ -276,6 +283,13 @@ void on_graph_execute() {
   pso::frame_tick();
   bindings::frame_tick();
   gpu_timing::frame_tick();
+  shader_reload::frame_tick();  // with the census on, graph_probe's detour is the only frame hook
+  readback::frame_tick();
+  ab::frame_begin();
+}
+
+void on_graph_executed() {
+  if (!g_own_hook) ab::frame_end();
 }
 
 void attach_frames() {
@@ -301,6 +315,7 @@ std::string arm(double delay_s, double seconds) {
   if (seconds < 1 || seconds > 600 || delay_s < 0 || delay_s > 600) return "delay 0..600 s, length 1..600 s";
   std::lock_guard<std::mutex> g(g_mu);
   if (g_state != kIdle) return "already running";
+  if (g_ab) return "an A/B profile is running (RG_AB)";
   const double f = qpc_freq();
   g_start = qpc_now() + static_cast<LONGLONG>(delay_s * f);
   g_end = g_start + static_cast<LONGLONG>(seconds * f);
@@ -330,5 +345,21 @@ std::string report() {
   std::lock_guard<std::mutex> g(g_mu);
   return g_report;
 }
+
+void client_time(const char* what, const char* name, uint64_t cycles) { ab::client_add(what, name, cycles); }
+
+bool set_ab(bool on) {
+  std::lock_guard<std::mutex> g(g_mu);
+  if (on && g_state != kIdle) return false;
+  g_ab = on;
+  g_on.store(on || g_state == kMeasuring);
+  return true;
+}
+
+void totals(uint64_t cycles[kPoints]) {
+  for (uint32_t p = 0; p < kPoints; ++p) cycles[p] = g_cycles[p].load(std::memory_order_relaxed);
+}
+
+const char* point_name(uint32_t p) { return p < kPoints ? kName[p] : "?"; }
 
 }  // namespace core::prof

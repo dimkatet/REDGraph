@@ -33,6 +33,7 @@ constexpr uint32_t kPairs = 4096;  // pairs per frame (a draw companion is timed
 constexpr uint32_t kCount[kKinds] = {8, 8, 8, 256, 64, 64};
 constexpr uint32_t base_of(uint32_t k) { return k == 0 ? 0 : base_of(k - 1) + kCount[k - 1]; }
 constexpr uint32_t kItems = base_of(kKinds);
+static_assert(kItems == kItemCount && base_of(kNode) == kNodeBase, "gpu_timing.hpp: kItemCount / kNodeBase");
 constexpr uint16_t kEmpty = 0xfffe, kIgnore = 0xffff;  // the slot's empty pair; a pair begun and never ended
 static_assert(kItems < kEmpty);
 constexpr uint32_t kMaskWords = (kItems + 63) / 64;
@@ -50,6 +51,7 @@ struct Slot {
   std::atomic<bool> empty_done{false};
   bool used = false;                               // recorded into since the last read
   uint16_t item[kPairs];
+  bool direct[kPairs];                             // recorded on a direct-queue list (the GPU span: nodes on it)
 };
 Slot g_slot[kRing];
 std::atomic<uint32_t> g_cur{0};
@@ -68,8 +70,13 @@ struct Item {
   double ema = -1, last = 0;
   uint32_t per_frame = 0;
   uint64_t frames = 0, rejected = 0, late = 0;
+  double total = 0;        // the A/B profile's running sum (ms over every frame read)
+  uint64_t bad_frames = 0;  // frames whose reading of the item was incomplete
 };
 Item g_item[kItems];
+std::atomic<int16_t> g_item_node[kItems] = {};  // 1 + the node class an item of ours was recorded in (0 none)
+double g_span_total = 0;
+uint64_t g_span_frames = 0;
 std::atomic<const char*> g_node_name[256] = {};
 std::mutex g_mu;  // the stats: frame_tick writes, report reads
 uint64_t g_read = 0, g_late = 0, g_overflow = 0;
@@ -163,6 +170,7 @@ void read(uint32_t si) {
   uint64_t bad[kMaskWords];  // items whose frame is incomplete
   for (uint32_t w = 0; w < kMaskWords; ++w) bad[w] = s.refused[w].load();
   uint64_t late = 0;
+  uint64_t span_b = UINT64_MAX, span_e = 0;
   for (uint32_t p = 0; p < n; ++p) {
     const uint16_t it = s.item[p];
     if (it == kIgnore) continue;
@@ -183,6 +191,10 @@ void read(uint32_t si) {
     }
     sum[it] += ms;
     ++cnt[it];
+    if (s.direct[p] && it >= kNodeBase && it < kNodeBase + kCount[kNode]) {
+      span_b = b < span_b ? b : span_b;
+      span_e = e > span_e ? e : span_e;
+    }
   }
   std::memset(rb, 0, size_t(n) * 2 * sizeof(uint64_t));
   std::lock_guard g(g_mu);
@@ -190,11 +202,20 @@ void read(uint32_t si) {
   g_late += late;
   if (s.n.load() > kPairs) ++g_overflow;
   if (overhead >= 0) smooth(&g_overhead, overhead);
+  if (span_e > span_b && static_cast<double>(span_e - span_b) * g_ms_per_tick < 4 * kMaxMs) {
+    g_span_total += static_cast<double>(span_e - span_b) * g_ms_per_tick;
+    ++g_span_frames;
+  }
   for (uint32_t i = 0; i < kItems; ++i) {
     Item& t = g_item[i];
     t.late += late_item[i];
     t.rejected += rej_item[i];
-    if (!cnt[i] || bit(bad, i)) continue;
+    if (bit(bad, i)) {
+      ++t.bad_frames;
+      continue;
+    }
+    t.total += sum[i];
+    if (!cnt[i]) continue;
     smooth(&t.ema, sum[i]);
     t.last = sum[i];
     t.per_frame = cnt[i];
@@ -209,6 +230,7 @@ uint32_t take_pair(Slot& s, uint16_t item) {
     return UINT32_MAX;
   }
   s.item[p] = item;
+  s.direct[p] = false;
   return p;
 }
 
@@ -220,6 +242,13 @@ bool active() { return g_active.load(std::memory_order_relaxed); }
 void set_node_timing(bool on) { g_nodes = on; }
 void set_node_name(int32_t handle, const char* n) {
   if (handle > 0 && static_cast<uint32_t>(handle) <= kCount[kNode]) g_node_name[handle - 1].store(n);
+}
+
+const char* node_name(int32_t handle) {
+  const char* n = handle > 0 && static_cast<uint32_t>(handle) <= kCount[kNode]
+                      ? g_node_name[handle - 1].load(std::memory_order_acquire)
+                      : nullptr;
+  return n ? n : "?";
 }
 
 void frame_tick() {
@@ -265,6 +294,12 @@ uint32_t begin(ID3D12GraphicsCommandList* cl, Kind kind, int32_t handle, bool ev
   const auto item = static_cast<uint16_t>(base_of(kind) + (handle - 1));
   const uint32_t p = take_pair(s, item);
   if (p == UINT32_MAX) return 0;
+  s.direct[p] = type == D3D12_COMMAND_LIST_TYPE_DIRECT;
+  if (kind != kNode) {
+    const int32_t cls = render_nodes::current_class();
+    if (cls >= 0 && g_item_node[item].load(std::memory_order_relaxed) != cls + 1)
+      g_item_node[item].store(static_cast<int16_t>(cls + 1), std::memory_order_relaxed);
+  }
   if (event) {
     const wchar_t* ev = g_item[item].event;
     cl->BeginEvent(0, ev, static_cast<UINT>((std::wcslen(ev) + 1) * sizeof(wchar_t)));
@@ -306,5 +341,35 @@ std::string report() {
     }
   return o;
 }
+
+void totals(Totals* out) {
+  std::lock_guard g(g_mu);
+  out->read = g_read;
+  out->span_ms = g_span_total;
+  out->span_frames = g_span_frames;
+  for (uint32_t i = 0; i < kItems; ++i) {
+    out->item_ms[i] = g_item[i].total;
+    out->item_bad[i] = g_item[i].bad_frames;
+  }
+}
+
+Kind item_kind(uint32_t item) {
+  for (uint32_t k = kKinds; k-- > 0;)
+    if (item >= base_of(k)) return static_cast<Kind>(k);
+  return kCompanion;
+}
+const char* kind_name(Kind kind) { return kind < kKinds ? kKindName[kind] : "?"; }
+std::string item_client(uint32_t item) {
+  const Kind k = item_kind(item);
+  return client(k, static_cast<rg_handle>(item - base_of(k) + 1));
+}
+std::string item_name(uint32_t item) {
+  const Kind k = item_kind(item);
+  const rg_handle h = static_cast<rg_handle>(item - base_of(k) + 1);
+  if (k != kRaysVariant) return name(k, h);
+  // Variants of several libraries share a name (crt_rgs_fix): the library tells them apart.
+  return name(k, h) + " / " + clients::name_of(clients::kRtLib, clients::parent_of(clients::kRtVariant, h));
+}
+int32_t item_node(uint32_t item) { return item < kItems ? g_item_node[item].load(std::memory_order_relaxed) - 1 : -1; }
 
 }  // namespace core::gpu_timing

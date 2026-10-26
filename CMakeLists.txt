@@ -7,7 +7,7 @@
 cmake_minimum_required(VERSION 3.20)
 # The release version (the DLL's RED4ext version, the log, the SDK package). The API version is RG_HOST_API_VERSION in
 # include/rg_host.h and changes only with the ABI.
-project(REDGraph VERSION 0.4.2 LANGUAGES CXX)
+project(REDGraph VERSION 0.5.0 LANGUAGES CXX)
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "Cyberpunk 2077 is 64-bit only; configure with a 64-bit generator (-A x64)")
@@ -55,6 +55,7 @@ add_library(REDGraph::api ALIAS redgraph_api)
 # ---- the host ----
 add_library(redgraph SHARED
   include/rg_host.h
+  include/rg_dev.h
   src/plugin.cpp
   src/settings.cpp
   src/settings.hpp
@@ -67,6 +68,7 @@ add_library(redgraph SHARED
   src/core/clients.cpp
   src/core/clients.hpp
   src/core/prof.cpp
+  src/core/ab.cpp
   src/core/prof.hpp
   src/core/internal.hpp
   src/core/engine_231.hpp
@@ -82,6 +84,8 @@ add_library(redgraph SHARED
   src/core/gpu_timing.cpp
   src/core/gpu_timing.hpp
   src/core/hlsl.cpp
+  src/core/shader_reload.cpp
+  src/core/readback.cpp
   src/core/render_flow.cpp
   src/core/render_nodes.cpp
   src/core/engine_blocks.cpp
@@ -126,6 +130,8 @@ if(RG_BUILD_SELFTEST)
     selftest/wrap_use_test.cpp
     selftest/draw_test.cpp
     selftest/hlsl_test.cpp
+    selftest/reload_test.cpp
+    selftest/readback_test.cpp
     selftest/sky_paint_shader.hpp
     selftest/lease_tex_shader.hpp
   )

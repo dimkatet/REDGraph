@@ -25,6 +25,7 @@
 
 #include <RED4ext/CName.hpp>
 
+#include "core/ab.hpp"
 #include "core/clients.hpp"
 #include "core/engine_231.hpp"
 #include "core/internal.hpp"
@@ -101,10 +102,18 @@ void job_thunk(void* data, void* run_ctx) {
   g_job_ran.fetch_add(1, std::memory_order_relaxed);
   const void* const prev = t_job_node;
   t_job_node = node;
+  const int32_t cls = render_nodes::class_of(node);
+  const int32_t prev_cls = render_nodes::enter_class(cls);  // our GPU work recorded in a job: its node's class
   {
     prof::Pause engine;
-    fn(orig, run_ctx);
+    if (cls >= 0 && ab::measuring()) {
+      ab::Span span(cls, true);
+      fn(orig, run_ctx);
+    } else {
+      fn(orig, run_ctx);
+    }
   }
+  render_nodes::leave_class(prev_cls);
   t_job_node = prev;
 }
 
@@ -673,6 +682,29 @@ uint32_t flow_transition(rg_handle h, uint32_t d3d12_state) {
   g_transition(cl_ctx, id, d3d12_state, 0xffffffffu);
   g_flush(cl_ctx);
   return 1;
+}
+
+// [Dev] Readback: a name resolved for the node recording on this thread, outside the registered table.
+uint32_t resolve_here(uint32_t name_hash, void** resource) {
+  if (resource) *resource = nullptr;
+  const uint8_t* ctx = t_ctx;
+  const uint8_t* data = flow_data(ctx);
+  if (!g_attached || !data || data[kFlowPhase] == kFlowPhaseDeclare) return 0;
+  const uint32_t tag = tag_of(ctx, name_hash);
+  uint32_t id = 0;
+  g_get_resource(data, &id, &tag, rd<uint8_t>(ctx, kNodeCtxFlowThread), false);
+  void* res = texture_resource(id);
+  if (!res) return 0;
+  if (resource) *resource = res;
+  return id;
+}
+
+bool transition_here(uint32_t id, uint32_t d3d12_state) {
+  void* cl_ctx = id && g_transition ? g_get_ctx() : nullptr;
+  if (!cl_ctx) return false;
+  g_transition(cl_ctx, id, d3d12_state, 0xffffffffu);
+  g_flush(cl_ctx);
+  return true;
 }
 
 void flow_stats(rg_handle h, rg_flow_stats* out) {

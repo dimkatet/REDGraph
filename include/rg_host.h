@@ -261,6 +261,11 @@ typedef struct rg_draw_info {
 typedef void (*rg_draw_fn)(void* user, const rg_draw_info* info);
 typedef void (*rg_device_fn)(void* user, void* d3d12_device);
 
+/* ---- 2026-10-26: the A/B profile ([Diagnostics] ABProfile, Game.RG_AB) ---- */
+/* A client's switch: the runner sets it OFF (A) and ON (B) from its own thread - apply live, do not persist. */
+typedef void (*rg_ab_set_fn)(void* user, uint32_t on);
+typedef uint32_t (*rg_ab_get_fn)(void* user);  /* 1 = on now (restored at the end of a run) */
+
 typedef struct rg_host_stats {
   uint32_t pso_hooks;          /* 1 = the PSO hooks are attached */
   uint32_t mapped;             /* engine PSOs mapped to clones / companions */
@@ -658,6 +663,19 @@ typedef struct rg_host {
    * blocks is asked for). RG_E_ARG = no such entry (the catalog grows by appending; an id never changes); RG_E_LATE
    * after registration. Register-time. */
   int32_t (*engine_block_find)(const char* name);
+
+  /* 2026-10-26: the A/B PROFILE ([Diagnostics] ABProfile at the start; Game.RG_AB in the CET console). A run switches
+   * the named switches OFF / ON in interleaved blocks and reports what the frame, the GPU (per engine node, per item of
+   * ours) and the CPU (per engine node, the host, every client callback by its registration name) cost in B against A.
+   * ab_switch: one per feature, `name` unique among the clients ("<Mod>.<Feature>"); set / get as above. Any time;
+   * a handle, RG_E_ARG (no name / fn, taken), RG_E_FULL. The string must live for the process. */
+  rg_handle (*ab_switch)(const char* name, rg_ab_set_fn set, rg_ab_get_fn get, void* user);
+  /* [hot] 1 = an A/B run measures now: time your own code (an engine hook of yours) and hand it to prof_add. */
+  uint32_t (*prof_active)(void);
+  /* [hot] `tsc_cycles` (__rdtsc) of YOUR code under `name` - a string that lives for the process, keyed by its
+   * pointer. Leave out the engine's original your hook calls. Call it on the thread that ran the code: an engine
+   * node's CPU time on that thread is reported without it. */
+  void (*prof_add)(const char* name, uint64_t tsc_cycles);
 } rg_host;
 
 RG_HOST_EXPORT const rg_host* rg_host_get(uint32_t version);

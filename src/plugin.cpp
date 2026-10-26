@@ -14,6 +14,7 @@
 #include <RED4ext/Api/v1/Version.hpp>
 
 #include "rg_host.h"
+#include "core/ab.hpp"
 #include "core/engine_blocks.hpp"
 #include "core/crash_log.hpp"
 #include "core/graph_debug.hpp"
@@ -29,6 +30,18 @@
 #define RG_VERSION_MINOR 0
 #define RG_VERSION_PATCH 0
 #endif
+
+namespace {
+// [Dev] ReadbackDir, else <ShaderReloadDir>/readback, else readback/ next to this DLL.
+std::string readback_dir() {
+  std::string d = rg_settings::text("Dev.ReadbackDir");
+  if (!d.empty()) return d;
+  d = rg_settings::text("Dev.ShaderReloadDir");
+  if (!d.empty()) return d + "\\readback";
+  const std::string ini = rg_settings::path();  // REDGraph.ini sits next to the DLL
+  return ini.substr(0, ini.find_last_of("\\/") + 1) + "readback";
+}
+}  // namespace
 
 RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle handle, RED4ext::v1::EMainReason reason,
                                         const RED4ext::v1::Sdk* sdk) {
@@ -47,6 +60,15 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle handle, RED4ex
     float blas = 0.0f;
     rg_settings::get("Diagnostics.BlasCensus", &blas);
     if (blas > 0.5f) core::blas_census::enable();  // draw subscriptions: before the registration window closes
+    float reload = 0.0f;
+    rg_settings::get("Dev.ShaderHotReload", &reload);
+    if (reload > 0.5f) core::shader_reload::enable(rg_settings::text("Dev.ShaderReloadDir"));  // before attach
+    float ab = 0.0f;
+    rg_settings::get("Diagnostics.ABProfile", &ab);
+    if (ab > 0.5f) core::ab::enable();  // before attach: every node class wrapped, jobs carry their node
+    float readback = 0.0f;
+    rg_settings::get("Dev.Readback", &readback);
+    if (readback > 0.5f) core::readback::enable(readback_dir());  // before attach: it wraps every node class
     core::drain_clients();  // the clients that loaded before us register now
     core::arm();            // registration stays open for the clients loading after us, until GpuApi::InitDevice
     rg_ui::attach();

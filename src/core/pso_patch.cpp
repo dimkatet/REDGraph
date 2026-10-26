@@ -19,9 +19,14 @@
 #include <intrin.h>
 
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <memory>
 #include <optional>
+#include <unordered_map>
+#include <string>
 #include <vector>
 
 #include <RED4ext/CName.hpp>
@@ -143,7 +148,26 @@ enum SlotKind : uint32_t { kPatch = 0, kComp = 1, kSubOnly = 2 };
 // COMBINATION of their states - combo = sum over i of (variant_i + 1) * stride[i], 0 = vanilla, so clone[0] is the
 // engine's own (nullptr). kComp: clone[0] = the companion PSO, idx[0] its index.
 constexpr uint32_t kMaxStages = 3;
+// [Dev] ShaderHotReload: a deep copy of the engine's desc, kept with the mapping - the engine's desc exists only inside
+// PSOSubCache::Create, and a reload rebuilds the clones later. Every pointer it holds is ours (the root signature
+// AddRef'd). Off: never made.
+struct DescCopy {
+  Pipe pipe = kCompute;
+  D3D12_COMPUTE_PIPELINE_STATE_DESC cs{};
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC gfx{};
+  std::vector<std::unique_ptr<uint8_t[]>> bytes;
+  std::vector<D3D12_INPUT_ELEMENT_DESC> il;
+  std::vector<D3D12_SO_DECLARATION_ENTRY> so;
+  std::vector<UINT> strides;
+  std::vector<std::string> names;  // reserved up front: the descs point into them
+  const void* desc() const { return pipe == kCompute ? static_cast<const void*>(&cs) : &gfx; }
+  ~DescCopy() {
+    ID3D12RootSignature* rs = pipe == kCompute ? cs.pRootSignature : gfx.pRootSignature;
+    if (rs) rs->Release();
+  }
+};
 struct Mapping {
+  DescCopy* desc = nullptr;  // [Dev] ShaderHotReload only (kPatch / kComp / draw companions), owned
   ID3D12PipelineState** clone = nullptr;  // nclone entries; nullptr = that build failed (the engine PSO stays bound)
   uint32_t nclone = 0;
   uint32_t kind = kPatch;
@@ -234,6 +258,8 @@ void sweep_locked() {
     for (uint32_t i = 0; i < s.m.ndc; ++i)
       if (s.m.dc[i]) g_retired.push_back(s.m.dc[i]);
     s.m.ndc = 0;
+    delete s.m.desc;  // a reload runs on this (the frame) thread under this lock: nobody reads it now
+    s.m.desc = nullptr;
     p->Release();  // ours, the last: the engine's PSO goes now
     g_entries.fetch_sub(1, std::memory_order_relaxed);
     ++removed;
@@ -269,6 +295,55 @@ struct GfxBind {
 thread_local GfxBind t_gfx{};
 bool g_track_draws = false;  // set at attach: draw subscriptions exist
 
+// [Dev] ShaderHotReload (dev_enable, before attach). g_dev_lock: a creation holds it shared from the clone build to the
+// insert, a reload exclusive while it swaps blobs and rebuilds clones - a creation in between sees the old or the new
+// blob, never half of one. Replaced clones are released kDevRetireFrames frames later (a list may still be on the GPU).
+bool g_dev = false;
+SRWLOCK g_dev_lock = SRWLOCK_INIT;
+constexpr uint32_t kDevRetireFrames = 16;
+std::vector<std::pair<ID3D12PipelineState*, uint32_t>> g_dev_retired;  // the frame thread only
+
+DescCopy* copy_desc(Pipe pipe, const void* desc_v) {
+  auto* c = new DescCopy;
+  c->pipe = pipe;
+  auto own = [c](D3D12_SHADER_BYTECODE& b) {
+    if (!b.pShaderBytecode || !b.BytecodeLength) return;
+    auto p = std::make_unique<uint8_t[]>(b.BytecodeLength);
+    std::memcpy(p.get(), b.pShaderBytecode, b.BytecodeLength);
+    b.pShaderBytecode = p.get();
+    c->bytes.push_back(std::move(p));
+  };
+  if (pipe == kCompute) {
+    c->cs = *static_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(desc_v);
+    own(c->cs.CS);
+    c->cs.CachedPSO = {};
+    if (c->cs.pRootSignature) c->cs.pRootSignature->AddRef();
+    return c;
+  }
+  auto& g = c->gfx;
+  g = *static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc_v);
+  for (D3D12_SHADER_BYTECODE* b : {&g.VS, &g.PS, &g.DS, &g.HS, &g.GS}) own(*b);
+  c->names.reserve(g.InputLayout.NumElements + g.StreamOutput.NumEntries);
+  auto name = [c](const char* s) { return s ? c->names.emplace_back(s).c_str() : nullptr; };
+  if (g.InputLayout.pInputElementDescs && g.InputLayout.NumElements) {
+    c->il.assign(g.InputLayout.pInputElementDescs, g.InputLayout.pInputElementDescs + g.InputLayout.NumElements);
+    for (auto& e : c->il) e.SemanticName = name(e.SemanticName);
+    g.InputLayout.pInputElementDescs = c->il.data();
+  }
+  if (g.StreamOutput.pSODeclaration && g.StreamOutput.NumEntries) {
+    c->so.assign(g.StreamOutput.pSODeclaration, g.StreamOutput.pSODeclaration + g.StreamOutput.NumEntries);
+    for (auto& e : c->so) e.SemanticName = name(e.SemanticName);
+    g.StreamOutput.pSODeclaration = c->so.data();
+  }
+  if (g.StreamOutput.pBufferStrides && g.StreamOutput.NumStrides) {
+    c->strides.assign(g.StreamOutput.pBufferStrides, g.StreamOutput.pBufferStrides + g.StreamOutput.NumStrides);
+    g.StreamOutput.pBufferStrides = c->strides.data();
+  }
+  g.CachedPSO = {};
+  if (g.pRootSignature) g.pRootSignature->AddRef();
+  return c;
+}
+
 std::atomic<uint64_t> g_creates[2] = {}, g_creates_unhashed{0};
 std::atomic<uint64_t> g_calls[2] = {}, g_cycles[2] = {};
 thread_local uint64_t t_cycles[2] = {};
@@ -277,6 +352,64 @@ thread_local uint32_t t_calls[2] = {};
 std::optional<dxil_hash::Hash> hash_of(const D3D12_SHADER_BYTECODE& s) {
   if (!s.pShaderBytecode || !s.BytecodeLength) return std::nullopt;
   return dxil_hash::of(s.pShaderBytecode, s.BytecodeLength);
+}
+
+// [Dev] Readback's vsout (dev_readback_enable, before attach): every graphics PSO the engine creates, its desc without
+// bytecode (the input layout copied, the root signature referenced) and its VS hash; the VS bytes once per hash. Keyed
+// by the engine PSO's address - a PSO created later at a freed address overwrites the record (creation precedes every
+// bind). Off: never made.
+bool g_rb_dev = false;
+struct RbRec {
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};  // VS / PS / GS / HS / DS and StreamOutput cleared
+  std::vector<D3D12_INPUT_ELEMENT_DESC> il;
+  std::vector<std::string> names;  // reserved up front: il points into them
+  dxil_hash::Hash vs{};
+  bool has_vs = false, tess = false;
+  ~RbRec() {
+    if (d.pRootSignature) d.pRootSignature->Release();
+  }
+};
+SRWLOCK g_rb_lock = SRWLOCK_INIT;
+std::unordered_map<uintptr_t, std::unique_ptr<RbRec>> g_rb_recs;     // g_rb_lock
+std::map<dxil_hash::Hash, std::vector<uint8_t>> g_rb_vs;              // g_rb_lock; a VS's bytes by its hash
+
+void rb_record(ID3D12PipelineState* engine, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& g) {
+  auto r = std::make_unique<RbRec>();
+  r->d = g;
+  r->d.VS = r->d.PS = r->d.GS = r->d.HS = r->d.DS = {};
+  r->d.StreamOutput = {};
+  r->d.CachedPSO = {};
+  r->tess = g.HS.pShaderBytecode || g.DS.pShaderBytecode;
+  if (g.InputLayout.pInputElementDescs && g.InputLayout.NumElements) {
+    r->names.reserve(g.InputLayout.NumElements);
+    r->il.assign(g.InputLayout.pInputElementDescs, g.InputLayout.pInputElementDescs + g.InputLayout.NumElements);
+    for (auto& e : r->il) e.SemanticName = e.SemanticName ? r->names.emplace_back(e.SemanticName).c_str() : nullptr;
+    r->d.InputLayout.pInputElementDescs = r->il.data();
+  }
+  if (r->d.pRootSignature) r->d.pRootSignature->AddRef();
+  const auto h = hash_of(g.VS);
+  AcquireSRWLockExclusive(&g_rb_lock);
+  if (h) {
+    r->vs = *h;
+    r->has_vs = true;
+    if (g_rb_vs.find(*h) == g_rb_vs.end()) {
+      const auto* b = static_cast<const uint8_t*>(g.VS.pShaderBytecode);
+      g_rb_vs.emplace(*h, std::vector<uint8_t>(b, b + g.VS.BytecodeLength));
+    }
+  }
+  g_rb_recs[reinterpret_cast<uintptr_t>(engine)] = std::move(r);
+  ReleaseSRWLockExclusive(&g_rb_lock);
+}
+
+// [hot while a vsout request is armed] kDevDrawBit when the engine PSO's VS is one a request waits for.
+uint32_t rb_draw_bit(ID3D12PipelineState* engine) {
+  dxil_hash::Hash h;
+  bool have = false;
+  AcquireSRWLockShared(&g_rb_lock);
+  const auto it = g_rb_recs.find(reinterpret_cast<uintptr_t>(engine));
+  if (it != g_rb_recs.end() && it->second->has_vs) h = it->second->vs, have = true;
+  ReleaseSRWLockShared(&g_rb_lock);
+  return have && readback::vs_wanted(h.data()) ? kDevDrawBit : 0u;
 }
 
 int32_t find_patch(uint32_t stage, const dxil_hash::Hash& h) {
@@ -414,6 +547,42 @@ void apply_state(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, const rg_pso_state& s, u
 
 const char* stage_label(uint32_t s) { return s == RG_STAGE_VS ? "VS" : s == RG_STAGE_PS ? "PS" : s == RG_STAGE_GS ? "GS" : "CS"; }
 
+// Draw companion `c`'s PSO from the engine's graphics desc.
+HRESULT create_dc(ID3D12Device* dev, const void* desc_v, const DrawComp& c, ID3D12PipelineState** out) {
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC d = *static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc_v);
+  if (c.shader.bytes) (c.stage == RG_STAGE_VS ? d.VS : d.PS) = {c.shader.bytes, c.shader.size};
+  uint32_t done = 0;
+  apply_state(d, c.st, done, c.name);
+  d.CachedPSO = {};
+  return dev->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(out));
+}
+
+// The clone of combination `combo` of `map` from the engine's desc, with the patches' blobs as they are now (kComp:
+// the companion). e[i] out = patch i's part: 0 vanilla, v + 1 = variant v.
+HRESULT create_combo(Pipe pipe, ID3D12Device* dev, const void* desc_v, const Mapping& map, uint32_t combo, uint32_t* e,
+                     ID3D12PipelineState** out) {
+  if (pipe == kCompute) {
+    D3D12_COMPUTE_PIPELINE_STATE_DESC d = *static_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(desc_v);
+    const rg_blob& b = map.kind == kComp ? g_c[map.idx[0]].cs : g_p[map.idx[0]].v[combo - 1];
+    e[0] = map.kind == kComp ? 1u : combo;  // a compute patch: combo = variant + 1
+    d.CS = {b.bytes, b.size};
+    d.CachedPSO = {};
+    return dev->CreateComputePipelineState(&d, IID_PPV_ARGS(out));
+  }
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC d = *static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc_v);
+  uint32_t state_done = 0;
+  for (uint32_t i = 0; i < map.np; ++i) {  // idx is in stage order VS, PS, GS (identify)
+    const Patch& p = g_p[map.idx[i]];
+    e[i] = (combo / map.stride[i]) % (p.n + 1);
+    if (!e[i]) continue;
+    const rg_blob& b = p.v[e[i] - 1];
+    if (b.bytes) (p.stage == RG_STAGE_GS ? d.GS : p.stage == RG_STAGE_PS ? d.PS : d.VS) = {b.bytes, b.size};
+    apply_state(d, p.st[e[i] - 1], state_done, p.name);
+  }
+  d.CachedPSO = {};
+  return dev->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(out));
+}
+
 // The draw companions of a graphics engine PSO, into `map` (before it is inserted).
 void build_draw_comps(ID3D12PipelineState* engine, const void* desc_v, const Match& m, Mapping& map) {
   if (!m.ndc) return;
@@ -421,13 +590,8 @@ void build_draw_comps(ID3D12PipelineState* engine, const void* desc_v, const Mat
   if (FAILED(engine->GetDevice(IID_PPV_ARGS(&dev)))) return;
   for (uint32_t i = 0; i < m.ndc; ++i) {
     DrawComp& c = g_dc[m.dc[i]];
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC d = *static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc_v);
-    if (c.shader.bytes) (c.stage == RG_STAGE_VS ? d.VS : d.PS) = {c.shader.bytes, c.shader.size};
-    uint32_t done = 0;
-    apply_state(d, c.st, done, c.name);
-    d.CachedPSO = {};
     ID3D12PipelineState* pso = nullptr;
-    const HRESULT hr = dev->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso));
+    const HRESULT hr = create_dc(dev, desc_v, c, &pso);
     map.dc_idx[map.ndc] = m.dc[i];
     map.dc[map.ndc++] = SUCCEEDED(hr) ? pso : nullptr;
     const uint32_t k = c.c.engine_psos.fetch_add(1) + 1;
@@ -459,6 +623,7 @@ void build(Pipe pipe, ID3D12PipelineState* engine, const void* desc_v, const Mat
     total *= m.kind == kComp ? 1u : g_p[m.idx[i]].n + 1;
   }
   if (m.kind == kComp) total = 1;  // clone[0] = the companion
+  if (g_dev) map.desc = copy_desc(pipe, desc_v);
   map.nclone = total;
   map.clone = new ID3D12PipelineState*[total]();
   ID3D12Device* dev = nullptr;
@@ -466,29 +631,8 @@ void build(Pipe pipe, ID3D12PipelineState* engine, const void* desc_v, const Mat
   uint32_t built = 0, failed = 0;
   uint32_t built_with[kMaxStages] = {};
   for (uint32_t combo = m.kind == kComp ? 0u : 1u; combo < total && SUCCEEDED(hr); ++combo) {
-    HRESULT vhr;
     uint32_t e[kMaxStages] = {};  // per patch: 0 vanilla, v + 1 = variant v
-    if (pipe == kCompute) {
-      D3D12_COMPUTE_PIPELINE_STATE_DESC d = *static_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(desc_v);
-      const rg_blob& b = m.kind == kComp ? g_c[m.idx[0]].cs : g_p[m.idx[0]].v[combo - 1];
-      e[0] = m.kind == kComp ? 1u : combo;  // a compute patch: combo = variant + 1
-      d.CS = {b.bytes, b.size};
-      d.CachedPSO = {};
-      vhr = dev->CreateComputePipelineState(&d, IID_PPV_ARGS(&map.clone[combo]));
-    } else {
-      D3D12_GRAPHICS_PIPELINE_STATE_DESC d = *static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc_v);
-      uint32_t state_done = 0;
-      for (uint32_t i = 0; i < m.n; ++i) {  // m.idx is in stage order VS, PS, GS (identify)
-        const Patch& p = g_p[m.idx[i]];
-        e[i] = (combo / map.stride[i]) % (p.n + 1);
-        if (!e[i]) continue;
-        const rg_blob& b = p.v[e[i] - 1];
-        if (b.bytes) (p.stage == RG_STAGE_GS ? d.GS : p.stage == RG_STAGE_PS ? d.PS : d.VS) = {b.bytes, b.size};
-        apply_state(d, p.st[e[i] - 1], state_done, p.name);
-      }
-      d.CachedPSO = {};
-      vhr = dev->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&map.clone[combo]));
-    }
+    const HRESULT vhr = create_combo(pipe, dev, desc_v, map, combo, e, &map.clone[combo]);
     if (SUCCEEDED(vhr)) {
       ++built;
       for (uint32_t i = 0; i < m.n; ++i) built_with[i] += e[i] ? 1u : 0u;
@@ -525,6 +669,7 @@ void build(Pipe pipe, ID3D12PipelineState* engine, const void* desc_v, const Mat
     for (uint32_t i = 0; i < map.ndc; ++i)
       if (map.dc[i]) map.dc[i]->Release();
     delete[] map.clone;
+    delete map.desc;
     g_sdk->logger->WarnF(g_handle, "pso swap: %s engine PSO %p not mapped (duplicate or table full, %u entries)", name,
                          static_cast<void*>(engine), g_entries.load());
     return;
@@ -556,7 +701,14 @@ void build(Pipe pipe, ID3D12PipelineState* engine, const void* desc_v, const Mat
   }
 }
 
+void on_create_unlocked(Pipe pipe, void** out, const void* desc, const Match& m);
 void on_create(Pipe pipe, void** out, const void* desc, const Match& m) {
+  if (!g_dev || !(m.n || m.ndc)) return on_create_unlocked(pipe, out, desc, m);
+  AcquireSRWLockShared(&g_dev_lock);
+  on_create_unlocked(pipe, out, desc, m);
+  ReleaseSRWLockShared(&g_dev_lock);
+}
+void on_create_unlocked(Pipe pipe, void** out, const void* desc, const Match& m) {
   if (!out || !*out || !desc) return;
   g_creates[pipe].fetch_add(1, std::memory_order_relaxed);
   if (m.n) {
@@ -566,9 +718,11 @@ void on_create(Pipe pipe, void** out, const void* desc, const Match& m) {
     sub.kind = kSubOnly;
     sub.subs = m.subs;
     if (pipe == kGraphics) build_draw_comps(static_cast<ID3D12PipelineState*>(*out), desc, m, sub);
+    if (g_dev && sub.ndc) sub.desc = copy_desc(pipe, desc);
     if (!insert(reinterpret_cast<uintptr_t>(*out), sub)) {
       for (uint32_t i = 0; i < sub.ndc; ++i)
         if (sub.dc[i]) sub.dc[i]->Release();
+      delete sub.desc;
       g_sdk->logger->WarnF(g_handle, "pso swap: subscribed engine PSO %p not mapped (duplicate or table full)", *out);
     }
   }
@@ -593,6 +747,8 @@ void** d_gfx_create(void* self, void** out, void* a3, uint64_t a4, uint64_t key,
   const Match m = desc ? identify(kGraphics, desc) : Match{};
   void** r = g_orig_gfx_create(self, out, a3, a4, key, desc);
   on_create(kGraphics, out, desc, m);
+  if (g_rb_dev && out && *out && desc)
+    rb_record(static_cast<ID3D12PipelineState*>(*out), *static_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(desc));
   if (graph_probe::census() && out && *out && desc) graph_probe::on_pso_created(kGraphics, *out, desc);
   return r;
 }
@@ -624,6 +780,7 @@ ID3D12PipelineState* swap(Pipe pipe, const void* state, ID3D12PipelineState* eng
   const uint64_t t0 = __rdtsc();
   ID3D12PipelineState* out = engine;
   uint32_t draw_subs = 0;
+  if (state) render_nodes::note_ctx(static_cast<const uint8_t*>(state) - (pipe == kCompute ? kCtxComputeState : kCtxGraphicsState));
   if (engine && graph_probe::census()) graph_probe::on_bind(pipe, engine);
   // The graph debug module's shader skip: NULL is the engine's own "still compiling" answer - it skips the draw.
   if (engine && graph_debug::skip(pipe, engine)) out = nullptr;
@@ -661,6 +818,7 @@ ID3D12PipelineState* swap(Pipe pipe, const void* state, ID3D12PipelineState* eng
       }
     }
   }
+  if (pipe == kGraphics && g_rb_dev && out && readback::vs_armed()) draw_subs |= rb_draw_bit(engine);
   // Every graphics bind, mapped or not: a stale entry would match a new PSO at a freed address.
   if (pipe == kGraphics && g_track_draws)
     t_gfx = {static_cast<const uint8_t*>(state) - kCtxGraphicsState, out, engine, out ? draw_subs : 0u};
@@ -820,7 +978,7 @@ int32_t companion_scope(rg_handle h, const char* node) {
 
 bool needed() {
   return g_np.load() != 0 || g_nc.load() != 0 || passes::has_subs() || passes::has_draw_subs() || g_ndc.load() != 0 ||
-         device_ready_wanted() || graph_probe::census();
+         device_ready_wanted() || graph_probe::census() || g_rb_dev;
 }
 bool has_companions() { return g_nc.load() != 0; }
 
@@ -829,8 +987,8 @@ bool attach() {
   for (uint32_t i = 0; i < np; ++i) g_want_stage[g_p[i].stage] = true;
   g_want[kCompute] = g_want_stage[RG_STAGE_CS] || g_nc.load() != 0 || passes::has_subs() || device_ready_wanted();
   g_want[kGraphics] = g_want_stage[RG_STAGE_VS] || g_want_stage[RG_STAGE_PS] || g_want_stage[RG_STAGE_GS] ||
-                      passes::has_draw_subs() || g_ndc.load() != 0;
-  g_track_draws = passes::has_draw_subs();
+                      passes::has_draw_subs() || g_ndc.load() != 0 || g_rb_dev;
+  g_track_draws = passes::has_draw_subs() || g_rb_dev;
   if (graph_probe::census()) g_want[kCompute] = g_want[kGraphics] = true;  // the census sees every PSO
   // Create first: an engine PSO must be mapped before a bind detour can recognise it.
   struct H {
@@ -889,7 +1047,9 @@ uint32_t claimed(const uint8_t* hash16) {
 }
 
 void frame_tick() {
-  if (++g_sweep_frame % kSweepFrames || (g_entries.load(std::memory_order_relaxed) == 0 && g_retired.empty())) return;
+  ++g_sweep_frame;
+  if (g_dev) dev_frame_tick();
+  if (g_sweep_frame % kSweepFrames || (g_entries.load(std::memory_order_relaxed) == 0 && g_retired.empty())) return;
   AcquireSRWLockExclusive(&g_insert_lock);
   sweep_locked();
   ReleaseSRWLockExclusive(&g_insert_lock);
@@ -1039,6 +1199,245 @@ ID3D12PipelineState* draw_companion_of(ID3D12PipelineState* engine, rg_handle h)
 
 void draw_companion_count(rg_handle h) {
   if (DrawComp* c = draw_comp_of(h)) c->c.swaps.fetch_add(1, std::memory_order_relaxed);
+}
+
+// ---- [Dev] ShaderHotReload (core/shader_reload.cpp drives it from the frame thread) ----
+
+namespace {
+enum TargetKind : uint32_t { kTPatch = 0, kTComp = 1, kTDrawComp = 2 };
+const char* const kTargetLabel[3] = {"patch", "companion", "draw companion"};
+
+std::string hex_of(const dxil_hash::Hash& h) {
+  char s[33];
+  for (int i = 0; i < 16; ++i) std::snprintf(s + 2 * i, 3, "%02x", h[i]);
+  return s;
+}
+
+struct Target {
+  uint32_t kind, idx;
+  const char* name;
+  uint32_t stage, variants;
+  const dxil_hash::Hash* hash;
+};
+// Every target a reload can name, in registration order (a refused patch is none).
+std::vector<Target> targets() {
+  std::vector<Target> t;
+  for (uint32_t i = 0, n = g_np.load(std::memory_order_acquire); i < n; ++i)
+    if (g_p[i].state.load() != RG_STATE_REFUSED) t.push_back({kTPatch, i, g_p[i].name, g_p[i].stage, g_p[i].n, &g_p[i].hash});
+  for (uint32_t i = 0, n = g_nc.load(std::memory_order_acquire); i < n; ++i)
+    if (g_c[i].state.load() != RG_STATE_REFUSED) t.push_back({kTComp, i, g_c[i].name, RG_STAGE_CS, 1, &g_c[i].hash});
+  for (uint32_t i = 0, n = g_ndc.load(std::memory_order_acquire); i < n; ++i)
+    t.push_back({kTDrawComp, i, g_dc[i].name, g_dc[i].stage, 1, &g_dc[i].hash});
+  return t;
+}
+
+void dev_retire(ID3D12PipelineState* p) {
+  if (p) g_dev_retired.push_back({p, g_sweep_frame});
+}
+}  // namespace
+
+void dev_enable() { g_dev = true; }
+
+void dev_readback_enable() { g_rb_dev = true; }
+
+bool dev_vs_of(ID3D12PipelineState* engine, ID3D12PipelineState* bound, rg_blob* vs, uint8_t* hash16) {
+  if (!g_rb_dev || !engine) return false;
+  // A clone: the VS of the patch variant it carries (a state-only variant keeps the engine's).
+  if (bound && bound != engine) {
+    if (const Slot* s = find(reinterpret_cast<uintptr_t>(engine)); s && s->m.kind == kPatch)
+      for (uint32_t c = 1; c < s->m.nclone; ++c) {
+        if (s->m.clone[c] != bound) continue;
+        for (uint32_t i = 0; i < s->m.np; ++i) {
+          const Patch& p = g_p[s->m.idx[i]];
+          const uint32_t e = (c / s->m.stride[i]) % (p.n + 1);
+          if (p.stage != RG_STAGE_VS || !e || !p.v[e - 1].bytes) continue;
+          *vs = p.v[e - 1];
+          const auto h = dxil_hash::of(vs->bytes, vs->size);
+          if (h) std::memcpy(hash16, h->data(), 16);
+          else std::memset(hash16, 0, 16);
+          return true;
+        }
+      }
+  }
+  AcquireSRWLockShared(&g_rb_lock);
+  bool ok = false;
+  const auto it = g_rb_recs.find(reinterpret_cast<uintptr_t>(engine));
+  if (it != g_rb_recs.end() && it->second->has_vs) {
+    const auto b = g_rb_vs.find(it->second->vs);
+    if (b != g_rb_vs.end()) {  // the bytes never move or go: kept for the process
+      *vs = {b->second.data(), static_cast<uint32_t>(b->second.size())};
+      std::memcpy(hash16, it->second->vs.data(), 16);
+      ok = true;
+    }
+  }
+  ReleaseSRWLockShared(&g_rb_lock);
+  return ok;
+}
+
+long dev_so_pso(ID3D12PipelineState* engine, rg_blob vs, const void* so, ID3D12PipelineState** out, bool bare,
+                void** root_sig) {
+  *out = nullptr;
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
+  AcquireSRWLockShared(&g_rb_lock);
+  const auto it = g_rb_recs.find(reinterpret_cast<uintptr_t>(engine));
+  const bool have = it != g_rb_recs.end() && !it->second->tess;
+  if (have) d = it->second->d;  // the input layout it points to lives as long as the record
+  if (have && d.pRootSignature) d.pRootSignature->AddRef();
+  ReleaseSRWLockShared(&g_rb_lock);
+  if (!have) return E_INVALIDARG;
+  d.VS = {vs.bytes, vs.size};
+  d.StreamOutput = *static_cast<const D3D12_STREAM_OUTPUT_DESC*>(so);
+  d.DepthStencilState.DepthEnable = FALSE;
+  d.DepthStencilState.StencilEnable = FALSE;
+  if (root_sig) *root_sig = d.pRootSignature;
+  if (bare) {
+    d.NumRenderTargets = 0;
+    for (auto& f : d.RTVFormats) f = DXGI_FORMAT_UNKNOWN;
+    d.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    d.BlendState = {};
+    for (auto& t : d.BlendState.RenderTarget) t.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    d.SampleDesc = {1, 0};
+  }
+  ID3D12Device* dev = nullptr;
+  HRESULT hr = engine->GetDevice(IID_PPV_ARGS(&dev));
+  if (SUCCEEDED(hr)) {
+    hr = dev->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(out));
+    dev->Release();
+  }
+  if (d.pRootSignature) d.pRootSignature->Release();
+  return hr;
+}
+
+std::string dev_file_stem(const char* name) {
+  std::string s = name ? name : "";
+  for (char& c : s)
+    if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_')) c = '_';
+  return s;
+}
+
+std::string dev_targets() {
+  std::string out;
+  for (const Target& t : targets()) {
+    char line[400];
+    std::snprintf(line, sizeof line, "%-15s %s  %s  variants %u  file: %s[.vN].dxbc|.ll  or  %s[.vN].dxbc|.ll\n",
+                  kTargetLabel[t.kind], stage_label(t.stage), t.name, t.variants, dev_file_stem(t.name).c_str(),
+                  hex_of(*t.hash).c_str());
+    out += line;
+  }
+  return out;
+}
+
+namespace {
+// Under g_dev_lock (exclusive) + g_insert_lock: every engine PSO carrying target `t`, the clones holding variant `v`
+// rebuilt from the kept desc with the blobs as they are NOW. All or nothing: any failure releases what was built and
+// leaves every clone as it was (false). On success the new clones go in place (one pointer store each - the bind
+// funnel reads them lock-free) and the old ones are retired.
+bool dev_rebuild(const Target& t, uint32_t v, DevReload* r) {
+  struct Built {
+    ID3D12PipelineState** at;
+    ID3D12PipelineState* pso;
+  };
+  std::vector<Built> built;
+  ID3D12Device* dev = nullptr;
+  bool ok = true;
+  for (Slot& s : g_slots) {
+    const uintptr_t k = s.engine.load(std::memory_order_relaxed);
+    if (k <= kTomb) continue;
+    Mapping& m = s.m;
+    const bool gfx = m.desc && m.desc->pipe == kGraphics;
+    if (t.kind == kTDrawComp) {
+      for (uint32_t i = 0; i < m.ndc; ++i) {
+        if (m.dc_idx[i] != t.idx) continue;
+        ++r->mapped;
+        if (!m.desc) { ++r->no_desc; continue; }
+        if (!dev && FAILED(reinterpret_cast<ID3D12PipelineState*>(k)->GetDevice(IID_PPV_ARGS(&dev)))) return false;
+        ID3D12PipelineState* pso = nullptr;
+        const HRESULT hr = create_dc(dev, m.desc->desc(), g_dc[t.idx], &pso);
+        if (FAILED(hr)) { ok = false, r->last_hr = static_cast<uint32_t>(hr), ++r->failed; continue; }
+        built.push_back({&m.dc[i], pso});
+      }
+      continue;
+    }
+    if (m.kind != (t.kind == kTComp ? kComp : kPatch) || !m.clone) continue;
+    int32_t at = -1;  // the target's position among the mapping's patches
+    for (uint32_t i = 0; i < m.np; ++i)
+      if (m.idx[i] == t.idx) at = static_cast<int32_t>(i);
+    if (at < 0) continue;
+    ++r->mapped;
+    if (!m.desc) { ++r->no_desc; continue; }
+    if (!dev && FAILED(reinterpret_cast<ID3D12PipelineState*>(k)->GetDevice(IID_PPV_ARGS(&dev)))) return false;
+    const Pipe pipe = gfx ? kGraphics : kCompute;
+    for (uint32_t combo = t.kind == kTComp ? 0u : 1u; combo < m.nclone; ++combo) {
+      if (t.kind == kTPatch) {
+        const uint32_t part = pipe == kCompute ? combo : (combo / m.stride[at]) % (g_p[t.idx].n + 1);
+        if (part != v + 1) continue;
+      }
+      uint32_t e[kMaxStages] = {};
+      ID3D12PipelineState* pso = nullptr;
+      const HRESULT hr = create_combo(pipe, dev, m.desc->desc(), m, combo, e, &pso);
+      if (FAILED(hr)) { ok = false, r->last_hr = static_cast<uint32_t>(hr), ++r->failed; continue; }
+      built.push_back({&m.clone[combo], pso});
+    }
+  }
+  if (dev) dev->Release();
+  if (!ok) {
+    for (const Built& b : built) b.pso->Release();
+    return false;
+  }
+  for (const Built& b : built) {
+    dev_retire(static_cast<ID3D12PipelineState*>(
+        InterlockedExchangePointer(reinterpret_cast<void* volatile*>(b.at), b.pso)));
+  }
+  r->rebuilt = static_cast<uint32_t>(built.size());
+  return true;
+}
+}  // namespace
+
+int32_t dev_reload(const char* stem, int32_t variant, rg_blob b, int32_t blob_stage, DevReload* r) {
+  *r = {};
+  if (!g_dev || !stem) return RG_E_UNAVAILABLE;
+  const Target* hit = nullptr;
+  const std::vector<Target> all = targets();
+  uint32_t matches = 0;
+  for (const Target& t : all)
+    if (_stricmp(dev_file_stem(t.name).c_str(), stem) == 0 || _stricmp(hex_of(*t.hash).c_str(), stem) == 0) {
+      hit = &t;
+      ++matches;
+    }
+  if (!hit) return RG_E_ARG;
+  if (matches > 1) return RG_E_TAKEN;  // two targets share the name / hash: name it by the other one
+  const Target t = *hit;
+  r->name = t.name;
+  r->kind = kTargetLabel[t.kind];
+  if (variant < 0 || static_cast<uint32_t>(variant) >= t.variants) return RG_E_FULL;
+  if (blob_stage >= 0 && static_cast<uint32_t>(blob_stage) != t.stage) return RG_E_BLOB;
+  rg_blob* slot = t.kind == kTPatch ? &g_p[t.idx].v[variant] : t.kind == kTComp ? &g_c[t.idx].cs : &g_dc[t.idx].shader;
+  AcquireSRWLockExclusive(&g_dev_lock);
+  AcquireSRWLockExclusive(&g_insert_lock);
+  const rg_blob old = *slot;
+  *slot = b;
+  const bool ok = dev_rebuild(t, static_cast<uint32_t>(variant), r);
+  if (!ok) *slot = old;  // the engine's next PSOs with this shader keep the working blob too
+  ReleaseSRWLockExclusive(&g_insert_lock);
+  ReleaseSRWLockExclusive(&g_dev_lock);
+  Counters& c = t.kind == kTPatch ? g_p[t.idx].c : t.kind == kTComp ? g_c[t.idx].c : g_dc[t.idx].c;
+  if (!ok) {
+    c.clone_failed.fetch_add(r->failed);
+    c.last_hr.store(r->last_hr);
+    return RG_E_COMPILE;
+  }
+  c.clones.fetch_add(r->rebuilt);
+  return 0;
+}
+
+void dev_frame_tick() {
+  if (g_dev_retired.empty()) return;
+  size_t keep = 0;
+  for (auto& [p, frame] : g_dev_retired) {
+    if (g_sweep_frame - frame >= kDevRetireFrames) p->Release();
+    else g_dev_retired[keep++] = {p, frame};
+  }
+  g_dev_retired.resize(keep);
 }
 
 void bound_subs_reset() { t_bound_subs = 0; }

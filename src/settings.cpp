@@ -42,6 +42,19 @@ const Def kDefs[] = {
     {"Diagnostics", "BlasCensus", false, "BLAS census"},
     // The frame time every 10 s as [frame] (core/prof) - an on/off A/B of any feature against its own log's switches.
     {"Diagnostics", "FrameTimer", true, "frame timer"},
+    // The A/B profile (core/ab): Game.RG_AB(switches, block, settle, pairs) switches clients' features off / on in
+    // interleaved blocks and logs what each costs - the frame, the GPU per node and per item of ours, the CPU per
+    // node / host / client callback. Wraps every node class and makes jobs carry their node. At the start only.
+    {"Diagnostics", "ABProfile", false, "A/B profile"},
+    // DEVELOPERS ONLY: a folder is watched - a .dxbc / .ll dropped there replaces a registered patch's / companion's
+    // shader while the game runs (core/shader_reload). Every patched PSO keeps a copy of its desc. At the start only.
+    // The folder: [Dev] ShaderReloadDir = <absolute path> (text, read by plugin.cpp), else shader_reload/ next to
+    // the DLL - which under MO2 is VIRTUAL: a file created there from outside under a new name stays invisible.
+    {"Dev", "ShaderHotReload", false, "shader hot reload"},
+    // DEVELOPERS ONLY: Game.RG_Readback(spec) copies an engine constant block or a RenderFlow texture at a node into a
+    // file (core/readback). Every node class is wrapped. At the start only. The folder: [Dev] ReadbackDir = <absolute
+    // path>, else <ShaderReloadDir>/readback, else readback/ next to the DLL (under MO2: it lands in overwrite/).
+    {"Dev", "Readback", false, "GPU readback"},
 };
 constexpr size_t kCount = sizeof(kDefs) / sizeof(kDefs[0]);
 
@@ -126,6 +139,16 @@ bool set(const char* name, float value) {
   }
   ReleaseSRWLockExclusive(&g_lock);
   return true;
+}
+
+std::string text(const char* name) {
+  const char* dot = name ? std::strchr(name, '.') : nullptr;
+  if (!dot) return {};
+  AcquireSRWLockShared(&g_lock);
+  const std::string* s = g_ini.find(std::string(name, dot).c_str(), dot + 1);
+  std::string v = s ? *s : std::string();
+  ReleaseSRWLockShared(&g_lock);
+  return v;
 }
 
 std::string path() {

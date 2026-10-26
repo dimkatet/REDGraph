@@ -50,6 +50,7 @@
 
 #include "core/clients.hpp"
 #include "core/engine_231.hpp"
+#include "core/ab.hpp"
 #include "core/gpu_timing.hpp"
 #include "core/internal.hpp"
 #include "core/prof.hpp"
@@ -196,6 +197,29 @@ DebugSlot* debug_slot_of(const void* node) {
   return nullptr;
 }
 
+// The thread-current CommandListContext outside a draw / dispatch is not always one: game 2.5 leaves 0xff0000 in its
+// TLS slot on a job worker before the node's Execute binds a list (2026-10-26, a crash at the GPU timing's read of
+// +kCtxCmdList). A pointer is trusted only once the bind funnel (pso_patch) saw it as a real context.
+constexpr uint32_t kMaxCtx = 256;
+std::atomic<const uint8_t*> g_ctx[kMaxCtx] = {};
+std::atomic<uint32_t> g_nctx{0};
+std::mutex g_ctx_mu;
+
+bool known_ctx(const uint8_t* c) {
+  if (!c) return false;
+  const uint32_t n = g_nctx.load(std::memory_order_acquire);
+  for (uint32_t i = 0; i < n; ++i)
+    if (g_ctx[i].load(std::memory_order_relaxed) == c) return true;
+  return false;
+}
+
+// The thread-current context if it is a known one, else nullptr. Without the bind funnel (no client patch: nothing
+// is ever noted) the TLS value is taken as is, as before.
+uint8_t* current_ctx() {
+  uint8_t* c = g_get_ctx();
+  return !g_nctx.load(std::memory_order_relaxed) || known_ctx(c) ? c : nullptr;
+}
+
 // [-1] the template's RTTI locator (kept in place, nothing should need it), [0..5] the vtable.
 void* g_vtable_storage[1 + kNodeVtSlots];
 void** g_vtable = g_vtable_storage + 1;
@@ -230,9 +254,9 @@ void declare_end(Node& n, const uint8_t* ctx) {
 }
 
 // A client fn on the command list bound on this thread; restores the engine's state when fn says it touched it.
-void run_fn(rg_node_fn fn, void* user, const uint8_t* ctx, std::atomic<uint64_t>& no_cmdlist,
+void run_fn(const char* name, rg_node_fn fn, void* user, const uint8_t* ctx, std::atomic<uint64_t>& no_cmdlist,
             std::atomic<uint64_t>& restores) {
-  uint8_t* lctx = g_get_ctx();
+  uint8_t* lctx = current_ctx();
   auto* cl = lctx ? *reinterpret_cast<ID3D12GraphicsCommandList**>(lctx + kCtxCmdList) : nullptr;
   if (!cl) {
     no_cmdlist.fetch_add(1, std::memory_order_relaxed);
@@ -243,7 +267,7 @@ void run_fn(rg_node_fn fn, void* user, const uint8_t* ctx, std::atomic<uint64_t>
   const rg_node_info info{0, (ctx[kNodeCtxFlags] & 1) ? 0u : (view & 0xff), cl};
   uint32_t touched;
   {
-    prof::Pause client;
+    prof::Client client("node fn", name);
     clients::Running running(reinterpret_cast<const void*>(fn));
     touched = fn(user, &info);
   }
@@ -258,17 +282,21 @@ void run_fn(rg_node_fn fn, void* user, const uint8_t* ctx, std::atomic<uint64_t>
 // fn's part of Execute; the declarations around it are issued whatever this returns.
 void node_run(Node* n, const uint8_t* ctx) {
   n->executes.fetch_add(1, std::memory_order_relaxed);
-  run_fn(n->fn, n->user, ctx, n->no_cmdlist, n->restores);
+  run_fn(n->name, n->fn, n->user, ctx, n->no_cmdlist, n->restores);
 }
 
 void node_execute(const uint8_t* self, const uint8_t* ctx, void*) {
   Node* n = node_of(self);
   if (!n) return;
   declare_begin(*n, ctx);
-  if (render_flow::declaring(ctx))  // the graph's first run of the frame: requests only, nothing is recorded
+  if (render_flow::declaring(ctx)) {  // the graph's first run of the frame: requests only, nothing is recorded
     n->declares.fetch_add(1, std::memory_order_relaxed);
-  else
+  } else {
+    const bool rb = readback::armed();  // [Dev] Readback: our nodes are nodes too (inside their declarations)
+    if (rb) readback::at_node(self, false, false);
     node_run(n, ctx);
+    if (rb) readback::at_node(self, true, false);
+  }
   declare_end(*n, ctx);
 }
 
@@ -339,18 +367,30 @@ void wrap_declare(uint32_t nw, int32_t vi, const uint8_t* ctx, bool begin) {
 
 // The flow thread's list id when no list is bound on this thread now, else 0.
 uint32_t flow_list_if_unbound(const uint8_t* ctx) {
-  const uint8_t* lctx = g_get_ctx();
+  const uint8_t* lctx = current_ctx();
   if (lctx && *reinterpret_cast<void* const*>(lctx + kCtxCmdList)) return 0;
   const auto* so = *reinterpret_cast<const uint8_t* const*>(g_base + kRtSoTable);
   const auto* ids = so ? *reinterpret_cast<const uint32_t* const*>(so + kFlowCmdLists) : nullptr;
   return ids ? ids[ctx[kNodeCtxFlowThread] + 1] : 0u;
 }
 
-// The engine's Execute, outside the host's profile.
+// The node class whose Execute runs on this thread now (its index in g_vt), -1 = none: gpu_timing names the node an
+// item of ours is recorded in, render_flow the class of a job's node.
+thread_local int32_t t_class = -1;
+
+// The engine's Execute, outside the host's profile; the A/B profile's CPU of the class (ab.hpp).
 template <class P>
-void orig_execute(const P* p, const uint8_t* self, const uint8_t* ctx, void* builder) {
+void orig_execute(const P* p, int32_t vi, const uint8_t* self, const uint8_t* ctx, void* builder) {
   prof::Pause engine;
-  p->orig(self, ctx, builder);
+  const int32_t prev = t_class;
+  t_class = vi;
+  if (ab::measuring()) {
+    ab::Span span(vi, false);
+    p->orig(self, ctx, builder);
+  } else {
+    p->orig(self, ctx, builder);
+  }
+  t_class = prev;
 }
 
 // Slot [1] of every wrapped class. The original runs in both runs of the graph; the clients' fns in the real one.
@@ -392,7 +432,7 @@ void wrap_execute(const uint8_t* self, const uint8_t* ctx, void* builder) {
     }
     w.executes.fetch_add(1, std::memory_order_relaxed);
     if (reinterpret_cast<JobUsage_t>(vt[kNodeVtJobBuilderUsage])(self)) w.jobs.fetch_add(1, std::memory_order_relaxed);
-    if (w.before) run_fn(w.before, w.user, ctx, w.no_cmdlist, w.restores);
+    if (w.before) run_fn(w.name, w.before, w.user, ctx, w.no_cmdlist, w.restores);
   }
   if (rm && declaring) {
     Instance* in = claim_instance(*rm, self);
@@ -401,7 +441,7 @@ void wrap_execute(const uint8_t* self, const uint8_t* ctx, void* builder) {
     in->rec.n = 0;
     in->rec.overflow = false;
     render_flow::record_into(&in->rec);
-    orig_execute(p, self, ctx, builder);
+    orig_execute(p, vi, self, ctx, builder);
     render_flow::record_into(nullptr);
     if (in->rec.overflow) rm->overflows.fetch_add(1, std::memory_order_relaxed);
     if (declare) wrap_declare(nw, vi, ctx, false);
@@ -412,12 +452,15 @@ void wrap_execute(const uint8_t* self, const uint8_t* ctx, void* builder) {
     ds->rec.n = 0;
     ds->rec.overflow = false;
     render_flow::record_into(&ds->rec);
-    orig_execute(p, self, ctx, builder);
+    orig_execute(p, vi, self, ctx, builder);
     render_flow::record_into(nullptr);
     if (ds->rec.overflow) ds->overflows.fetch_add(1, std::memory_order_relaxed);
     if (declare) wrap_declare(nw, vi, ctx, false);
     return;
   }
+  const bool rb = !declaring && !p->shared && readback::armed();  // [Dev] Readback: before / after this node
+  const bool rb_job = rb && reinterpret_cast<JobUsage_t>(vt[kNodeVtJobBuilderUsage])(self);
+  if (rb) readback::at_node(self, false, rb_job);
   // GPU timing: the ENGINE's work of this node (its Execute, or the removal's replay) on the node's list - not the
   // clients' before / after. Not a group (its members run on their own lists) nor a job-builder node (its work is in
   // jobs); a list that changed under it drops the pair.
@@ -425,7 +468,7 @@ void wrap_execute(const uint8_t* self, const uint8_t* ctx, void* builder) {
   ID3D12GraphicsCommandList* gcl = nullptr;
   if (!declaring && !p->shared && gpu_timing::active() &&
       !reinterpret_cast<JobUsage_t>(vt[kNodeVtJobBuilderUsage])(self)) {
-    const uint8_t* lctx = g_get_ctx();
+    const uint8_t* lctx = current_ctx();
     gcl = lctx ? *reinterpret_cast<ID3D12GraphicsCommandList* const*>(lctx + kCtxCmdList) : nullptr;
     gt = gcl ? gpu_timing::begin(gcl, gpu_timing::kNode, vi + 1, false) : 0;
   }
@@ -436,7 +479,7 @@ void wrap_execute(const uint8_t* self, const uint8_t* ctx, void* builder) {
       rm->removed.fetch_add(1, std::memory_order_relaxed);
       rm->replayed.fetch_add(in->rec.n, std::memory_order_relaxed);
     } else {
-      orig_execute(p, self, ctx, builder);
+      orig_execute(p, vi, self, ctx, builder);
       rm->ran.fetch_add(1, std::memory_order_relaxed);
     }
   } else if (ds) {
@@ -445,19 +488,20 @@ void wrap_execute(const uint8_t* self, const uint8_t* ctx, void* builder) {
       ds->removed.fetch_add(1, std::memory_order_relaxed);
       ds->replayed.fetch_add(ds->rec.n, std::memory_order_relaxed);
     } else {
-      orig_execute(p, self, ctx, builder);
+      orig_execute(p, vi, self, ctx, builder);
       ds->ran.fetch_add(1, std::memory_order_relaxed);
     }
   } else {
-    orig_execute(p, self, ctx, builder);
+    orig_execute(p, vi, self, ctx, builder);
   }
   if (gt) {
-    const uint8_t* lctx = g_get_ctx();
+    const uint8_t* lctx = current_ctx();
     if (lctx && *reinterpret_cast<ID3D12GraphicsCommandList* const*>(lctx + kCtxCmdList) == gcl)
       gpu_timing::end(gcl, gt, false);
     else
       gpu_timing::abandon(gt);
   }
+  if (rb) readback::at_node(self, true, rb_job);
   if (!any || declaring) {
     if (declare) wrap_declare(nw, vi, ctx, false);
     return;
@@ -470,7 +514,7 @@ void wrap_execute(const uint8_t* self, const uint8_t* ctx, void* builder) {
     Wrap& w = g_w[i];
     if (!w.after || !wrap_matches(w, vi, p->shared, name)) continue;
     if (rebind) w.rebinds.fetch_add(1, std::memory_order_relaxed);
-    run_fn(w.after, w.user, ctx, w.no_cmdlist, w.restores);
+    run_fn(w.name, w.after, w.user, ctx, w.no_cmdlist, w.restores);
   }
   if (rebind) g_bind_cl(0);
   if (declare) wrap_declare(nw, vi, ctx, false);
@@ -556,6 +600,34 @@ uint32_t d_register(void* factory, uint32_t group, const void* params) {
 bool needed() { return g_nn.load() != 0 || g_nw.load() != 0 || g_debug.load() || g_wrap_all.load(); }
 
 void wrap_all_classes() { g_wrap_all.store(true); }
+
+void note_ctx(const uint8_t* c) {
+  thread_local const uint8_t* t_last = nullptr;
+  if (!c || c == t_last) return;
+  t_last = c;
+  if (known_ctx(c)) return;
+  std::lock_guard lock(g_ctx_mu);
+  if (known_ctx(c)) return;
+  const uint32_t n = g_nctx.load();
+  if (n >= kMaxCtx) return;
+  g_ctx[n].store(c, std::memory_order_relaxed);
+  g_nctx.store(n + 1, std::memory_order_release);
+}
+
+int32_t current_class() { return t_class; }
+int32_t class_of(const void* node) {
+  if (!node) return -1;
+  const PatchedVt* p = patched_of(*static_cast<void* const* const*>(node));
+  return p ? static_cast<int32_t>(p - g_vt) : -1;
+}
+int32_t enter_class(int32_t cls) {
+  const int32_t prev = t_class;
+  t_class = cls;
+  return prev;
+}
+void leave_class(int32_t prev) { t_class = prev; }
+const char* class_name(int32_t cls) { return gpu_timing::node_name(cls + 1); }
+uint32_t class_count() { return g_nvt.load(std::memory_order_acquire); }
 
 bool attach() {
   if (!needed()) return false;

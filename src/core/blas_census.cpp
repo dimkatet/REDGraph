@@ -121,7 +121,7 @@ void** g_vt = nullptr;
 
 struct Ib {
   uint64_t va = 0, vb0 = 0;  // the views' BufferLocation
-  uint32_t size = 0, isz = 0, vb0_size = 0;
+  uint32_t size = 0, isz = 0, vb0_size = 0, vb0_stride = 0;
 };
 thread_local Ib t_ib;
 
@@ -152,6 +152,7 @@ void STDMETHODCALLTYPE d_set_vb(void* cl, UINT start, UINT n, const D3D12_VERTEX
   if (start == 0 && n && v) {
     t_ib.vb0 = v[0].BufferLocation;
     t_ib.vb0_size = v[0].SizeInBytes;
+    t_ib.vb0_stride = v[0].StrideInBytes;
   }
   g_orig_set_vb(cl, start, n, v);
 }
@@ -452,6 +453,16 @@ void attach() {
                                 reinterpret_cast<void**>(&g_orig_eval), "CRenderMesh::EvaluatePositions (BLAS census)");
   g_sdk->logger->InfoF(g_handle, "[blas] census: EvaluatePositions %s (per proxy: caller, material handler, stamp, pool CS)",
                        g_eval_attached ? "HOOKED" : "NOT hooked");
+}
+
+bool ia_views(IaViews* out) {
+  if (g_vt_state.load(std::memory_order_relaxed) != 2) {
+    patch_vtable();
+    return false;
+  }
+  const Ib& t = t_ib;
+  *out = {t.va, t.vb0, t.size, t.isz, t.vb0_size, t.vb0_stride};
+  return true;
 }
 
 void detach() {

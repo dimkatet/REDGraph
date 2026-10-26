@@ -11,6 +11,8 @@
 #include <RED4ext/Api/v1/PluginHandle.hpp>
 #include <RED4ext/Api/v1/Sdk.hpp>
 
+#include <string>
+
 namespace core {
 
 void open(RED4ext::v1::PluginHandle handle, const RED4ext::v1::Sdk* sdk);
@@ -33,5 +35,16 @@ void detach();
 namespace blas_census {
 void enable();
 }  // namespace blas_census
+
+// [Dev] ShaderHotReload: enable() before attach - pso keeps every mapped PSO's desc, `dir` is watched ("" =
+// shader_reload/ next to REDGraph.dll).
+namespace shader_reload {
+void enable(const std::string& dir);
+}  // namespace shader_reload
+
+// [Dev] Readback: enable() before attach - every node class is wrapped, `dir` gets the files (core/readback.cpp).
+namespace readback {
+void enable(const std::string& dir);
+}  // namespace readback
 
 }  // namespace core

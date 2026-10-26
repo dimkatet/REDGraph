@@ -904,6 +904,10 @@ void d_blas(void* range, void* geoms, uint32_t buffer) {
 // engine's own layout (version 0x10020, stride 0x68). A geometry: u32 type (0 triangles, 1 AABBs, 2 triangles + OMM),
 // flags, then D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC / _AABBS_DESC at +8.
 int d_nv(void* cl_engine, const void* params) {
+  if (readback::blas_armed()) {  // [Dev] Readback: copy this build's inputs before it runs
+    const auto* p = static_cast<const uint8_t*>(params);
+    if (p && rd32(p) == 0x10020) readback::on_blas_build(cl_engine, reinterpret_cast<const uint8_t*>(rd64(p + 8)));
+  }
   if (blas_census::on()) {
     const auto* p = static_cast<const uint8_t*>(params);
     blas_census::on_nv(p && rd32(p) == 0x10020 ? reinterpret_cast<const uint8_t*>(rd64(p + 8)) : nullptr);

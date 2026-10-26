@@ -40,6 +40,7 @@ bool enabled();
 bool active();              // timing now (the per-call check)
 void set_node_timing(bool on);  // every node class is wrapped (for the report)
 void set_node_name(int32_t handle, const char* name);  // a node class's name (stable for the process)
+const char* node_name(int32_t handle);  // "?" = none
 void frame_tick();          // the frame hook (prof.cpp): reads the slot it is about to reuse
 
 // 0 = not timed (off, not ready, the frame's pairs used up). Pair it with end() on the same list. `event`: a debug
@@ -61,5 +62,24 @@ struct Scope {
 
 // Tab-separated lines for the CET window and the status report (format in gpu_timing.cpp); "" = off.
 std::string report();
+
+// ---- running totals, for the A/B profile (ab.cpp): a block is the difference of two snapshots ----
+// Items: companions, draw companions, passes, nodes, rays (library), rays (variant) - kCount per kind in the .cpp.
+constexpr uint32_t kItemCount = 8 + 8 + 8 + 256 + 64 + 64;
+constexpr uint32_t kNodeBase = 8 + 8 + 8;  // item index of node class 0
+struct Totals {
+  uint64_t read;                  // frames read
+  double span_ms;                 // sum over frames: first to last NODE timestamp on the direct queue
+  uint64_t span_frames;           // frames with a span
+  double item_ms[kItemCount];     // sum over the frames read (a frame without the item adds 0)
+  uint64_t item_bad[kItemCount];  // frames whose reading of the item was incomplete (late / refused / rejected)
+};
+void totals(Totals* out);
+Kind item_kind(uint32_t item);
+const char* kind_name(Kind kind);
+std::string item_client(uint32_t item);
+std::string item_name(uint32_t item);
+// The node class an item of ours was last recorded in (render_nodes' class index), -1 = none seen.
+int32_t item_node(uint32_t item);
 
 }  // namespace core::gpu_timing

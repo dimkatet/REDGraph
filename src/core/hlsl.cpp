@@ -6,8 +6,8 @@
 // never touched. Not linked (the 20 MB is why runtime compile was once rejected) and never a hard dependency: without
 // dxcompiler.dll every call is RG_E_UNAVAILABLE, logged once. Without dxil.dll the container comes out UNSIGNED (an
 // all-zero hash at bytes 4..20) and D3D12 would reject it - refused here with the reason. Every blob is kept for the
-// process: the engine and our clones keep pointers into bytecode. Hot reload is not offered: a registered patch /
-// companion cannot take a new blob yet.
+// process: the engine and our clones keep pointers into bytecode. assemble() serves [Dev] ShaderHotReload
+// (shader_reload.cpp): an edited .ll back into a signed container.
 
 #include <Windows.h>
 #include <objidl.h>  // IStream, IUnknown - Windows.h is lean in this build
@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <initializer_list>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -30,6 +31,7 @@ std::mutex g_mu;  // IDxcCompiler3 is one instance: one compile at a time
 bool g_tried = false;
 IDxcUtils* g_utils = nullptr;
 IDxcCompiler3* g_dxc = nullptr;
+DxcCreateInstanceProc g_create = nullptr;  // for the assembler / validator ([Dev] ShaderHotReload)
 bool g_have_dxil = false;
 std::vector<IDxcBlob*> g_keep;  // never released
 
@@ -57,6 +59,7 @@ bool load() {
   g_have_dxil = LoadLibraryExW((dir / L"dxil.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH) != nullptr;
   HMODULE dxc = LoadLibraryExW((dir / L"dxcompiler.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
   auto create = dxc ? reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(dxc, "DxcCreateInstance")) : nullptr;
+  g_create = create;
   if (!create) {
     g_sdk->logger->InfoF(g_handle, "hlsl: no dxcompiler.dll next to REDGraph.dll (%ls) - compile_hlsl is unavailable",
                          dir.c_str());
@@ -182,6 +185,63 @@ int32_t compile(const rg_hlsl_desc* d, rg_blob* out, char* error, uint32_t error
   if (obj) obj->Release();
   if (msgs) msgs->Release();
   if (res) res->Release();
+  return rc;
+}
+
+int32_t assemble(const std::string& ir, rg_blob* out, std::string* error) {
+  *out = {nullptr, 0};
+  std::lock_guard lock(g_mu);
+  if (!load() || !g_create) {
+    *error = "no dxcompiler.dll next to REDGraph.dll";
+    return RG_E_UNAVAILABLE;
+  }
+  if (!g_have_dxil) {
+    *error = "no dxil.dll next to REDGraph.dll: the container could not be signed";
+    return RG_E_UNAVAILABLE;
+  }
+  IDxcAssembler* as = nullptr;
+  IDxcValidator* val = nullptr;
+  IDxcBlobEncoding* text = nullptr;
+  IDxcOperationResult* ar = nullptr;
+  IDxcOperationResult* vr = nullptr;
+  IDxcBlob* obj = nullptr;
+  auto errors_of = [](IDxcOperationResult* r, const char* what) {
+    std::string e = what;
+    IDxcBlobEncoding* b = nullptr;
+    if (r && SUCCEEDED(r->GetErrorBuffer(&b)) && b && b->GetBufferSize())
+      e += ": " + std::string(static_cast<const char*>(b->GetBufferPointer()), b->GetBufferSize());
+    if (b) b->Release();
+    return e;
+  };
+  int32_t rc = RG_E_COMPILE;
+  HRESULT st = E_FAIL;
+  if (FAILED(g_create(CLSID_DxcAssembler, IID_PPV_ARGS(&as))) || FAILED(g_create(CLSID_DxcValidator, IID_PPV_ARGS(&val)))) {
+    *error = "dxcompiler.dll has no assembler / validator";
+    rc = RG_E_UNAVAILABLE;
+  } else if (FAILED(g_utils->CreateBlob(ir.data(), static_cast<UINT32>(ir.size()), DXC_CP_UTF8, &text))) {
+    *error = "CreateBlob failed";
+  } else if (FAILED(as->AssembleToContainer(text, &ar)) || !ar || FAILED(ar->GetStatus(&st)) || FAILED(st)) {
+    *error = errors_of(ar, "assembly failed");
+  } else if (FAILED(ar->GetResult(&obj)) || !obj || obj->GetBufferSize() < 32) {
+    *error = "the assembler returned no container";
+  } else if (FAILED(val->Validate(obj, DxcValidatorFlags_InPlaceEdit, &vr)) || !vr || FAILED(vr->GetStatus(&st)) ||
+             FAILED(st)) {
+    *error = errors_of(vr, "validation failed");  // InPlaceEdit also writes the container's checksum (the signature)
+  } else {
+    const auto* b = static_cast<const uint8_t*>(obj->GetBufferPointer());
+    bool signed_ = false;
+    for (int i = 4; i < 20; ++i) signed_ |= b[i] != 0;
+    if (!signed_) {
+      *error = "validated but not signed";
+    } else {
+      g_keep.push_back(obj);
+      obj = nullptr;
+      *out = {b, g_keep.back()->GetBufferSize()};
+      rc = 0;
+    }
+  }
+  for (IUnknown* u : std::initializer_list<IUnknown*>{as, val, text, ar, vr, obj})
+    if (u) u->Release();
   return rc;
 }
 

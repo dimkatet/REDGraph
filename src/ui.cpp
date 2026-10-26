@@ -11,10 +11,16 @@
 //   RG_Profile(Float delay, Float seconds) -> String   the host's own CPU, measured `seconds` after `delay`
 //                                           (core/prof.hpp); "" = armed, else why not
 //   RG_ProfileState() -> String             "idle" / "starts in" / "measuring", then the last report
+//   RG_AB(String switches, Float block, Float settle, Float pairs) -> String   the A/B profile ([Diagnostics]
+//                                           ABProfile, core/ab.hpp): "" = started, else why not; "stop" aborts
+//   RG_ABState() -> String                  the run's state line, then the last report (also in the log as [ab])
+//   RG_ABSwitches() -> String               the clients' A/B switches: name 	 on / off
 //   RG_GpuTiming() -> String                GPU ms per companion / pass ([Diagnostics] GpuTiming,
 //                                           core/gpu_timing.cpp has the format); "" = off
 //   RG_Clients() -> String                  the host's clients and what each registered (core/clients.cpp has
 //                                           the format)
+//   RG_Readback(String spec) -> Int32       [Dev] Readback: a request (include/rg_dev.h has the spec) -> its id
+//   RG_ReadbackResult(Int32 id) -> String   "pending: ..." / "done: <file> | dims | min max nan" / "failed: why"
 
 #include "ui.hpp"
 
@@ -24,6 +30,8 @@
 #include <RED4ext/RED4ext.hpp>
 
 #include "rg_host.h"
+#include "rg_dev.h"
+#include "core/ab.hpp"
 #include "core/clients.hpp"
 #include "core/gpu_timing.hpp"
 #include "core/graph_debug.hpp"
@@ -129,6 +137,29 @@ void ProfileState(RED4ext::IScriptable*, RED4ext::CStackFrame* frame, RED4ext::C
   if (out) *out = RED4ext::CString((core::prof::state() + "\n" + core::prof::report()).c_str());
 }
 
+void AB(RED4ext::IScriptable*, RED4ext::CStackFrame* frame, RED4ext::CString* out, int64_t) {
+  RED4ext::CString spec;
+  float block = 0.0f, settle = 0.0f, pairs = 0.0f;
+  RED4ext::GetParameter(frame, &spec);
+  RED4ext::GetParameter(frame, &block);
+  RED4ext::GetParameter(frame, &settle);
+  RED4ext::GetParameter(frame, &pairs);
+  frame->code++;  // ParamEnd
+  const std::string r = core::ab::run(spec.c_str(), block, settle, static_cast<uint32_t>(pairs < 0 ? 0 : pairs));
+  if (!r.empty()) say(RG_LOG_WARN, "ui: RG_AB - " + r);
+  if (out) *out = RED4ext::CString(r.c_str());
+}
+
+void ABState(RED4ext::IScriptable*, RED4ext::CStackFrame* frame, RED4ext::CString* out, int64_t) {
+  frame->code++;  // ParamEnd
+  if (out) *out = RED4ext::CString(core::ab::state().c_str());
+}
+
+void ABSwitches(RED4ext::IScriptable*, RED4ext::CStackFrame* frame, RED4ext::CString* out, int64_t) {
+  frame->code++;  // ParamEnd
+  if (out) *out = RED4ext::CString(core::ab::switches().c_str());
+}
+
 void GpuTiming(RED4ext::IScriptable*, RED4ext::CStackFrame* frame, RED4ext::CString* out, int64_t) {
   frame->code++;  // ParamEnd
   if (out) *out = RED4ext::CString(core::gpu_timing::report().c_str());
@@ -184,6 +215,25 @@ void GraphAction(RED4ext::IScriptable*, RED4ext::CStackFrame* frame, bool* out, 
   if (out) *out = ok;
 }
 
+// ---- [Dev] Readback (rg_dev.h has the spec) ----
+
+void Readback(RED4ext::IScriptable*, RED4ext::CStackFrame* frame, int32_t* out, int64_t) {
+  RED4ext::CString spec;
+  RED4ext::GetParameter(frame, &spec);
+  frame->code++;  // ParamEnd
+  const int32_t id = rg_dev_readback(spec.c_str());
+  if (out) *out = id;
+}
+
+void ReadbackResult(RED4ext::IScriptable*, RED4ext::CStackFrame* frame, RED4ext::CString* out, int64_t) {
+  int32_t id = 0;
+  RED4ext::GetParameter(frame, &id);
+  frame->code++;  // ParamEnd
+  rg_readback_info info{};
+  rg_dev_readback_result(id, &info);
+  if (out) *out = RED4ext::CString(info.text);
+}
+
 template <typename Fn>
 RED4ext::CGlobalFunction* make(const char* name, Fn fn, const char* ret) {
   auto* f = RED4ext::CGlobalFunction::Create(name, name, fn);
@@ -216,6 +266,16 @@ void post_register() {
   }
   rtti->RegisterFunction(make("RG_ProfileState", &ProfileState, "String"));
   rtti->RegisterFunction(make("RG_GpuTiming", &GpuTiming, "String"));
+  {
+    auto* f = make("RG_AB", &AB, "String");
+    f->AddParam("String", "switches");
+    f->AddParam("Float", "block");
+    f->AddParam("Float", "settle");
+    f->AddParam("Float", "pairs");
+    rtti->RegisterFunction(f);
+  }
+  rtti->RegisterFunction(make("RG_ABState", &ABState, "String"));
+  rtti->RegisterFunction(make("RG_ABSwitches", &ABSwitches, "String"));
   rtti->RegisterFunction(make("RG_Graph", &Graph, "String"));
   {
     auto* f = make("RG_GraphNode", &GraphNode, "String");
@@ -243,7 +303,18 @@ void post_register() {
     f->AddParam("Int32", "action");
     rtti->RegisterFunction(f);
   }
-  say(RG_LOG_INFO, "ui: native functions registered - RG_Ping, RG_Get, RG_Set, RG_Status, RG_Clients, RG_Profile*, RG_GpuTiming, RG_Graph*");
+  {
+    auto* f = make("RG_Readback", &Readback, "Int32");
+    f->AddParam("String", "spec");
+    rtti->RegisterFunction(f);
+  }
+  {
+    auto* f = make("RG_ReadbackResult", &ReadbackResult, "String");
+    f->AddParam("Int32", "id");
+    rtti->RegisterFunction(f);
+  }
+  say(RG_LOG_INFO, "ui: native functions registered - RG_Ping, RG_Get, RG_Set, RG_Status, RG_Clients, RG_Profile*, "
+                   "RG_GpuTiming, RG_AB*, RG_Graph*, RG_Readback*");
 }
 
 void on_register() {}

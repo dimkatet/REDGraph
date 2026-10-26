@@ -23,7 +23,7 @@ constexpr uint32_t kMaxEntries = 1024;
 const char* const kKindName[kKinds] = {
     "patch", "patch scope", "companion", "companion scope", "lease", "cbuffer", "cbuffer feed", "view", "RT library",
     "RT variant", "pass", "subscription", "device_ready", "flow", "node", "node use", "node alloc", "wrap", "remove", "patch state", "wrap use", "draw subscription", "draw companion",
-    "draw companion scope", "census watch", "engine block"};
+    "draw companion scope", "census watch", "engine block", "A/B switch"};
 
 struct Client {
   HMODULE module;
@@ -391,6 +391,12 @@ std::string target_of(Kind kind, rg_handle h) {
   std::lock_guard<std::mutex> g(g_mu);
   const Entry* e = find(kind, h);
   return e ? e->target : "";
+}
+
+rg_handle parent_of(Kind kind, rg_handle h) {
+  std::lock_guard<std::mutex> g(g_mu);
+  const Entry* e = find(kind, h);
+  return e ? e->parent : 0;
 }
 
 std::string client_of(Kind kind, rg_handle h) {

@@ -799,6 +799,7 @@ void d_execute_parallel(const void* graph, const void* ctx, void* builder) {
   prof::on_graph_execute();
   probe(graph);
   g_orig(graph, ctx, builder);
+  prof::on_graph_executed();
 }
 
 }  // namespace

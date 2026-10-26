@@ -23,18 +23,21 @@
 namespace {
 
 struct Wanted {
-  bool flow = false, lease_tex = false, compose = false, state = false, wrap_use = false, draw = false, hlsl = false;
+  bool flow = false, lease_tex = false, compose = false, state = false, wrap_use = false, draw = false, hlsl = false,
+       reload = false, readback = false;
   int rtv = 0, swap = 0, scope = 0;
 } g_want;
 
 void on_host(const rg_host* host, void*) {
-  char line[260];
+  char line[360];
   std::snprintf(line, sizeof line,
                 "selftest: REDGraph ready - FlowProbe %s, RtVariantTest %d, RtSwapTest %d, PatchScopeTest %d, "
-                "LeaseTexTest %s, ComposeTest %s, StateTest %s, WrapUseTest %s, DrawTest %s, HlslTest %s",
+                "LeaseTexTest %s, ComposeTest %s, StateTest %s, WrapUseTest %s, DrawTest %s, HlslTest %s, ReloadTest %s, "
+                "ReadbackTest %s",
                 g_want.flow ? "on" : "off", g_want.rtv, g_want.swap, g_want.scope, g_want.lease_tex ? "on" : "off",
                 g_want.compose ? "on" : "off", g_want.state ? "on" : "off", g_want.wrap_use ? "on" : "off",
-                g_want.draw ? "on" : "off", g_want.hlsl ? "on" : "off");
+                g_want.draw ? "on" : "off", g_want.hlsl ? "on" : "off",
+                g_want.reload ? "on" : "off", g_want.readback ? "on" : "off");
   host->log(RG_LOG_INFO, line);
   if (g_want.flow) selftest::flow_probe::register_with(host);
   selftest::rt_variant_test::register_with(host, g_want.rtv);
@@ -46,6 +49,8 @@ void on_host(const rg_host* host, void*) {
   selftest::state_test::register_with(host, g_want.state);
   selftest::wrap_use_test::register_with(host, g_want.wrap_use);
   selftest::draw_test::register_with(host, g_want.draw);
+  selftest::reload_test::register_with(host, g_want.reload);
+  selftest::readback_test::register_with(host, g_want.readback);
 }
 
 }  // namespace
@@ -66,6 +71,8 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle handle, RED4ex
     if (const std::string* s = ini.find("Tests", "WrapUseTest")) g_want.wrap_use = *s == "true" || *s == "1";
     if (const std::string* s = ini.find("Tests", "DrawTest")) g_want.draw = *s == "true" || *s == "1";
     if (const std::string* s = ini.find("Tests", "HlslTest")) g_want.hlsl = *s == "true" || *s == "1";
+    if (const std::string* s = ini.find("Tests", "ReloadTest")) g_want.reload = *s == "true" || *s == "1";
+    if (const std::string* s = ini.find("Tests", "ReadbackTest")) g_want.readback = *s == "true" || *s == "1";
   }
   const int r = rg_host_when_ready(&on_host, nullptr);
   sdk->logger->InfoF(handle, "REDGraphSelfTest: %s, host %s", path.string().c_str(),

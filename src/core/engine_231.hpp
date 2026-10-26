@@ -102,6 +102,13 @@ constexpr uintptr_t kCmdSigDrawIndexed = 0x1410678;  // in the device data: ID3D
 constexpr uintptr_t kCmdSigDraw = 0x1410670;         // ... one draw
 constexpr uintptr_t kCtxTopology = 0x628;  // u32 D3D_PRIMITIVE_TOPOLOGY set on the list (re-set when it differs)
 constexpr uintptr_t kRestoreState = 0x2fa5278;           // GpuApi::Hacks::RestoreState(cmdlist)
+// What RestoreState does, in parts (2.5): ctx+0x3d8 / +0x3e0 = the graphics / compute root signature the context last
+// set; EnsureComputeRootSignature(ctx, bool rt) - when +0x3e0 is not the engine's compute one (device data + 0x1410640):
+// every root parameter dirty (SFrameResources), cache it, SetComputeRootSignature. RestoreState itself also sets the
+// GRAPHICS root signature and BindDescriptorHeaps - not for a COMPUTE list (the BLAS builds run on one).
+constexpr uintptr_t kCtxGraphicsRootSig = 0x3d8;
+constexpr uintptr_t kCtxComputeRootSig = 0x3e0;
+constexpr uintptr_t kEnsureComputeRootSig = 0x3e3c18;
 // GpuApi::TransitionTexture(CommandListContext&, TextureRef, ResourceState, u32 subresource) - ResourceState IS a
 // D3D12_RESOURCE_STATES (CopyTextureData passes 0x400 = COPY_DEST), subresource -1 = all; the engine's state tracker
 // records it and queues the barrier. FlushPendingBarriers(CommandListContext&) records the queued barriers.
@@ -131,6 +138,21 @@ constexpr size_t kRtSoEntry = 24;
 constexpr uintptr_t kRtStateObjects = 0x1406c58;  // in the device data: the state-object container's entries
 constexpr size_t kRtStateObjectStride = 0x38;     // = the creator's `out`: +0 ComPtr<ID3D12StateObject>, +0x10 names
 constexpr uintptr_t kFlushPendingBarriers = 0x3e3bb4;
+// The global GRAPHICS root signature's flags (2.5). Two creators store it at device data + 0x1410638 (the compute one
+// at +0x1410640, flags 0): a 1.0 desc for D3D12SerializeRootSignature, `mov qword ptr [rbp-0x10], 1` - the one that
+// RAN on 2.5 / NVIDIA, 2026-10-24 -, and a 1.1 desc for the versioned serializer, `mov dword ptr [rbp-8], 1`. Flags 1 =
+// ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT only: without ALLOW_STREAM_OUTPUT (0x40) no PSO on it may stream out ([Dev]
+// Readback's vsout: CreateGraphicsPipelineState E_INVALIDARG) - the dev switch patches both immediates to 0x41 at Load,
+// before InitDevice creates it. {rva, the instruction's bytes, offset of the immediate's low byte}.
+struct CodePatchSite {
+  uintptr_t rva;
+  uint8_t bytes[8];
+  uint32_t size, imm;
+};
+constexpr CodePatchSite kGfxRootSigFlags[2] = {
+    {0x108c854, {0x48, 0xC7, 0x45, 0xF0, 0x01, 0x00, 0x00, 0x00}, 8, 4},
+    {0x2fa4e6d, {0xC7, 0x45, 0xF8, 0x01, 0x00, 0x00, 0x00}, 7, 3},
+};
 // Acceleration-structure builds (markers, 0.3.2). The BLAS batch builder (the symbols call it
 // BindAccelerationStructure+0x104 - a folded name) records per BLAS either the statically linked
 // NvAPI_D3D12_BuildRaytracingAccelerationStructureEx(cl, params) or ID3D12GraphicsCommandList4 vtable +0x240; args

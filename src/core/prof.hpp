@@ -33,6 +33,11 @@ extern std::atomic<bool> g_on;
 
 void add(Point p, uint64_t cycles);
 extern thread_local uint64_t t_paused;
+// Our time on this thread - the host's Scopes (exclusive) and the clients' callbacks: the A/B profile's node Span
+// (ab.hpp) leaves it out of the engine's time. Only grows; a Span rewinds it to its own start when it closes.
+extern thread_local uint64_t t_ours;
+// The A/B profile: a client callback's time by its registration name (ab.cpp).
+void client_time(const char* what, const char* name, uint64_t cycles);
 
 struct Scope {
   uint64_t t0 = 0, p0 = 0;
@@ -45,11 +50,34 @@ struct Scope {
   }
   ~Scope() {
     if (!t0) return;
-    const uint64_t all = __rdtsc() - t0, paused = t_paused - p0;
-    add(p, all > paused ? all - paused : 0);
+    const uint64_t all = __rdtsc() - t0, paused = t_paused - p0, own = all > paused ? all - paused : 0;
+    add(p, own);
+    t_ours += own;
   }
   Scope(const Scope&) = delete;
   Scope& operator=(const Scope&) = delete;
+};
+
+// A client's callback: not the host's time (a Pause), counted for the A/B profile by its registration name.
+struct Client {
+  uint64_t t0 = 0, p0 = 0;
+  const char* what;
+  const char* name;
+  Client(const char* what, const char* name) : what(what), name(name) {
+    if (g_on.load(std::memory_order_relaxed)) {
+      p0 = t_paused;
+      t0 = __rdtsc();
+    }
+  }
+  ~Client() {
+    if (!t0) return;
+    const uint64_t dt = __rdtsc() - t0;
+    t_paused = p0 + dt;
+    t_ours += dt;
+    client_time(what, name, dt);
+  }
+  Client(const Client&) = delete;
+  Client& operator=(const Client&) = delete;
 };
 
 // Not the host's time: the engine's original, a client's callback.
@@ -73,8 +101,14 @@ struct Pause {
 void attach_frames();      // after the core's attach: its own ExecuteParallel hook unless graph_probe has one
 void detach();
 void on_graph_execute();   // from graph_probe's ExecuteParallel detour (when that one is attached)
+void on_graph_executed();  // ... and after the engine's original returned
 void set_frame_timer(bool on);  // [Diagnostics] FrameTimer: the frame time every 10 s in the log ([frame])
 std::string arm(double delay_s, double seconds);  // "" = armed, else why not
+// The A/B profile (ab.cpp) keeps the points counting while it runs; the timer profile and it exclude each other.
+bool set_ab(bool on);  // false = the timer profile is running (on refused)
+// The points' running totals (cycles), for the A/B profile's blocks.
+void totals(uint64_t cycles[kPoints]);
+const char* point_name(uint32_t p);
 std::string state();       // one line: idle / starts in / measuring, s left
 std::string report();      // the last measurement ("" = none yet)
 

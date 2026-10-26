@@ -15,6 +15,7 @@
 
 #include "core/engine_blocks.hpp"
 #include "core/clients.hpp"
+#include "core/ab.hpp"
 #include "core/gpu_timing.hpp"
 #include "core/crash_log.hpp"
 #include "core/engine_231.hpp"
@@ -410,6 +411,12 @@ __declspec(noinline) int32_t w_node_remove_clear(rg_handle remove, uint32_t name
   return r;
 }
 
+__declspec(noinline) rg_handle w_ab_switch(const char* name, rg_ab_set_fn set, rg_ab_get_fn get, void* user) {
+  const rg_handle r = ab::ab_switch(name, set, get, user);
+  clients::note(_ReturnAddress(), clients::kAbSwitch, r, 0, name ? name : "", "");
+  return r;
+}
+
 void h_node_remove_set(rg_handle remove, uint32_t on) {
   if (own(_ReturnAddress(), clients::sRemove, remove, "node_remove_set")) render_nodes::node_remove_set(remove, on);
 }
@@ -478,6 +485,9 @@ const rg_host kHost = {
     &w_node_remove_clear,
     &w_census_watch,
     &w_engine_block_find,
+    &w_ab_switch,
+    &ab::prof_active,
+    &ab::prof_add,
 };
 
 }  // namespace
@@ -586,12 +596,14 @@ void attach() {
   if (want_rt) rt_ok = rtlib::attach();
   if (want_pass) pass_ok = passes::attach();
   if (gpu_timing::enabled()) render_nodes::wrap_all_classes();  // GpuTiming on at the start: every node timed
+  if (ab::enabled()) render_nodes::wrap_all_classes();          // ABProfile: every node's CPU (and GPU) per class
   render_nodes::attach();  // only if a client registered a node, a wrap, or every class is wrapped
   render_flow::attach();   // only if a census, a flow_register or a node wants it
   if (graph_probe::census()) graph_probe::attach();
   // M12 variants, the census's DispatchRays rows and / or GPU timing of raygens in state objects with our libraries
   rtlib::attach_rays(graph_probe::rays_wanted(), gpu_timing::enabled());
   blas_census::attach();  // [Diagnostics] BlasCensus only; after attach_rays (shares its NvAPI BLAS hook)
+  if (readback::on()) rtlib::attach_nv_census();  // [Dev] Readback's blas: the BLAS builds' inputs
   prof::attach_frames();                         // the profile timer (RG_Profile)
   auto s = [](bool want, bool ok) { return want ? (ok ? "on" : "FAILED") : "none"; };
   g_sdk->logger->InfoF(g_handle, "host: ATTACHED at %s - PSO patches %s, engine-table leases %s, RT libraries %s, "

@@ -49,4 +49,12 @@ bool available(const rg_host* host);  // the host has compile_hlsl
 void register_with(const rg_host* host, bool on);
 }  // namespace hlsl_test
 
+namespace reload_test {  // [Tests] ReloadTest: [Dev] ShaderHotReload (files dropped into shader_reload/ while running)
+void register_with(const rg_host* host, bool on);
+}  // namespace reload_test
+
+namespace readback_test {  // [Tests] ReadbackTest: [Dev] Readback (a known pattern of ours, then t64, cb12, refusals)
+void register_with(const rg_host* host, bool on);
+}  // namespace readback_test
+
 }  // namespace selftest

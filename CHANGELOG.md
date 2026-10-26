@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.0
+
+- For mod developers: the A/B profile (`[Diagnostics] ABProfile`) - a mod registers a switch per feature
+  (`rg_host::ab_switch`, new), and `Game.RG_AB(...)` from CET turns them off and on in alternating blocks and logs
+  what the feature costs: the frame, the GPU time of its ray-tracing dispatches and extra passes, the CPU per engine
+  node, per callback and in the mod's own hooks (`prof_active` / `prof_add`, new). API: three entries appended (check
+  `struct_size`); API version stays 1. Off by default; players are not affected.
+- Fixed: with `[Diagnostics] GpuTiming` on, game 2.5 crashed at the first rendered frame.
+- For mod developers: `[Dev] ShaderHotReload` in `REDGraph.ini` - drop a `.dxbc` or an edited `.ll` into a folder and
+  a registered patch / companion runs it at once, without restarting the game (`docs/internals.md`, "Shader hot reload
+  (dev)"). Off by default; players are not affected.
+- For mod developers: `[Dev] Readback` - `Game.RG_Readback("flow:<name> after:<node>")` (or `block:<engine block>`)
+  from CET copies a render-graph texture at that node, or the next write of an engine constant block, into a file
+  (`.dds` / `.bin` + `.json`), and `Game.RG_ReadbackResult(id)` says where, with min / max / NaN (`docs/internals.md`,
+  "GPU readback (dev)"). Off by default; players are not affected.
+- For mod developers: `[Dev] Readback` also takes `vsout:<VS hash>` - what a game vertex shader outputs at its next
+  draws, by Stream Output, with cb12 of the same frame - and `vsout:<hash> blas:1` - the same plus the ray-tracing
+  copies (BLAS build inputs) of the meshes it draws, in the same frame. With the switch on, the game's graphics root
+  signature allows Stream Output.
+- Fixed: with `RenderGraphDump` or `RenderGraphDebug` on, `[Dev] ShaderHotReload` never looked at its folder.
+
 ## 0.4.2
 
 - **Game 2.5.** This version runs on Cyberpunk 2077 2.5 only (needs RED4ext for 2.5); for 2.31 keep 0.4.1.

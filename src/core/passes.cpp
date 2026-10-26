@@ -114,7 +114,7 @@ void run_after(uint8_t* ctx) {
   auto* cl = *reinterpret_cast<ID3D12GraphicsCommandList**>(ctx + kCtxCmdList);
   uint32_t touched;
   {
-    prof::Pause client;
+    prof::Client client("pass", g_pass_names[a.pass - 1]);
     clients::Running running(reinterpret_cast<const void*>(a.fn));
     gpu_timing::Scope gpu(cl, gpu_timing::kPass, a.pass);
     touched = a.fn(a.user, cl);
@@ -140,7 +140,7 @@ void run_subs(uint32_t mask, const rg_dispatch_info& info) {
                            info.gz, indirect ? " (indirect)" : "");
     if (indirect && s.indirect.fetch_add(1, std::memory_order_relaxed) == 0 && s.calls.load() > 1)
       g_sdk->logger->InfoF(g_handle, "host: first INDIRECT subscribed dispatch '%s'", s.name);
-    prof::Pause client;
+    prof::Client client("subscription", s.name);
     clients::Running running(reinterpret_cast<const void*>(s.fn));
     s.fn(s.user, &info);
   }
@@ -191,7 +191,7 @@ void d_dispatch_indirect() {
 
 // ---- the graphics wing ----
 
-constexpr uint32_t kMaxDrawSubs = 32;  // the mask is a u32
+constexpr uint32_t kMaxDrawSubs = 31;  // the mask is a u32; bit 31 = kDevDrawBit ([Dev] Readback's vsout)
 struct DrawSub {
   const char* name;
   uint32_t stage;
@@ -219,9 +219,12 @@ struct DrawNow {
 thread_local DrawNow t_draw{};
 std::atomic<uint64_t> g_draws_seen{0}, g_dcomp_done{0}, g_dafter_done{0}, g_draw_reentry{0};
 
+}  // namespace
+
 // One draw call on the list, as the engine's entry made it (indirect: its command signature, buffer and offset are still
 // the context's - BindIndirectArgs is not undone after the draw).
-void issue_draw(uint8_t* ctx, ID3D12GraphicsCommandList* cl, const rg_draw_info& d) {
+void issue_draw(uint8_t* ctx, void* list, const rg_draw_info& d) {
+  auto* cl = static_cast<ID3D12GraphicsCommandList*>(list);
   switch (d.kind) {
     case RG_DRAW_INSTANCED:
       cl->DrawInstanced(d.count, d.instances, d.start, d.start_instance);
@@ -240,6 +243,8 @@ void issue_draw(uint8_t* ctx, ID3D12GraphicsCommandList* cl, const rg_draw_info&
     }
   }
 }
+
+namespace {
 
 // After an engine draw that carries a subscribed shader: its subscriptions, then the companions they asked for, then
 // the pass. (The subscription runs only for the draw that recorded: a NULL PSO skipped it - draw_bound says 0.)
@@ -268,11 +273,12 @@ void on_draw(const rg_draw_info& info) {
     if (s.calls.fetch_add(1, std::memory_order_relaxed) == 0)
       g_sdk->logger->InfoF(g_handle, "host: first subscribed draw '%s' - kind %u%s, count %u x %u", s.name, info.kind,
                            info.flags & RG_DRAW_SYSTEM ? " (system)" : "", info.count, info.instances);
-    prof::Pause client;
+    prof::Client client("draw subscription", s.name);
     clients::Running running(reinterpret_cast<const void*>(s.fn));
     s.fn(s.user, &info);
   }
   d.active = false;
+  if (mask & kDevDrawBit) readback::at_draw(ctx, engine, bound, info);  // [Dev] Readback's vsout, the list untouched
   if (!d.ncomp && !d.after.set) return;
   auto* cl = *reinterpret_cast<ID3D12GraphicsCommandList**>(ctx + kCtxCmdList);
   // The list must be where the engine left it: its PSO still the one it drew with.
@@ -298,7 +304,7 @@ void on_draw(const rg_draw_info& info) {
     d.after.set = false;
     uint32_t touched;
     {
-      prof::Pause client;
+      prof::Client client("pass", g_pass_names[d.after.pass - 1]);
       clients::Running running(reinterpret_cast<const void*>(d.after.fn));
       gpu_timing::Scope gpu(cl, gpu_timing::kPass, d.after.pass);
       touched = d.after.fn(d.after.user, cl);
@@ -533,7 +539,9 @@ uint32_t after_draw(rg_handle h, rg_pass_fn fn, void* user) {
   return 1;
 }
 
-bool needed(bool companions) { return companions || g_npasses.load() != 0 || has_subs() || has_draw_subs(); }
+bool needed(bool companions) {
+  return companions || g_npasses.load() != 0 || has_subs() || has_draw_subs() || readback::on();
+}
 
 bool attach() {
   g_get_ctx = reinterpret_cast<GetCtx_t>(g_base + kGetCommandListContext);
@@ -548,7 +556,7 @@ bool attach() {
                        g_attached ? "ATTACHED (DispatchCompute post-hook)" : "NOT attached",
                        !g_attached ? "" : g_indirect_attached ? " + DispatchIndirectCompute post-hook"
                                                               : " - indirect dispatches NOT seen");
-  if (has_draw_subs()) {
+  if (has_draw_subs() || readback::on()) {
     g_get_d3d_buffer = reinterpret_cast<GetD3DBuffer_t>(g_base + kGetD3DBuffer);
     uint32_t ok = 0;
     for (DrawHook& k : g_draw_hooks) ok += (k.attached = attach_hook(k.rva, k.ret, k.detour, k.orig, k.name)) ? 1u : 0u;

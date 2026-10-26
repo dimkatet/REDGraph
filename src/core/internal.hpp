@@ -83,7 +83,35 @@ uint32_t draw_bound(const uint8_t* ctx, ID3D12PipelineState** engine, ID3D12Pipe
 // Companion `h`'s PSO for engine PSO `engine`, nullptr = not built for it / build failed / out of its scope.
 ID3D12PipelineState* draw_companion_of(ID3D12PipelineState* engine, rg_handle h);
 void draw_companion_count(rg_handle h);
+// [Dev] ShaderHotReload (shader_reload.cpp): dev_enable before attach - every mapping keeps a copy of the engine's desc.
+// dev_reload, on the frame thread: target `stem` (a file-safe name, dev_file_stem, or the shader hash in hex) variant
+// `variant` takes blob `b` (kept by the caller for good; blob_stage = its rg_stage, -1 unknown) and every clone
+// carrying it is rebuilt - all or nothing. 0 ok; RG_E_ARG no such target, RG_E_TAKEN two match, RG_E_FULL no such
+// variant, RG_E_BLOB another stage, RG_E_COMPILE a clone failed (nothing changed).
+struct DevReload {
+  const char* name = nullptr;
+  const char* kind = nullptr;
+  uint32_t mapped = 0, no_desc = 0, rebuilt = 0, failed = 0, last_hr = 0;
+};
+void dev_enable();
+int32_t dev_reload(const char* stem, int32_t variant, rg_blob b, int32_t blob_stage, DevReload* r);
+std::string dev_file_stem(const char* name);
+std::string dev_targets();  // one line per target: kind, stage, name, variants, the file names it answers to
+void dev_frame_tick();      // from frame_tick: releases the replaced clones kDevRetireFrames later
+// [Dev] Readback's vsout (readback.cpp): dev_readback_enable before attach - every graphics PSO creation keeps a light
+// copy of its desc (no bytecode but the VS, deduplicated by hash) and every graphics bind is tracked for draws.
+// dev_vs_of: the VS the draw ran with - the engine PSO's own, or the patch variant `bound` (a clone) carries - and its
+// hash; false = the engine PSO was never seen. dev_so_pso: a PSO from the engine PSO's desc with `vs` and the
+// D3D12_STREAM_OUTPUT_DESC `so` (no PS, nothing rasterized).
+void dev_readback_enable();
+bool dev_vs_of(ID3D12PipelineState* engine, ID3D12PipelineState* bound, rg_blob* vs, uint8_t* hash16);
+// bare: no render targets / depth format either. root_sig out (optional): the desc's root signature, for a log.
+long dev_so_pso(ID3D12PipelineState* engine, rg_blob vs, const void* so, ID3D12PipelineState** out, bool bare = false,
+                void** root_sig = nullptr);
 }  // namespace pso
+
+// The draw-subscription bit [Dev] Readback's vsout uses (passes' subscriptions take bits 0..30).
+constexpr uint32_t kDevDrawBit = 1u << 31;
 
 // bindings.cpp - M2 leases + the host's cbuffers
 namespace bindings {
@@ -162,6 +190,13 @@ int32_t watch(uint32_t stage, const uint8_t* hash16, const char* name);  // rg_h
 void attach();  // at attach: the index-buffer hook + the NvAPI BLAS hook
 void detach();
 void on_nv(const uint8_t* desc);  // from rt_lib's NvAPI BuildEx detour; NULL = params not read
+// The last IASetIndexBuffer / IASetVertexBuffers(slot 0) views on this recording thread ([Dev] Readback too, census on or
+// off). The first call patches the command-list vtable and answers false: views are tracked from the next bind on.
+struct IaViews {
+  uint64_t ib, vb0;
+  uint32_t ib_size, index_bytes, vb0_size, vb0_stride;
+};
+bool ia_views(IaViews* out);
 }  // namespace blas_census
 
 // passes.cpp - M4
@@ -182,6 +217,8 @@ uint32_t draw_subs_for(const uint8_t* vs16, const uint8_t* ps16);  // NULL = tha
 bool has_draw_subs();
 uint32_t draw_companion_request(rg_handle h);
 uint32_t after_draw(rg_handle pass, rg_pass_fn fn, void* user);
+// The draw `d` once more on list `cl` of context `ctx`, as the engine's entry made it (readback's vsout).
+void issue_draw(uint8_t* ctx, void* cl, const rg_draw_info& d);
 }  // namespace passes
 
 // render_flow.cpp - M5: the node context on the recording thread (CRenderNodeBase::Process) + resources by name
@@ -232,7 +269,33 @@ struct RemoveClear {
 void replay(const void* node_ctx, const FlowRecord& r, const RemoveClear* clears = nullptr, uint32_t nclears = 0);
 void clear_stats(uint64_t* cleared, uint64_t* skipped);
 uint32_t gpu_descriptors(uint32_t count, rg_descriptors* out);  // M10
+// [Dev] Readback: RenderFlow name `name_hash` (an engine constant or a published name's hash) as the node recording on
+// this thread sees it now - the GpuApi texture id (0 = not live / outside a node / declaration run) and its resource;
+// transition_here = the engine's TransitionTexture + flush on this thread's context (its tracker knows the new state).
+uint32_t resolve_here(uint32_t name_hash, void** resource);
+bool transition_here(uint32_t id, uint32_t d3d12_state);
 }  // namespace render_flow
+
+// readback.cpp - [Dev] Readback: engine blocks / RenderFlow textures at a node into files, on request (CET, rg_dev.h)
+namespace readback {
+void enable(const std::string& dir);  // at Load, before attach: every node class gets wrapped
+bool armed();                          // [hot] a flow request waits for its node
+// From the node wrappers, real run only, the node's list bound: `after` = its Execute returned. job = the node
+// records its work in a job (after = before that work).
+void at_node(const void* node, bool after, bool job);
+void frame_tick();
+int32_t request(const char* spec);
+bool on();  // the switch is on (pso / passes attach their graphics hooks for vsout)
+// vsout: [hot] a request waits for a draw; does this VS hash match one (pso's bind funnel, only while vs_armed)?
+bool vs_armed();
+bool vs_wanted(const uint8_t* hash16);
+// From passes' draw hook, the draw just recorded on ctx's list with `bound` (engine PSO `engine`) carries kDevDrawBit.
+void at_draw(uint8_t* ctx, ID3D12PipelineState* engine, ID3D12PipelineState* bound, const rg_draw_info& info);
+// blas:1 with vsout: [hot] a request copies BLAS build inputs now; from rt_lib's NvAPI BuildEx detour, BEFORE the build,
+// on its list: desc = the engine's NVAPI build desc (rt_lib d_nv's layout).
+bool blas_armed();
+void on_blas_build(void* cmdlist, const uint8_t* desc);
+}  // namespace readback
 
 // render_nodes.cpp - M6: our nodes in the engine's render graph
 namespace render_nodes {
@@ -255,6 +318,16 @@ int32_t node_remove_clear(rg_handle h, uint32_t name_hash, const float* value);
 // GPU timing on at the start: every engine node class is wrapped (as for the graph debug module) and each node's
 // Execute is timed. Before attach.
 void wrap_all_classes();
+// The A/B profile / gpu_timing: the node class (index of its wrapped vtable, = gpu_timing's kNode handle - 1) whose
+// Execute runs on this thread, -1 = none; a node object's class, -1 = not wrapped; a job sets its node's class.
+int32_t current_class();
+// The bind funnel's every CommandListContext (pso_patch): only those are trusted outside a draw / dispatch.
+void note_ctx(const uint8_t* ctx);
+int32_t class_of(const void* node);
+int32_t enter_class(int32_t cls);  // returns the previous one, for leave_class
+void leave_class(int32_t prev);
+const char* class_name(int32_t cls);  // "?" = none
+uint32_t class_count();
 // The client removal (node_remove) of the class `node_name` that is ON now - its handle, else 0. For the debug window.
 rg_handle client_removal(const char* node_name);
 // A node vtable's Execute as the engine built it (the original when slot [1] is wrapped) - for the graph dump.
@@ -274,7 +347,17 @@ uint32_t debug_wrapped_classes();
 // hlsl.cpp - compile_hlsl (dxcompiler.dll next to the host, optional)
 namespace hlsl {
 int32_t compile(const rg_hlsl_desc* desc, rg_blob* out, char* error, uint32_t error_size);
+// [Dev] ShaderHotReload: LLVM IR text (a disassembled .ll, edited) -> a validated, signed DXBC container
+// (IDxcAssembler + IDxcValidator in place, as tools/assemble_and_validate_dxil.ps1 in CRT). Kept for the process.
+// 0 ok; RG_E_UNAVAILABLE no dxcompiler.dll / dxil.dll; RG_E_COMPILE errors in `error`.
+int32_t assemble(const std::string& ir, rg_blob* out, std::string* error);
 }  // namespace hlsl
+
+// shader_reload.cpp - [Dev] ShaderHotReload: a folder next to REDGraph.dll watched for new shader bytes
+namespace shader_reload {
+void enable(const std::string& dir);  // host.hpp: at Load, before attach (it makes pso keep the engine's descs)
+void frame_tick();  // the frame hook: every kPollFrames, the folder's changed files applied
+}  // namespace shader_reload
 
 // graph_probe.cpp - the render graph, read only ([Diagnostics] RenderGraphDump)
 namespace graph_probe {

@@ -14,6 +14,7 @@ Each mechanism carries the milestone tag the code comments use (M1..M12): the or
 
 ```
 include/rg_host.h        THE API: plain C, versioned, append-only. Clients include only this.
+include/rg_dev.h         developer exports outside the API (rg_dev_readback*), live only under their [Dev] switch
 src/plugin.cpp           RED4ext entry: settings, crash log, core::open / arm, the CET functions
 src/core/                the host CORE - knows no client
   host.cpp               the rg_host table, registration window, attach-on-demand, the w_* wrappers (clients tab)
@@ -28,8 +29,12 @@ src/core/                the host CORE - knows no client
   graph_probe.cpp            graph walk, dump, census (node -> shaders / resources / DispatchRays)
   graph_debug.cpp            the CET graph debug module's state and report
   clients.cpp                who registered what (the Clients tab)
-  prof.cpp                   the host's own CPU profile
+  prof.cpp                   the host's own CPU profile; the frame hook (frame timer, per-frame ticks)
+  gpu_timing.cpp             [Diagnostics] GpuTiming: timestamps round our work, engine nodes, raygens
+  ab.cpp                     [Diagnostics] ABProfile: clients' switches off / on in blocks, the cost per mechanism
   crash_log.cpp              vectored exception handler, device-removed watchdog, DRED
+  shader_reload.cpp          [Dev] ShaderHotReload: a watched folder, new shader bytes for registered patches live
+  readback.cpp               [Dev] Readback: an engine block / a RenderFlow texture at a node into a file, on request
 src/settings.cpp         REDGraph.ini
 src/ui.cpp               RTTI global functions for the CET window (Game.RG_*)
 cet/REDGraph/init.lua    the CET window
@@ -581,6 +586,56 @@ only the host's own code (rdtsc, the TSC rate measured against QPC). Not measuri
 measured reference point (raster and PT, one spot): ~570 us/frame summed over ~19 threads, spread evenly - about 40 us
 on any one thread, below run-to-run fps noise.
 
+## A/B profile
+
+`ab.cpp` (2026-10-26). What a client's FEATURE costs the frame, and where - the instrument the frame timer above was a
+stopgap for. `[Diagnostics] ABProfile = true` at the start (it wraps every node class, as GpuTiming / the debug module
+do, and makes jobs carry their node - `render_flow::want`); then from CET / REDBridge:
+
+| call | what |
+|---|---|
+| `Game.RG_AB(switches, block, settle, pairs) -> String` | `""` = started, else why not. `switches` = a comma list of switch names, or `*`; `"stop"` aborts (the switches go back) |
+| `Game.RG_ABState() -> String` | the state line ("running ... pair 3 / 10, B (on): measuring"), then the last report |
+| `Game.RG_ABSwitches() -> String` | every registered switch: `name 	 on / off` |
+
+A SWITCH is a client's: `rg_host::ab_switch(name, set, get, user)` (any time; the runner calls `set(user, 0 / 1)` from
+its OWN thread, never the render thread - apply live, do not persist; `get` gives the start value back at the end).
+The run: pairs of blocks, A = every named switch off, B = on, in the order AB, BA, AB, ... (a linear drift cancels);
+after each switch `settle` seconds are left out (a PSO swap lands at the next state change, GPU timestamps arrive 8
+frames late, caches refill); a block with a frame gap over 0.25 s (menu, loading) drops its pair. Per block every
+metric is a per-frame mean; per pair d = B - A; the report (`[ab]` lines in the log, and RG_ABState) gives the means of
+A and B and mean d +- a 95 % t-interval over the pairs, a metric whose |d| is inside it marked `(noise)`.
+
+The metrics, all measured in A and B alike (their own cost cancels):
+
+* **frame** - the interval between two `ExecuteParallel` calls; **CPU record** - the frame's start to the end of its
+  last node Execute on any thread (`ExecuteParallel` itself only hands the nodes out: ~25 us);
+* **GPU span** - first to last engine-node timestamp of a frame on the direct queue; **GPU nodes sum**; per engine
+  node class its GPU time; per item of ours (companion, draw companion, pass) its GPU time and the node class it was
+  recorded in; per DispatchRays of a state object holding a client library the WHOLE dispatch (the engine's raygen
+  work included - a ray-traced node's GPU bracket does NOT contain its DispatchRays, so the rays are their own term);
+* **CPU, all threads (work, not the critical path)** - per node class its Execute (exclusive: nested node Executes,
+  the host's Scopes and client callbacks inside are left out) and the jobs it submitted; the host's `prof.cpp`
+  points; every client callback by its registration name (`prof::Client` at the call sites); what clients time in
+  their own engine hooks (`rg_host::prof_add(name, cycles)`, `prof_active()` says when - the time is also taken out
+  of the node it ran in, `prof::t_ours`).
+
+Decomposition lines close the report: dGPU span = rays + our companions / passes + the engine nodes' own work + the
+rest; d(CPU record) next to the work by owner. Read them with the noise marks: the per-node GPU times and their sum
+are noisy (async work, a node's bracket is one of its lists) - frame, rays and our items are the solid numbers. Known
+issue (2026-10-26): the GPU span read 7-8 ms on a 19 ms frame after the context fix below (18.7 the same day before
+it) - suspect nodes dropped by `current_ctx`; not yet fixed. The report prints a NOTE that the span (and the bound verdict) is unreliable.
+
+**The context fix (2026-10-26).** The node GPU timing (and `run_fn`, `flow_list_if_unbound`) read the thread's
+`CommandListContext` through `GetCommandListContext` OUTSIDE a draw / dispatch, before the engine's Execute. On game
+2.5 a job worker's TLS slot holds `0xff0000` there, not a context - the first run with node timing on 2.5 crashed at
+the read of `+kCtxCmdList` (it had last run on 2.31, 2026-10-11). `render_nodes.cpp` `current_ctx()` now trusts a
+pointer only once the bind funnel (`pso_patch.cpp` `swap`, `note_ctx`) has seen it as a context; with no bind funnel
+attached (no client patch) the TLS value is taken as before.
+
+Used first on CRT: `docs/perf-audit.md` 17 in that repository (whole mod +1.48 ms in PT; one feature's 0.8 ms traced
+to one branch of its raygen by ablation).
+
 ## Crash log
 
 `crash_log.cpp`. A vectored exception handler (first in the chain; AV, illegal instruction, stack overflow, buffer
@@ -627,6 +682,138 @@ dump. The first such TLAS logs a self-test line (ids seen, an example id's stamp
 A first-chance access violation is logged even when an SEH handler elsewhere will catch it. Never read engine memory
 under `__try`: the engine's crash handler freezes the game on any first-chance AV.
 
+## Shader hot reload (dev)
+
+For developers, off by default; `REDGraph.ini`, read at the start:
+
+```
+[Dev]
+ShaderHotReload = true
+ShaderReloadDir = D:\work\shader_reload   ; optional, see MO2 below
+```
+
+A file dropped into the folder replaces the shader of a REGISTERED patch (CS / VS / PS / GS), compute companion or
+draw companion while the game runs - no restart, no client rebuild:
+
+| file | what happens |
+|---|---|
+| `<target>[.v<N>].dxbc` | a signed DXBC container, used as is |
+| `<target>[.v<N>].ll` | LLVM IR text (a disassembled shader, edited): assembled and signed by the host (`hlsl::assemble`: IDxcAssembler + IDxcValidator in place - the same as CRT's `assemble_and_validate_dxil.ps1`); needs `dxcompiler.dll` + `dxil.dll` next to REDGraph.dll (`build_and_deploy.ps1 -Dxc`) |
+
+`<target>` = the client's name made file-safe (every character but letters, digits, `-`, `_` becomes `_`) or the
+engine shader's hash in hex; `N` = the variant (none = 0). `_targets.txt` in the folder lists every target with both
+names (written at the first frame). The folder is polled every 30 frames from the frame hook; a file whose time or
+size changed is applied, and the log says what happened: `DEV reload: <file> -> patch '<name>' variant N: K clone(s)
+rebuilt on M engine PSO(s)`, or `NOT applied - <why>` (assembly / validation error text, another stage than the
+target's, no such target or variant, the driver refused a clone). Files already there at the start are applied too:
+the folder IS the set of overrides - empty it when the edit is baked into the client.
+
+How (`pso_patch.cpp`): with the switch on, every mapped engine PSO keeps a deep copy of the engine's desc (all stages'
+bytecode, input layout, stream output, the root signature AddRef'd) - the engine's desc exists only inside
+`PSOSubCache::Create`. A reload swaps the target's blob and rebuilds every clone that carries it from the kept desc,
+ALL OR NOTHING: one refusal releases what was built and leaves blob and clones as they were. A new clone goes into the
+mapping in place (one pointer store - the bind funnel reads lock-free and lands on it at the next state change); the
+old one is released 16 frames later. `g_dev_lock`: a PSO creation holds it shared from its clone build to the insert,
+a reload exclusively - a creation sees the old blob or the new one. The engine's PSOs made after a reload get the new
+blob as usual.
+
+Limits: only what a client registered (a new target, a new lease, a new variant count need a restart); the shader must
+keep to the registers the engine's root signature and the leases give it; a shader that hangs the GPU still takes the
+game down; RT libraries are not covered (their identifiers live in engine tables - a separate design). Cost with the
+switch OFF: none (one bool per PSO creation). ON: a desc copy per mapped engine PSO (material patches map hundreds).
+
+**MO2:** the default folder (`shader_reload/` next to REDGraph.dll) lies inside the game directory, which MO2
+virtualizes - a file created there FROM OUTSIDE the game under a name the game has not seen stays invisible (measured
+2026-10-24: an overwrite of a known name is seen, a new name is not). Set `ShaderReloadDir` to a real folder outside
+the game.
+
+## GPU readback (dev)
+
+For developers, off by default; `REDGraph.ini`, read at the start:
+
+```
+[Dev]
+Readback = true
+ReadbackDir = D:\work\readback   ; optional: else <ShaderReloadDir>\readback, else readback\ next to the DLL
+```
+
+"Read THIS now" from CET / REDBridge `eval_lua`, no readback code in a client:
+
+| call | what |
+|---|---|
+| `Game.RG_Readback(spec) -> Int32` | a request id (a bad spec too - its result says why); -8 = the switch is off |
+| `Game.RG_ReadbackResult(id) -> String` | `pending: ...` / `done: <file> \| WxHxD xN slice(s), mip M, DXGI F \| min (...) max (...) nan N inf N` / `failed: <why>` |
+| `rg_dev_readback` / `rg_dev_readback_result` | the same as C exports of REDGraph.dll (`include/rg_dev.h`, `GetProcAddress`; the self-test uses them) |
+
+| spec | result |
+|---|---|
+| `block:<catalog name \| id>` | the NEXT write of that [engine constant block](#engine-constant-blocks) after the request (its hook goes on if needed) -> `rb<id>_block_<name>.bin` + `.json`; stats over float32 |
+| `flow:<8 hex \| mod/name> after:<node>` | a RenderFlow texture right after the node's Execute (the engine's or a client's, removal replays included) -> `rb<id>_flow_<name>_after_<node>.dds` + `.json` |
+| `... before:<node>` | the same at its start: after the clients' befores and a wrap's `node_wrap_use` declarations |
+| `mip:<n>`, `frames:<n>` | the mip (0); give up after n frames (600) |
+| `vsout:<VS hash, 8..32 hex>` | what that ENGINE VS outputs at its next draw(s), by Stream Output -> `rb<id>_vsout_<hash>.bin` (32-bit components per vertex in the `.json`'s `elements` order, draw after draw) + `.json` (per draw: kind, counts, start / base vertex, topology, IB / VB0 VAs, frame, the VS bytes it ran - a patch's clone's when one drew) + `rb<id>_cb12.bin` (the shared constants' latest write at the first draw) |
+| `draws:<n>` | vsout: up to n draws (1..64) of ONE frame (1) |
+| `blas:1` | vsout: frame A learns the VS's index ranges (IB VA of the first index, index count); frame A+1 captures its draws AND every NvAPI BLAS build / update of those ranges -> `rb<id>_blas_<hash>.bin` + `.json` (per geometry: dest, update, flags, IB / VB / transform VAs, formats, counts, offsets + skews in the file) |
+
+`<node>` is a CLASS name (as `node_wrap`); the first instance in a frame where the name resolves is taken. Groups are
+not reached (their Execute leaves no list bound) - name a member. A job-builder node's `after` comes before its job's
+work (the `.json` says `job_builder_node`). Engine names are the 32-bit RenderFlow hashes the census lists (t64 =
+`583c0f7f`); a client's published transient goes by its `"<mod>/<name>"`.
+
+How (`readback.cpp`): the switch wraps every node class at its first `Register` (`render_nodes::wrap_all_classes`, as
+the graph debug module) and wants the node context; `wrap_execute` and our own `node_execute` call `at_node` in the
+real run around the work when a flow request is armed (one relaxed load otherwise). There, on the node's list:
+`resolve_here` (the M5 lookup for that node), the engine's `TransitionTexture` to COPY_SOURCE + flush (its tracker
+starts the next bind from there - nothing is restored), `CopyTextureRegion` of every array slice of the mip (plane 0)
+into a committed READBACK buffer (`GetCopyableFootprints`), then `WriteBufferImmediate` MARKER_OUT after the data -
+written by the GPU only once the copy ran. The frame hook maps the buffer until the marker is there (300 frames
+without it = `failed: ... never executed`), repacks the rows tight, and a worker thread writes the `.dds` (DX10
+header; a typeless format written as its typed twin, the `.json` keeps both) and the `.json` (resource desc, texture
+id, footprint, frame, stats). Decoded for stats: RGBA8 / BGRA8, RGB10A2, R11G11B10, 16- / 32-bit float and unorm
+1-4 channels, R32_UINT, R24X8 depth; others (BC) are written without stats.
+
+**vsout / blas (2026-10-24, `readback.cpp` "vsout" / "blas:1", `pso_patch.cpp` `rb_record` / `dev_so_pso`):**
+* Under the switch pso keeps a light copy of EVERY graphics PSO's desc (no bytecode; the input layout copied, the root
+  signature referenced) and every VS's bytes once per hash, and tracks every graphics bind. While a vsout request is
+  armed the bind funnel marks a PSO whose engine VS hash matches with `kDevDrawBit` (bit 31 of the draw-subscription
+  mask; client draw subscriptions are 31 at most now) and passes' draw hook calls `readback::at_draw`.
+* There: a PSO from the engine PSO's desc with the VS the draw ran with (`pso::dev_vs_of`: the patch variant a clone
+  carries), no PS, depth off, `StreamOutput` from the VS's output signature (DXIL `OSG1`, register order, one entry per
+  element, `RasterizedStream = NO_RASTERIZED_STREAM`); a committed DEFAULT buffer (zeroed = filled-size counter 0 at
+  +0, data at +256) in STREAM_OUT; `SOSetTargets` -> `SetPipelineState(so)` -> the same draw (`passes::issue_draw`) ->
+  `SOSetTargets(empty)` -> `SetPipelineState(the engine's)` -> barrier to COPY_SOURCE -> copy into READBACK + marker.
+  Indirect draws are skipped (no count on the CPU). IB / VB0 views from `blas_census::ia_views` (the command-list
+  vtable patch; the first matching draw only starts it).
+* **The engine's graphics root signature has NO `ALLOW_STREAM_OUTPUT`** (flags 1 = IA layout only;
+  `CreateGraphicsPipelineState` E_INVALIDARG for any SO decl, while our own root signature 0x41 + own VS builds - the
+  control is still in the failure log). It has TWO creators, both storing at device data + 0x1410638: a 1.0 desc for
+  `D3D12SerializeRootSignature` (`mov qword [rbp-0x10], 1` at 0x108c854 - the one that RAN on 2.5 / NVIDIA) and a 1.1
+  desc (`mov dword [rbp-8], 1` at 0x2fa4e6d). The switch patches both immediates to 0x41 at Load, bytes checked
+  (`e231::kGfxRootSigFlags`). Dev only.
+* blas:1 copies in `rt_lib`'s NvAPI BuildEx detour, BEFORE the build, on its list: a host CS (`compile_hlsl`, DXC
+  needed) with a root SRV at the source VA and a root UAV of our buffer, dword copy, no barrier on the engine's buffers
+  (they are in NON_PIXEL_SHADER_RESOURCE for the build). **The BLAS builds run on a COMPUTE list** (type 2): the
+  engine's state comes back with only the compute part of `Hacks::RestoreState` (clear `ctx+0x3e0`, the engine's
+  `EnsureComputeRootSignature` 0x3e3c18) - the whole `RestoreState` sets a GRAPHICS root signature on it and the next
+  driver call jumped to 0 (2026-10-24 18:15, logs in CRT `_artifacts/palm-crown-20261024/run3-blas-crash`).
+* cb12 on 2.5: float4 rows 1-4 WorldToView, 9-12 ViewToWorld (camera position in row 12), 13-16 ViewToScreen (row
+  convention, `v @ M`); SV_Position is reversed-Z with a constant `z` = 0.02, so world = (clip.x, clip.y, clip.w)
+  through ViewToScreen's x / y / w columns, then ViewToWorld (CRT `tools/vsout_blas_residual.py`).
+
+Not covered: buffers (`GetResource<TextureRef>` resolves textures only), multisampled textures, plane 1 (stencil),
+the resource bound at a shader's register (`docs/plan-dev-readback.md` source 3), watch mode, raw `va:` ranges
+(source 7), BLAS builds through the D3D12 vtable (non-NVIDIA). Cost with the switch OFF: none. ON: every node class
+wrapped (one thread-local lookup per Execute), every graphics PSO's desc kept (a few MB), every graphics bind tracked
+(one thread-local store), the graphics root signature allows Stream Output; nothing per frame without a request.
+
+Checked 2026-10-24 on 2.5 (`ReadbackTest` 7 / 7 PASS: our pattern texel-exact incl. the repacked 160-B rows, t64
+512x512 after its writer, cb12 2512 B, four refusals); from CET: VolumetricFog's `28cfafeb` / `acc44dbb` (BC7,
+written without stats), the fog b6 (800 B), `mip:3` of t64 refused (1 mip). vsout / blas 2026-10-24: `ReadbackTest`
+10 / 10 PASS (the sky VS `69090ccd`: a 4-vertex strip -> 6 SO vertices, clip x / y +-1, z 0, w 1); CRT's crown VS
+`c25f7935` (its patch's clone): 64 draws, 450k vertices + 521 BLAS update copies (683 geometries) in ONE frame, no
+crash. Open: `vsout:79816ca4` (CRT's tree trunk VS, visibly drawn) answered "no draw in 600 frames" once, right after
+graph-debug skip rules on it were switched off - not investigated.
+
 ## Self-tests
 
 `REDGraphSelfTest.dll` is a client like any other; `REDGraphSelfTest.ini` next to it, section `[Tests]`:
@@ -641,6 +828,8 @@ under `__try`: the engine's crash handler freezes the game on any first-chance A
 | `StateTest = true` | M1 pipeline state: the visible sky's PS 5f079e10 with two state-only variants (no bytecode): wireframe, RT0 write mask 0; phases of 600 sky runs; bad fill mode and a variant out of range refused at registration | `state test: registered ... (expected 0 0 -1 -1)`, then `state test phase 'wireframe' / 'write mask 0': swaps +N -> PASS`, `'vanilla': +0 -> PASS`. ON SCREEN only where nothing covers the sky's bottom layer (5f079e10 lies under the volumetric clouds, fog and aerial composite): far off, near the horizon |
 | `DrawTest = true` | M4 graphics wing: draw subscriptions on the visible sky's PS 5f079e10 and the sky-scattering VS 69090ccd, a draw companion of 5f079e10 that only sets FILL_MODE_WIREFRAME, a pass after the sky draw that returns `RG_PASS_TOUCHED_STATE` touching nothing; phases of 600 sky draws: none / companion / pass; refusals (stage CS, a companion with nothing to change) | `draw test: registered ... PASS`, host `first subscribed draw ... kind N`, `first companion draw`, `first pass after a draw`, then per phase `draw test phase '...': companion draws +N (requests +N+1 ...) ... -> PASS`; the line names the draw kinds the sky goes through. On screen only far off: wireframe sky edges in the companion phase |
 | `WrapUseTest = true` | M8 declarations: our transient `rgwrapuse/tmp` written in Lighting (`RgNode_WrapUseWriter` after ClassifyMaterials), declared by a wrap of `CRenderNode_ApplyBloomAndTonemapping` (PostFX) with `node_wrap_use` and copied in its `before`; a wrap of `DrawHUD` without the declaration as an informational control; registration refusals (access 0, no such flow, a 9th declaration) and a group target | `wrap use test: registered ... PASS`, host `wrap 'PostFX' - a GROUP: its 1 node_wrap_use declaration(s) are NOT issued`, then every 1800 frames `wrap use test #N ... DECLARED: ok N (exact M) stale 0 bad 0 ... miss 0 ... -> PASS` (ok = the pattern with a counter within 2 of the writer's: PostFX may record on the CPU before this frame's Lighting). Nothing on screen |
+| `ReloadTest = true` (+ REDGraph's `[Dev] ShaderHotReload`, DXC) | Shader hot reload: a patch of the visible sky's PS 5f079e10 (a magenta PS from `compile_hlsl`), then every 600 sky runs a file dropped into the reload folder: a green `.dxbc` (rebuilt), a compute `.dxbc` (refused: stage), text that is no IR as `.ll` (refused: assembly), a blue PS as `.ll` (assembled, rebuilt); files removed at the end | `reload test step 1..4 ... -> PASS` (clones grow exactly at 1 and 4, `clone_failed` never, swaps every step), `reload test: DONE - 4 pass, 0 fail`; host `DEV reload:` lines. On screen only far off: the sky's bottom layer magenta -> green -> blue. Alone among the 5f079e10 tests. 4/4 PASS on 2.5, 2026-10-24 (default folder and `ShaderReloadDir`) |
+| `ReadbackTest = true` (+ REDGraph's `[Dev] Readback`) | GPU readback (dev): `RgNode_ReadbackWriter` (after ClassifyMaterials) clears `rgreadback/pattern` (40x24 RGBA8) to a known pattern with its run counter; from run 300, through `rg_dev_readback`: the pattern after our node (the `.dds` checked texel by texel), t64 after `RenderVolumetricCloudsLighting` (512x512, DXGI 28, size), t64 before `VolumetricFog` (informational), cb12 (2512 B), four specs that must fail (no key:value, no such block, no node, a node that never runs with `frames:30`); `vsout:69090ccd...` (the sky-scattering VS: vertices = the draw's count x instances by topology, file = vertices x stride, SV_Position finite) and two vsout refusals (a bad hash, a VS never drawn with `frames:30`) | `readback test step 1..11 ... -> PASS` (3: INFO), `readback test: DONE - 10 pass, 0 fail`; host `DEV readback #N` lines; files in the readback folder. Nothing on screen. 10/10 PASS on 2.5, 2026-10-24 |
 | `LeaseTexTest = true` | M2 texture sources: a companion of the tonemapping-LUT CS 88c57ef1 (scoped to `CRenderNode_GenerateTonemappingLUT`, after the frame's third dispatch) reads our 4x4x2 R32_UINT texture through a 2D_ARRAY view of slice 1 (t64) and the engine's LUT `2ae9f45c` by name through a 3D UAV view (u16) into our raw buffer (u17); the registration checks (a raw view at a Texture2DArray refused, a cube UAV refused, a buffer into a texture view / a resource into a flow view refused) | `lease tex test: registered`, `views set`, then every 300 frames `lease tex test #N ... client texture 16/16 = slice 1 ... LUT texels 2/2 equal to the copy ... PASS`. Nothing on screen |
 
 The short hashes in this table are game 2.31's names. On 2.5 the tests target 318cee44 -> 535195dc, 0c359133 -> f8a34e57, 5f079e10 -> b932ca8e, 53c455b6 -> 9de16e4e, a58d01db -> 20e19582, 3dd31a42 -> c4a2262b, and the LUT CS is a NEW shader e1c6df2f (`m_LUTGenerateACES2019`; 88c57ef1's successor is never dispatched); 69090ccd / 5c7ab952 unchanged. All PASS on 2.5, 2026-10-23.
@@ -709,10 +898,17 @@ validates an item; it does not set the order.
 7. **GPU time per host work item + runtime HLSL compile service** - BUILT and hardware-checked 2026-10-11 (ideas from
    spuddeh/cp2077-native-shaders, author's permission): [`plan-gpu-timing-and-hlsl.md`](plan-gpu-timing-and-hlsl.md).
    `[Diagnostics] GpuTiming` (companions, draw companions, passes; engine dispatches by hash and raygens not yet);
-   `compile_hlsl` (cs/vs/ps_6_x; the DXC DLLs are NOT shipped - licence of a stable release unchecked; no hot reload).
+   `compile_hlsl` (cs/vs/ps_6_x; the DXC DLLs are NOT shipped - licence of a stable release unchecked). Hot reload of
+   registered patches / companions: BUILT 2026-10-24 as a developer switch, [Shader hot reload (dev)](#shader-hot-reload-dev).
 8. **Candidate, not planned: the deform pool** (2026-10-17). Clients that fix the BVH copy of deformed meshes hook the
    engine's pool writers themselves today (CRT: cloth tarps, garment layers). Three primitives were weighed (CRT
    `docs/deform-bvh-desync.md` 9c): a per-proxy **refresh** ("pool content changes without a CPU change": the engine's
    own refit gate `proxy[+0x90]`), a per-chunk **record tag** written into a free field of a batch record (proven only
    for the batched skinned layout), and per-proxy **custom data** (raw engine structs - rejected). Each has one
    consumer; built when a second, independent one needs it - the refresh first.
+9. **GPU readback on request from CET (dev)** - sources 1-2 BUILT 2026-10-24 ([GPU readback (dev)](#gpu-readback-dev),
+   `ReadbackTest` 7/7): constant blocks, RenderFlow textures before / after a node; sources 5-6 BUILT 2026-10-24
+   (`ReadbackTest` 10/10): an engine VS's outputs by Stream Output (`vsout:`) and, in the same frame, the BLAS build
+   inputs of its meshes by GPU VA (`blas:1`). Open: a BLAS self-test (only run on CRT's palms), raw `va:` ranges
+   (source 7), the resource bound at a shader's register (source 3, RE), RT inputs, watch mode.
+   [`plan-dev-readback.md`](plan-dev-readback.md).

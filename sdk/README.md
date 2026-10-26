@@ -82,7 +82,8 @@ REDGraph you support.
 
 **Do not rely on RED4ext `Unload`.** A heavily modded game often crashes on exit, so `Unload` may never run.
 
-**The game version is 2.31.** REDGraph uses fixed engine addresses of that build.
+**The game version is 2.5** (REDGraph 0.4.2 on; 0.4.1 is the last for 2.31; 0.5.0 adds the A/B profile API entries). REDGraph uses fixed engine addresses of
+that build.
 
 ## 3. What a client can do
 
@@ -108,6 +109,7 @@ The header documents each call in detail. This table is the map: which call you 
 | another mod's transient | `flow_register("<theirmod>/<name>", 0)` + `node_use` | the only way clients share a resource - see section 8 |
 | code before / after an engine node | `node_wrap` (M8), `node_wrap_use` | any number of wraps per node; `node_wrap_use` declares a resource on the wrapped node (not on a group) |
 | an engine node's work switched off (or replaced) | `node_remove` + `node_remove_set` (M9), plus a wrap for a replacement | **one** removal per node class across all clients |
+| what your feature costs, measured | `ab_switch` (one per feature), `prof_active` + `prof_add` (your own engine hooks' CPU) | `[Diagnostics] ABProfile`, `Game.RG_AB` - section 9; check `struct_size` first (new in 0.5.0) |
 | ... and its outputs cleared instead of left stale | `node_remove_clear` | the node's own textures, or a named one; the value is yours. See section 7 |
 | HLSL compiled into a blob at load | `compile_hlsl` | `cs/vs/ps_6_x`; needs `dxcompiler.dll` + `dxil.dll` next to REDGraph.dll - **not shipped** with REDGraph, else `RG_E_UNAVAILABLE` |
 | shader-visible descriptors for your own pass | `gpu_descriptors` (M10) | from the engine's per-frame ring: allocate per use, never keep |
@@ -297,6 +299,15 @@ The log has the same information in one line at startup: `registration CLOSED - 
     name)` (its draws joined to the BLAS) or `RG_STAGE_CS` (dispatches; for the `m_computeSkinning_*` pool writers);
     it returns `RG_E_UNAVAILABLE` and costs nothing while the census is off. NVIDIA only.
   * `FrameTimer` (live): the frame time every 10 s as `[frame]` - switch your feature off and on and compare.
+  * `ABProfile`: the A/B profile - register a switch per feature (`host->ab_switch("<Mod>.<Feature>", set, get,
+    user)`: `set` is called from the profiler's own thread - apply live, do not save), then from the CET console
+    `Game.RG_AB("<Mod>.<Feature>", 4, 1.5, 10)` (block s, settle s, pairs; `*` = every switch; `"stop"` aborts) and
+    `Game.RG_ABState()`. The report (`[ab]` in the log): the frame, the GPU span, your DispatchRays, companions and
+    passes, the CPU per engine node, the host's and every client callback's - B (on) minus A (off), with a 95 %
+    interval. Time your own engine hooks with `prof_add` while `prof_active()`. `docs/internals.md` "A/B profile".
+* **`[Dev]` (developers):** `ShaderHotReload` (a folder of new shader bytes for your registered patches, live) and
+  `Readback` (`Game.RG_Readback(...)`: an engine constant block, a render-graph texture at a node, a VS's outputs + the
+  BVH copies of its meshes, into files) - `docs/internals.md` "Shader hot reload (dev)", "GPU readback (dev)".
 * **REDGraph window → Host:**
   * **Status into the log** writes REDGraph's counters and settings.
   * **Profile** measures REDGraph's own CPU time per hook point. About 0.3 % of a frame is normal.
