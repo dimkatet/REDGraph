@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.2
 
 - Fixed: the game could crash when a mod asked for a render-graph texture by name at a point of the frame where that
   texture does not exist (yet or any more).
