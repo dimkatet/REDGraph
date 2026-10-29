@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Fixed: the game could crash when a mod asked for a render-graph texture by name at a point of the frame where that
+  texture does not exist (yet or any more).
+
 ## 0.5.1
 
 - Fixed (0.5.0 only): a mod's code that runs at the end of a render node (for example Cyberpunk Render Tweaks'

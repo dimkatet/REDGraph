@@ -176,6 +176,38 @@ uint32_t tag_of(const uint8_t* ctx, uint32_t name_hash) {
   return name_hash ^ (view << 24);
 }
 
+// The engine's GetResource, guarded. Asked for a name whose entry exists but that is not alive at this node (a
+// transient between its allocation and last use only), it faults inside the engine; the same checks run here first and
+// the lookup is skipped (id 0) when it would. A name not in the table answers 0 in the engine too.
+uint32_t get_id(const uint8_t* data, uint32_t tag, uint8_t thread) {
+  uint32_t id = 0;
+  const uint32_t n_tab = rd<uint32_t>(data, kFlowTabCount), n_buckets = rd<uint32_t>(data, kFlowTabBucketCount);
+  if (!n_tab || !n_buckets) return 0;
+  const auto* buckets = rd<const uint8_t*>(data, kFlowTabBuckets);
+  const auto* entries = rd<const uint8_t*>(data, kFlowTabEntries);
+  const uint32_t stride = rd<uint32_t>(data, kFlowTabStride);
+  if (!buckets || !entries) return 0;
+  uint32_t i = rd<uint32_t>(buckets, size_t(tag % n_buckets) * 4);
+  const uint8_t* e = nullptr;
+  for (; i != 0xffffffffu; i = rd<uint32_t>(e, 0)) {
+    e = entries + size_t(i) * stride;
+    if (rd<uint32_t>(e, 4) == tag && rd<uint32_t>(e, 8) == tag) break;
+  }
+  if (i == 0xffffffffu) return 0;
+  if (!rd<const uint8_t*>(e, kFlowEntryInstance)) {
+    uint32_t count = rd<uint32_t>(data, size_t(thread) * kFlowThreadStride + kFlowThreadCount);
+    if (count < 1) count = 1;
+    const uint64_t key = (uint64_t(thread) << 16) | uint16_t(count - 1);
+    const uint32_t n = rd<uint32_t>(e, kFlowEntryIntervalCount);
+    const auto* iv = rd<const uint8_t*>(e, kFlowEntryIntervals);
+    bool reached = false;
+    for (uint32_t k = 0; iv && k < n && !reached; ++k) reached = rd<uint64_t>(iv, size_t(k) * 24 + 8) >= key;
+    if (!reached) return 0;  // the engine would fault here
+  }
+  g_get_resource(data, &id, &tag, thread, false);
+  return id;
+}
+
 Res* res_of(rg_handle h) {
   return h > 0 && static_cast<uint32_t>(h) <= g_nr.load(std::memory_order_acquire) ? &g_r[h - 1] : nullptr;
 }
@@ -532,8 +564,7 @@ void replay(const void* node_ctx, const FlowRecord& r, const RemoveClear* clears
     for (uint32_t k = 0; k < nown && !owned; ++k) owned = own[k] == tag;
     for (uint32_t c = 0; c < nclears; ++c) {
       if (clears[c].name_hash ? tag_of(ctx, clears[c].name_hash) != tag : !owned) continue;
-      uint32_t id = 0;
-      g_get_resource(data, &id, &tag, r.thread[i], false);
+      const uint32_t id = get_id(data, tag, r.thread[i]);
       if (id) clear_texture(id, tag, clears[c].value);
       if (c < kMaxRemoveClears) fired[c] = true;
       break;  // the first matching rule, in registration order
@@ -552,8 +583,7 @@ void replay(const void* node_ctx, const FlowRecord& r, const RemoveClear* clears
       continue;
     }
     const uint32_t tag = tag_of(ctx, clears[c].name_hash);
-    uint32_t id = 0;
-    g_get_resource(data, &id, &tag, rd<uint8_t>(ctx, kNodeCtxFlowThread), false);
+    const uint32_t id = get_id(data, tag, rd<uint8_t>(ctx, kNodeCtxFlowThread));
     if (texture_resource(id)) {
       clear_texture(id, tag, clears[c].value);
     } else if (!g_named_logged.exchange(true)) {
@@ -651,8 +681,7 @@ uint32_t resolve(Res* r) {
     return 0;
   }
   const uint32_t tag = tag_of(ctx, r->hash);
-  uint32_t id = 0;
-  g_get_resource(data, &id, &tag, rd<uint8_t>(ctx, kNodeCtxFlowThread), false);
+  const uint32_t id = get_id(data, tag, rd<uint8_t>(ctx, kNodeCtxFlowThread));
   if (!texture_resource(id)) {
     r->misses.fetch_add(1, std::memory_order_relaxed);
     return 0;
@@ -691,8 +720,7 @@ uint32_t resolve_here(uint32_t name_hash, void** resource) {
   const uint8_t* data = flow_data(ctx);
   if (!g_attached || !data || data[kFlowPhase] == kFlowPhaseDeclare) return 0;
   const uint32_t tag = tag_of(ctx, name_hash);
-  uint32_t id = 0;
-  g_get_resource(data, &id, &tag, rd<uint8_t>(ctx, kNodeCtxFlowThread), false);
+  const uint32_t id = get_id(data, tag, rd<uint8_t>(ctx, kNodeCtxFlowThread));
   void* res = texture_resource(id);
   if (!res) return 0;
   if (resource) *resource = res;

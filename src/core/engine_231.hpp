@@ -265,6 +265,21 @@ constexpr uintptr_t kFlowDescFlags = 0x20;
 constexpr uintptr_t kFlowDescFormat = 0x25;
 // SRenderFlowInternalData::GetResource<GpuApi::TextureRef>(data, TextureRef* out, const u32* tag, u8 thread, bool)
 constexpr uintptr_t kFlowGetTexture = 0x334810;
+// Its lookup, read from the 2.5 exe (2026-10-28): a name table in `data` (u32 count +0x61d550, u64 buckets +0x61d548,
+// u32 bucket count +0x61d554, entries +0x61d558 with stride u32 +0x61d564; an entry: u32 next, u32 hash, u32 hash, u64
+// instance +0x20) and, per thread (stride 0x70c0, u32 count at +0x40), the entry's timeline: u32 count +0x34, 24-byte
+// intervals at u64 +0x28 keyed by u64 +8 = thread << 16 | (count - 1). An entry with no instance AND no interval
+// reaching the key makes the lookup return NULL and the function dereference it (rax = 0 at +0x3348c9).
+constexpr uintptr_t kFlowTabCount = 0x61d550;
+constexpr uintptr_t kFlowTabBuckets = 0x61d548;
+constexpr uintptr_t kFlowTabBucketCount = 0x61d554;
+constexpr uintptr_t kFlowTabEntries = 0x61d558;
+constexpr uintptr_t kFlowTabStride = 0x61d564;
+constexpr uintptr_t kFlowThreadStride = 0x70c0;
+constexpr uintptr_t kFlowThreadCount = 0x40;
+constexpr uintptr_t kFlowEntryInstance = 0x20;
+constexpr uintptr_t kFlowEntryIntervals = 0x28;
+constexpr uintptr_t kFlowEntryIntervalCount = 0x34;
 // SRenderNodeImplContext (the ctx of Execute / Process): +0x08 -> SRenderFlowInternalData* (one more deref), +0x30 u8
 // flags (bit 0: Test() answers true and a tag takes view 0 - meaning open; NOT the declaration run, that is
 // kFlowPhase), +0x34 u32 view (a tag is name_hash ^ view << 24, 32-bit), +0x38 u8 the flow thread
