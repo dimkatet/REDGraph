@@ -4,6 +4,11 @@
 
 - Fixed: the game could crash when a mod asked for a render-graph texture by name at a point of the frame where that
   texture does not exist (yet or any more).
+- For mod developers: a draw companion can now read a mod's own data - `lease_register` takes draw companions (in
+  `companions`, with stage VS / PS). The companion is drawn only when that data is in place for the draw. API version
+  stays 1; an older REDGraph refuses such a lease (`RG_E_ARG`).
+- For mod developers: two mods leasing the same register of the same game shader no longer break each other silently -
+  the second one is refused (`RG_E_TAKEN`) and the log names the first.
 
 ## 0.5.1
 

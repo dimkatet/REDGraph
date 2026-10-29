@@ -135,9 +135,16 @@ constexpr uint32_t kMaxRefs = 64;  // ShaderRefs a lease learns - one per engine
 constexpr uint32_t kMaxGroups = 32;
 constexpr uint32_t kMaxPatchHandles = kMaxPatchCount;
 constexpr uint32_t kMaxCompHandles = 8;
+constexpr uint32_t kMaxDrawCompHandles = 8;  // pso_patch.cpp kMaxDrawComps
 constexpr uint32_t kMaxLeasesPerOwner = 8;
 static_assert(kMaxGroups <= 32, "FrSave::mask is a uint32_t bit per group");
 static_assert(kMaxLeases <= 127, "g_lease_of_patch / g_lease_of_comp hold a lease index in an int8_t");
+
+// The shader owners a lease can have. rg_lease_desc.companions takes compute companions (stage CS) and draw companions
+// (stage VS / PS): the lease's stage tells them apart, so a Lease's comps[] holds one kind or the other.
+enum Owner : uint8_t { kOwnPatch, kOwnComp, kOwnDraw };
+const char* const kOwnerName[3] = {"patch", "companion", "draw companion"};
+Owner comp_owner(uint32_t stage) { return stage == RG_STAGE_CS ? kOwnComp : kOwnDraw; }
 
 struct Group {
   uint32_t stage, kind, reg;
@@ -177,15 +184,29 @@ std::atomic<uint32_t> g_nleases{0};
 // 2 refused.
 int8_t g_lease_of_patch[kMaxPatchHandles][kMaxLeasesPerOwner];
 int8_t g_lease_of_comp[kMaxCompHandles][kMaxLeasesPerOwner];
+int8_t g_lease_of_draw[kMaxDrawCompHandles][kMaxLeasesPerOwner];
 std::atomic<uint8_t> g_patch_ok[kMaxPatchHandles] = {};
 std::atomic<uint8_t> g_comp_ok[kMaxCompHandles] = {};
+std::atomic<uint8_t> g_draw_ok[kMaxDrawCompHandles] = {};
 
 struct LeaseOfInit {
   LeaseOfInit() {
     std::memset(g_lease_of_patch, -1, sizeof(g_lease_of_patch));
     std::memset(g_lease_of_comp, -1, sizeof(g_lease_of_comp));
+    std::memset(g_lease_of_draw, -1, sizeof(g_lease_of_draw));
   }
 } g_lease_of_init;
+
+uint32_t owner_max(Owner o) {
+  return o == kOwnPatch ? kMaxPatchHandles : o == kOwnComp ? kMaxCompHandles : kMaxDrawCompHandles;
+}
+// The owner's lease slots / vanilla verdict; h checked against owner_max by the caller.
+int8_t* owner_slots(Owner o, rg_handle h) {
+  return o == kOwnPatch ? g_lease_of_patch[h - 1] : o == kOwnComp ? g_lease_of_comp[h - 1] : g_lease_of_draw[h - 1];
+}
+std::atomic<uint8_t>& owner_verdict(Owner o, rg_handle h) {
+  return o == kOwnPatch ? g_patch_ok[h - 1] : o == kOwnComp ? g_comp_ok[h - 1] : g_draw_ok[h - 1];
+}
 
 std::atomic<uint64_t> g_frame{0};  // frame_tick()
 
@@ -246,7 +267,7 @@ bool is_ref(const Lease& l, uint32_t id) {
 
 bool lease_enabled(const Lease& l) {
   if (l.state.load(std::memory_order_relaxed) == RG_STATE_REFUSED) return false;
-  if (l.ncomps) return true;  // a companion's lease stages at every dispatch of its engine shader (header)
+  if (l.ncomps) return true;  // a companion's lease stages at every dispatch / draw of its engine shader (header)
   for (uint32_t i = 0; i < l.npatches; ++i)
     if (pso::patch_selected(l.patches[i])) return true;
   return false;
@@ -895,25 +916,26 @@ void build() {
 }
 
 // The k-th lease of an owner, nullptr past the last.
-Lease* lease_of(bool comp, rg_handle h, uint32_t k) {
-  const uint32_t max = comp ? kMaxCompHandles : kMaxPatchHandles;
-  if (h <= 0 || static_cast<uint32_t>(h) > max || k >= kMaxLeasesPerOwner) return nullptr;
-  const int8_t li = comp ? g_lease_of_comp[h - 1][k] : g_lease_of_patch[h - 1][k];
+Lease* lease_of(Owner o, rg_handle h, uint32_t k) {
+  if (h <= 0 || static_cast<uint32_t>(h) > owner_max(o) || k >= kMaxLeasesPerOwner) return nullptr;
+  const int8_t li = owner_slots(o, h)[k];
   return li >= 0 ? &g_leases[li] : nullptr;
 }
 
-void refuse_owner(bool comp, rg_handle h, const char* why) {
-  if (comp)
+void refuse_owner(Owner o, rg_handle h, const char* why) {
+  if (o == kOwnPatch)
+    pso::patch_refuse(h, why);
+  else if (o == kOwnComp)
     pso::companion_refuse(h, why);
   else
-    pso::patch_refuse(h, why);
+    pso::draw_companion_refuse(h, why);
 }
 
 void refuse_lease(Lease& l, const char* why) {
   l.state.store(RG_STATE_REFUSED);
   clients::refused(clients::kLease, static_cast<rg_handle>(&l - g_leases + 1), why);
   for (uint32_t i = 0; i < l.npatches; ++i) pso::patch_refuse(l.patches[i], why);
-  for (uint32_t i = 0; i < l.ncomps; ++i) pso::companion_refuse(l.comps[i], why);
+  for (uint32_t i = 0; i < l.ncomps; ++i) refuse_owner(comp_owner(l.stage), l.comps[i], why);
 }
 
 // Registration of one owner of a lease being registered: its blobs must read the register, it may not hold it twice.
@@ -949,41 +971,81 @@ int32_t check_rt_owner(rg_handle h, const rg_lease_desc* d, const char* name) {
   return kind_mismatch(rk, want_kind(d), name, "RT library", h, d);
 }
 
-int32_t check_owner(bool comp, rg_handle h, const rg_lease_desc* d, const char* name) {
+int32_t check_owner(Owner o, rg_handle h, const rg_lease_desc* d, const char* name) {
   const rg_blob* v = nullptr;
   rg_blob cs{};
   uint32_t stage = RG_STAGE_CS, count = 1;
-  const uint32_t max = comp ? kMaxCompHandles : kMaxPatchHandles;
-  if (h <= 0 || static_cast<uint32_t>(h) > max) return RG_E_ARG;
-  if (comp) {
+  if (h <= 0 || static_cast<uint32_t>(h) > owner_max(o)) return RG_E_ARG;
+  if (o == kOwnComp) {
     if (!pso::companion_info(h, &cs)) return RG_E_ARG;
+    v = &cs;
+  } else if (o == kOwnDraw) {
+    if (!pso::draw_companion_info(h, &stage, &cs)) return RG_E_ARG;
+    if (!cs.bytes) {  // a state-only draw companion runs the engine's shader, which must not read the register
+      clients::reason("a draw companion without a shader of its own cannot hold a lease");
+      return RG_E_ARG;
+    }
     v = &cs;
   } else if (!pso::patch_info(h, &stage, &v, &count)) {
     return RG_E_ARG;
   }
   if (stage != d->stage) return RG_E_ARG;
-  const int8_t* slots = comp ? g_lease_of_comp[h - 1] : g_lease_of_patch[h - 1];
+  const int8_t* slots = owner_slots(o, h);
   uint32_t held = 0;
   for (; held < kMaxLeasesPerOwner && slots[held] >= 0; ++held) {
-    const Lease& o = g_leases[slots[held]];
-    if (o.stage == d->stage && o.kind == d->kind && o.reg == d->reg) return RG_E_TAKEN;  // that register, twice
+    const Lease& l = g_leases[slots[held]];
+    if (l.stage == d->stage && l.kind == d->kind && l.reg == d->reg) return RG_E_TAKEN;  // that register, twice
   }
   if (held == kMaxLeasesPerOwner) return RG_E_FULL;
   for (uint32_t k = 0; k < count; ++k) {
     uint32_t rk = 0;
     if (dxbc::binds(v[k].bytes, v[k].size, d->kind, 0, d->reg, &rk) != dxbc::Bound::kYes) {
       g_sdk->logger->ErrorF(g_handle, "host: lease '%s' REFUSED - %s #%d%s does not read %s %c%u (space0)", name,
-                            comp ? "companion" : "patch", h, comp ? "" : " (a variant)", stage_name(d->stage),
+                            kOwnerName[o], h, o == kOwnPatch ? " (a variant)" : "", stage_name(d->stage),
                             letter(d->kind), d->reg);
       return RG_E_BLOB;
     }
-    if (const int32_t e = kind_mismatch(rk, want_kind(d), name, comp ? "companion" : "patch", h, d)) return e;
+    if (const int32_t e = kind_mismatch(rk, want_kind(d), name, kOwnerName[o], h, d)) return e;
   }
   return 0;
 }
 
-void add_owner(bool comp, rg_handle h, int8_t lease) {
-  int8_t* slots = comp ? g_lease_of_comp[h - 1] : g_lease_of_patch[h - 1];
+// Two leases on one register of ONE engine shader: staging takes the first lease whose owners carry the bound shader,
+// so the other one's owners would silently lose (a patch stays vanilla, a companion never runs). Between the leases
+// of one client that is the client's own business (e.g. variants it never selects together); between two CLIENTS it
+// is refused here, when the second one registers - RG_E_TAKEN, both named in the log.
+clients::Kind owner_client_kind(Owner o) {
+  return o == kOwnPatch ? clients::kPatch : o == kOwnComp ? clients::kCompanion : clients::kDrawCompanion;
+}
+int32_t check_shared_target(Owner o, rg_handle h, const rg_lease_desc* d, const char* name) {
+  uint8_t mine[16];
+  if (!pso::owner_target(o, h, mine)) return 0;
+  const std::string client = clients::client_of(owner_client_kind(o), h);
+  const uint32_t n = g_nleases.load();
+  for (uint32_t i = 0; i < n; ++i) {
+    const Lease& l = g_leases[i];
+    if (l.rt_mask || l.stage != d->stage || l.kind != d->kind || l.reg != d->reg) continue;
+    for (uint32_t k = 0; k < l.npatches + l.ncomps; ++k) {
+      const Owner lo = k < l.npatches ? kOwnPatch : comp_owner(l.stage);
+      const rg_handle lh = k < l.npatches ? l.patches[k] : l.comps[k - l.npatches];
+      uint8_t theirs[16];
+      if (!pso::owner_target(lo, lh, theirs) || std::memcmp(mine, theirs, 16) != 0) continue;
+      const std::string other = clients::client_of(owner_client_kind(lo), lh);
+      if (other == client) continue;
+      char why[200];
+      std::snprintf(why, sizeof why, "%s %c%u of the same engine shader is already leased by '%s' (%s #%d of %s) - "
+                    "one register of one shader stages one descriptor", stage_name(d->stage), letter(d->kind), d->reg,
+                    l.name, kOwnerName[lo], lh, other.empty() ? "another client" : other.c_str());
+      g_sdk->logger->ErrorF(g_handle, "host: lease '%s' REFUSED - %s", name, why);
+      clients::reason(why);
+      return RG_E_TAKEN;
+    }
+  }
+  return 0;
+}
+
+void add_owner(Owner o, rg_handle h, int8_t lease) {
+  int8_t* slots = owner_slots(o, h);
   for (uint32_t k = 0; k < kMaxLeasesPerOwner; ++k)
     if (slots[k] < 0) {
       slots[k] = lease;
@@ -1164,10 +1226,15 @@ rg_handle lease_register(const rg_lease_desc* d) {
       clients::reason(why);
       return RG_E_TAKEN;
     }
+  const Owner co = comp_owner(d->stage);
   for (uint32_t i = 0; i < d->patch_count; ++i)
-    if (const int32_t e = check_owner(false, d->patches[i], d, name)) return e;
+    if (const int32_t e = check_owner(kOwnPatch, d->patches[i], d, name)) return e;
   for (uint32_t i = 0; i < d->companion_count; ++i)
-    if (const int32_t e = check_owner(true, d->companions[i], d, name)) return e;
+    if (const int32_t e = check_owner(co, d->companions[i], d, name)) return e;
+  for (uint32_t i = 0; i < d->patch_count; ++i)
+    if (const int32_t e = check_shared_target(kOwnPatch, d->patches[i], d, name)) return e;
+  for (uint32_t i = 0; i < d->companion_count; ++i)
+    if (const int32_t e = check_shared_target(co, d->companions[i], d, name)) return e;
   uint64_t rt_mask = 0;
   for (uint32_t i = 0; i < d->rtlib_count; ++i) {
     if (const int32_t e = check_rt_owner(d->rtlibs[i], d, name)) return e;
@@ -1194,12 +1261,12 @@ rg_handle lease_register(const rg_lease_desc* d) {
   l.npatches = d->patch_count;
   for (uint32_t i = 0; i < d->patch_count; ++i) {
     l.patches[i] = d->patches[i];
-    add_owner(false, d->patches[i], static_cast<int8_t>(n));
+    add_owner(kOwnPatch, d->patches[i], static_cast<int8_t>(n));
   }
   l.ncomps = d->companion_count;
   for (uint32_t i = 0; i < d->companion_count; ++i) {
     l.comps[i] = d->companions[i];
-    add_owner(true, d->companions[i], static_cast<int8_t>(n));
+    add_owner(co, d->companions[i], static_cast<int8_t>(n));
   }
   l.rt_mask = rt_mask;
   l.cb = d->cbuffer > 0 ? d->cbuffer - 1 : -1;
@@ -1373,41 +1440,41 @@ void detach() {
 
 bool attached() { return g_attached; }
 
-bool patch_has_lease(rg_handle patch) { return lease_of(false, patch, 0) != nullptr; }
+bool patch_has_lease(rg_handle patch) { return lease_of(kOwnPatch, patch, 0) != nullptr; }
 
 namespace {
 
 // One lease against the vanilla bytecode: true = granted.
-bool check_vanilla(Lease& l, bool comp, rg_handle owner, const void* code, size_t size) {
+bool check_vanilla(Lease& l, Owner o, rg_handle owner, const void* code, size_t size) {
   const dxbc::Bound b = dxbc::binds(code, size, l.kind, 0, l.reg);
   if (b == dxbc::Bound::kNo) {
     uint32_t expect = RG_STATE_PENDING;
     l.state.compare_exchange_strong(expect, RG_STATE_OK);
     g_sdk->logger->InfoF(g_handle, "host: lease '%s' %s %c%u GRANTED for %s #%d - the engine's shader does not read it",
-                         l.name, stage_name(l.stage), letter(l.kind), l.reg, comp ? "companion" : "patch", owner);
+                         l.name, stage_name(l.stage), letter(l.kind), l.reg, kOwnerName[o], owner);
     return true;
   }
   char why[160];
   _snprintf_s(why, sizeof(why), _TRUNCATE, "lease '%s': %s", l.name,
               b == dxbc::Bound::kYes ? "the engine's shader reads that register itself"
                                      : "the engine's shader has no readable PSV0 (bindings unknown)");
-  refuse_owner(comp, owner, why);
+  refuse_owner(o, owner, why);
   return false;
 }
 
 // Create-time, before the engine creates the PSO: every lease of the owner against the vanilla bytecode, once.
-bool owner_matched(bool comp, rg_handle h, const void* code, size_t size) {
-  if (!lease_of(comp, h, 0)) return true;
+bool owner_matched(Owner o, rg_handle h, const void* code, size_t size) {
+  if (!lease_of(o, h, 0)) return true;
   if (!g_attached) return false;
   std::call_once(g_build_once, [] { build(); });
-  std::atomic<uint8_t>& verdict = comp ? g_comp_ok[h - 1] : g_patch_ok[h - 1];
+  std::atomic<uint8_t>& verdict = owner_verdict(o, h);
   const uint8_t v = verdict.load();
   if (v) return v == 1;
   bool ok = true;
   for (uint32_t k = 0; ok; ++k) {
-    Lease* l = lease_of(comp, h, k);
+    Lease* l = lease_of(o, h, k);
     if (!l) break;
-    ok = l->state.load() != RG_STATE_REFUSED && check_vanilla(*l, comp, h, code, size);
+    ok = l->state.load() != RG_STATE_REFUSED && check_vanilla(*l, o, h, code, size);
   }
   verdict.store(ok ? 1 : 2);
   return ok;
@@ -1442,57 +1509,76 @@ bool lease_bind_ok(Lease& l, uint8_t* ctx, bool enabled) {
   return slot && src_owns(l, *slot);
 }
 
-}  // namespace
-
-bool on_patch_matched(rg_handle patch, const void* code, size_t size) { return owner_matched(false, patch, code, size); }
-
-bool on_companion_matched(rg_handle comp, const void* code, size_t size) {
-  return owner_matched(true, comp, code, size);
-}
-
-bool bind_ok(rg_handle patch, const void* pso_state, bool compute, bool enabled) {
-  if (!pso_state || !g_ready.load(std::memory_order_acquire) || !lease_of(false, patch, 0)) return false;
-  auto* ctx = const_cast<uint8_t*>(static_cast<const uint8_t*>(pso_state)) - (compute ? kCtxComputeState : kCtxGraphicsState);
-  bool ok = true;
-  for (uint32_t k = 0;; ++k) {  // every lease, so each learns its ShaderRef even when an earlier one is not staged
-    Lease* l = lease_of(false, patch, k);
-    if (!l) break;
-    ok = lease_bind_ok(*l, ctx, enabled) && ok;
-  }
-  return ok;
-}
-
-void companion_bind(rg_handle comp, const void* pso_state) {
-  if (!pso_state || !g_ready.load(std::memory_order_acquire) || !lease_of(true, comp, 0)) return;
-  auto* ctx = const_cast<uint8_t*>(static_cast<const uint8_t*>(pso_state)) - kCtxComputeState;
+// A companion (compute or draw) bound with the engine PSO it accompanies: its leases learn the ShaderRef.
+void owner_bind(Owner o, rg_handle h, const void* pso_state, uint32_t state_offset) {
+  if (!pso_state || !g_ready.load(std::memory_order_acquire) || !lease_of(o, h, 0)) return;
+  auto* ctx = const_cast<uint8_t*>(static_cast<const uint8_t*>(pso_state)) - state_offset;
   for (uint32_t k = 0;; ++k) {
-    Lease* l = lease_of(true, comp, k);
+    Lease* l = lease_of(o, h, k);
     if (!l) break;
     lease_bind_ok(*l, ctx, true);
   }
 }
 
-bool companion_staged(rg_handle comp, const void* ctx_v) {
-  if (!lease_of(true, comp, 0)) return true;
+// From inside the engine's dispatch / draw: true iff every lease of the companion has OUR descriptor in the table it uses.
+bool owner_staged(Owner o, rg_handle h, const void* ctx_v) {
+  if (!lease_of(o, h, 0)) return true;
   if (!ctx_v || !g_ready.load(std::memory_order_acquire)) return false;
   auto* fr = *reinterpret_cast<uint8_t* const*>(static_cast<const uint8_t*>(ctx_v) + kCtxFrameRes);
   bool ok = true;
   for (uint32_t k = 0;; ++k) {
-    Lease* l = lease_of(true, comp, k);
+    Lease* l = lease_of(o, h, k);
     if (!l) break;
     const Group& g = g_groups[l->group];
     const int32_t idx = g.idx.load(std::memory_order_relaxed);
     const uint64_t* slot = (fr && idx >= 0 && !g.broken.load(std::memory_order_relaxed)) ? staging_slot(fr, idx) : nullptr;
     if (!slot || !src_owns(*l, *slot)) {
       if (l->not_staged.fetch_add(1, std::memory_order_relaxed) == 0)
-        g_sdk->logger->WarnF(g_handle, "native table: companion #%d NOT STAGED - lease '%s' %s %c%u is not in this "
-                             "dispatch's table (source %s, staging index %d); the companion is skipped (logged once)",
-                             comp, l->name, stage_name(l->stage), letter(l->kind), l->reg,
-                             src_valid(*l) ? "ready" : "NOT READY", idx);
+        g_sdk->logger->WarnF(g_handle, "native table: %s #%d NOT STAGED - lease '%s' %s %c%u is not in this %s's table "
+                             "(source %s, staging index %d); the %s is skipped (logged once)", kOwnerName[o], h,
+                             l->name, stage_name(l->stage), letter(l->kind), l->reg,
+                             o == kOwnDraw ? "draw" : "dispatch", src_valid(*l) ? "ready" : "NOT READY", idx,
+                             kOwnerName[o]);
       ok = false;
     }
   }
   return ok;
 }
+
+}  // namespace
+
+bool on_patch_matched(rg_handle patch, const void* code, size_t size) {
+  return owner_matched(kOwnPatch, patch, code, size);
+}
+
+bool on_companion_matched(rg_handle comp, const void* code, size_t size) {
+  return owner_matched(kOwnComp, comp, code, size);
+}
+
+bool on_draw_companion_matched(rg_handle comp, const void* code, size_t size) {
+  return owner_matched(kOwnDraw, comp, code, size);
+}
+
+bool bind_ok(rg_handle patch, const void* pso_state, bool compute, bool enabled) {
+  if (!pso_state || !g_ready.load(std::memory_order_acquire) || !lease_of(kOwnPatch, patch, 0)) return false;
+  auto* ctx = const_cast<uint8_t*>(static_cast<const uint8_t*>(pso_state)) - (compute ? kCtxComputeState : kCtxGraphicsState);
+  bool ok = true;
+  for (uint32_t k = 0;; ++k) {  // every lease, so each learns its ShaderRef even when an earlier one is not staged
+    Lease* l = lease_of(kOwnPatch, patch, k);
+    if (!l) break;
+    ok = lease_bind_ok(*l, ctx, enabled) && ok;
+  }
+  return ok;
+}
+
+void companion_bind(rg_handle comp, const void* pso_state) { owner_bind(kOwnComp, comp, pso_state, kCtxComputeState); }
+
+bool companion_staged(rg_handle comp, const void* ctx) { return owner_staged(kOwnComp, comp, ctx); }
+
+void draw_companion_bind(rg_handle comp, const void* pso_state) {
+  owner_bind(kOwnDraw, comp, pso_state, kCtxGraphicsState);
+}
+
+bool draw_companion_staged(rg_handle comp, const void* ctx) { return owner_staged(kOwnDraw, comp, ctx); }
 
 }  // namespace core::bindings

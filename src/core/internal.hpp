@@ -70,6 +70,11 @@ uint32_t bound_subs_take();
 // For bindings: the companion's blob; refuse = never mapped / dispatched from now on.
 bool companion_info(rg_handle h, rg_blob* cs);
 void companion_refuse(rg_handle h, const char* why);
+// For bindings, the same for a draw companion (shader {NULL, 0} = a state-only companion).
+bool draw_companion_info(rg_handle h, uint32_t* stage, rg_blob* shader);
+void draw_companion_refuse(rg_handle h, const char* why);
+// For bindings: the engine shader hash an owner targets (owner 0 patch, 1 companion, 2 draw companion).
+bool owner_target(uint32_t owner, rg_handle h, uint8_t hash16[16]);
 // The graphics wing of M4: draw companions, and which PSO drew on this thread.
 rg_handle draw_companion_register(const char* name, uint32_t stage, const uint8_t* hash16, rg_blob shader,
                                   const rg_pso_state* state);
@@ -147,6 +152,12 @@ bool bind_ok(rg_handle patch, const void* pso_state, bool compute, bool enabled)
 bool on_companion_matched(rg_handle comp, const void* code, size_t size);
 void companion_bind(rg_handle comp, const void* pso_state);
 bool companion_staged(rg_handle comp, const void* ctx);
+// And for DRAW companions (leases at stage VS / PS, staged at every draw of the engine shader they accompany): matched
+// with that stage's vanilla bytecode; bind = GraphicsPSO::CreatePSO of an engine PSO carrying it; staged = from inside
+// the draw subscription, context `ctx` of the draw just recorded.
+bool on_draw_companion_matched(rg_handle comp, const void* code, size_t size);
+void draw_companion_bind(rg_handle comp, const void* pso_state);
+bool draw_companion_staged(rg_handle comp, const void* ctx);
 // RT leases (owners = RT libraries, staged at every DispatchRays): from rt_lib's creator detour, for EVERY library the
 // engine creates (its own bytes) - one that declares a leased register refuses that lease; and before baking one of
 // ours - false = a lease of it is refused, keep the engine's library.

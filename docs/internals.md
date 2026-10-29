@@ -179,7 +179,11 @@ LeaseTexTest run leased t120 and lost its companion that way. A lease is granted
 | the definition covers it | the first `UpdateRootParams` | never staged; patch never swaps |
 | (SRV) its table is not STATIC at that moment (`fr+0x78`, a resource pack at t0) | per draw | not staged (`static_skips`) |
 
-Leases of different shaders share a register freely: staging is per draw.
+Leases of different shaders share a register freely: staging is per draw. Two leases on one register of ONE shader
+(stage + hash of their owners) would not: staging takes the first lease whose owners carry the bound shader, and the
+other one's owners silently lose (a patch stays vanilla, a companion is skipped). Between two CLIENTS that is refused
+when the second registers (`RG_E_TAKEN`, both named); one client's own leases are not checked against each other (it
+may hold variants it never selects together).
 
 **RT leases.** `UpdateRootParams` with `rays = 1` (from `GpuApi::DispatchRays`) forces the CS tables, so those are what
 raygens read. A `DispatchRays` carries no shader identity, so an RT lease stages at EVERY RT dispatch. That is safe
@@ -207,7 +211,12 @@ context unused for N frames` and `all 64 context entries are in use` (the first 
 ends with `context entries: in use, peak, taken over, all in use`.
 
 **Companions' leases** stage at every dispatch of the engine shader they accompany (inert for the vanilla shader);
-`companion_request` is accepted only when the descriptors sit in that dispatch's table.
+`companion_request` is accepted only when the descriptors sit in that dispatch's table. **Draw companions' leases**
+(2026-10-29; `rg_lease_desc.companions` at stage VS / PS, the stage tells the two kinds apart): the same per draw -
+the lease test on that stage's vanilla bytecode before the engine creates the PSO, the ShaderRef learned at the graphics
+bind (`draw_companion_bind`), staged at every draw of the engine's shader, `draw_companion_request` accepted only when
+the descriptors sit in the table the engine's draw used. A state-only draw companion runs the engine's shader and
+cannot hold one.
 
 What a lease binds: a host cbuffer (`cbuffer_create` / `_write` / `_feed`, a ring on the engine's device; UPLOAD, or
 GPU_UPLOAD when available), a view of a client-owned **buffer** (`view_create` / `view_set_resource`), or - since
@@ -312,7 +321,7 @@ Every other draw costs one thread-local load.
   carrying the hash, from the engine's desc with that stage's bytecode and / or `rg_pso_state` applied; recorded as
   `SetPipelineState(companion) -> the same draw -> SetPipelineState(what the engine drew with)` (indirect: the
   engine's command signature at device data `+0x13bc678` / `+0x13bc670`, `GetD3DBuffer(ctx+0x6c)`, offset
-  `ctx+0x70` - still bound). No leases (v1). `draw_companion_scope` as `companion_scope`.
+  `ctx+0x70` - still bound). Leases: as a compute companion's ("Leases (M2)"). `draw_companion_scope` as `companion_scope`.
 * **pass after a draw** (`pass_after_draw`): as after a dispatch, plus the topology cache (`ctx+0x628`) cleared on a
   restore. NOT restored: render targets, viewports, scissors, VB / IB, stencil ref, blend factor - the next draw of the
   batch re-sets none of them.
@@ -826,7 +835,7 @@ graph-debug skip rules on it were switched off - not investigated.
 | `PatchScopeTest = 1` / `2` | M11: the game's own PS 0c359133 swapped for itself, scoped inside / outside its node | `scope test ... swaps` / `out_of_scope` grow |
 | `ComposeTest = true` | M1 composition: VS 69090ccd (2 variants) and PS 0c359133 (1), the game's own bytecode swapped for itself, on the sky pass's PSO; four phases of 600 sky runs: VS only, both, PS only, none | `engine PSO ... carries 2 patches ... 5 of 5 combination(s) built`, then per phase `compose test A/B/C/D ... -> PASS` (swaps grow exactly for the patches switched on). Nothing on screen; takes CRT's sky patch for the session |
 | `StateTest = true` | M1 pipeline state: the visible sky's PS 5f079e10 with two state-only variants (no bytecode): wireframe, RT0 write mask 0; phases of 600 sky runs; bad fill mode and a variant out of range refused at registration | `state test: registered ... (expected 0 0 -1 -1)`, then `state test phase 'wireframe' / 'write mask 0': swaps +N -> PASS`, `'vanilla': +0 -> PASS`. ON SCREEN only where nothing covers the sky's bottom layer (5f079e10 lies under the volumetric clouds, fog and aerial composite): far off, near the horizon |
-| `DrawTest = true` | M4 graphics wing: draw subscriptions on the visible sky's PS 5f079e10 and the sky-scattering VS 69090ccd, a draw companion of 5f079e10 that only sets FILL_MODE_WIREFRAME, a pass after the sky draw that returns `RG_PASS_TOUCHED_STATE` touching nothing; phases of 600 sky draws: none / companion / pass; refusals (stage CS, a companion with nothing to change) | `draw test: registered ... PASS`, host `first subscribed draw ... kind N`, `first companion draw`, `first pass after a draw`, then per phase `draw test phase '...': companion draws +N (requests +N+1 ...) ... -> PASS`; the line names the draw kinds the sky goes through. On screen only far off: wireframe sky edges in the companion phase |
+| `DrawTest = true` | M4 graphics wing: draw subscriptions on the visible sky's PS 5f079e10 and the sky-scattering VS 69090ccd, a draw companion of 5f079e10 that only sets FILL_MODE_WIREFRAME, a pass after the sky draw that returns `RG_PASS_TOUCHED_STATE` touching nothing, a LEASED draw companion of 5f079e10 (our PS painting a cbuffer of ours leased at PS b11 - the engine's PS reads b0 b6 b13); phases of 600 sky draws: none / companion / pass / leased companion; refusals (stage CS, a companion with nothing to change, a lease on a state-only companion, a lease on a register its PS does not read) | `draw test: registered ... PASS`, host `first subscribed draw ... kind N`, `first companion draw`, `first pass after a draw`, then per phase `draw test phase '...': companion draws +N (requests +N+1 ...) ... -> PASS`; the line names the draw kinds the sky goes through. On screen only far off: wireframe sky edges in the companion phase |
 | `WrapUseTest = true` | M8 declarations: our transient `rgwrapuse/tmp` written in Lighting (`RgNode_WrapUseWriter` after ClassifyMaterials), declared by a wrap of `CRenderNode_ApplyBloomAndTonemapping` (PostFX) with `node_wrap_use` and copied in its `before`; a wrap of `DrawHUD` without the declaration as an informational control; registration refusals (access 0, no such flow, a 9th declaration) and a group target | `wrap use test: registered ... PASS`, host `wrap 'PostFX' - a GROUP: its 1 node_wrap_use declaration(s) are NOT issued`, then every 1800 frames `wrap use test #N ... DECLARED: ok N (exact M) stale 0 bad 0 ... miss 0 ... -> PASS` (ok = the pattern with a counter within 2 of the writer's: PostFX may record on the CPU before this frame's Lighting). Nothing on screen |
 | `ReloadTest = true` (+ REDGraph's `[Dev] ShaderHotReload`, DXC) | Shader hot reload: a patch of the visible sky's PS 5f079e10 (a magenta PS from `compile_hlsl`), then every 600 sky runs a file dropped into the reload folder: a green `.dxbc` (rebuilt), a compute `.dxbc` (refused: stage), text that is no IR as `.ll` (refused: assembly), a blue PS as `.ll` (assembled, rebuilt); files removed at the end | `reload test step 1..4 ... -> PASS` (clones grow exactly at 1 and 4, `clone_failed` never, swaps every step), `reload test: DONE - 4 pass, 0 fail`; host `DEV reload:` lines. On screen only far off: the sky's bottom layer magenta -> green -> blue. Alone among the 5f079e10 tests. 4/4 PASS on 2.5, 2026-10-24 (default folder and `ShaderReloadDir`) |
 | `ReadbackTest = true` (+ REDGraph's `[Dev] Readback`) | GPU readback (dev): `RgNode_ReadbackWriter` (after ClassifyMaterials) clears `rgreadback/pattern` (40x24 RGBA8) to a known pattern with its run counter; from run 300, through `rg_dev_readback`: the pattern after our node (the `.dds` checked texel by texel), t64 after `RenderVolumetricCloudsLighting` (512x512, DXGI 28, size), t64 before `VolumetricFog` (informational), cb12 (2512 B), four specs that must fail (no key:value, no such block, no node, a node that never runs with `frames:30`); `vsout:69090ccd...` (the sky-scattering VS: vertices = the draw's count x instances by topology, file = vertices x stride, SV_Position finite) and two vsout refusals (a bad hash, a VS never drawn with `frames:30`) | `readback test step 1..11 ... -> PASS` (3: INFO), `readback test: DONE - 10 pass, 0 fail`; host `DEV readback #N` lines; files in the readback folder. Nothing on screen. 10/10 PASS on 2.5, 2026-10-24 |
@@ -885,8 +894,11 @@ validates an item; it does not set the order.
    rasterizer (cull, fill, depth bias), depth, blend / write mask per target, formats, per variant; state-only
    variants (no bytecode). Not covered: stencil, sample desc, input layout, topology.
 4. ~~**The graphics wing of M4.**~~ DONE 2026-10-10, hardware-confirmed 21:48 (`DrawTest` 5/5 PASS): draw subscriptions, draw companions,
-   passes after a draw over the eight `GpuApi` draw entries ("The graphics wing (draws)"; `DrawTest`). Left: leases
-   for draw companions.
+   passes after a draw over the eight `GpuApi` draw entries ("The graphics wing (draws)"; `DrawTest`). Leases for draw
+   companions: DONE 2026-10-29, hardware-confirmed 12:33 (`DrawTest` 6/6 PASS: the leased companion drew
+   exactly its 600 requests minus the uncounted last, 0 refused, the lease staged at every sky draw, 0 not staged; an
+   engine shader reading the register refuses it - b13 of 5f079e10 did, first run). The cross-client refusal is not
+   exercised by a self-test (one module).
 5. **The RT wing of M4.** An RT companion: the engine's `DispatchRays` issued again (same state object and tables,
    another raygen, a leased output). The raygen record is built per dispatch in the upload ring
    (`GpuApi::DispatchRays` 0x2a406e4), so the second dispatch needs its own record.

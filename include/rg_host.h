@@ -175,7 +175,10 @@ typedef struct rg_patch_stats {
  * StructuredBuffer, a texture view of the declared dimension.
  * For a COMPANION the descriptor is staged at every dispatch of the engine's shader it accompanies (the vanilla shader
  * does not read the register, so it is inert there), and the companion is dispatched only if the descriptor sat in
- * the engine's table for that dispatch.
+ * the engine's table for that dispatch. A DRAW companion (stage VS / PS, since 0.5.2): the same per draw - staged at
+ * every draw of the engine's shader of its stage, drawn only if staged; it needs a shader of its own.
+ * Two CLIENTS' leases on one register of one engine shader (stage + hash) are refused: the second one gets RG_E_TAKEN
+ * (only one descriptor can be staged there per draw). One client's own leases are not checked against each other.
  * For RT LIBRARIES (stage CS - DispatchRays binds the CS tables): staged at EVERY DispatchRays, whichever state object
  * it uses - an engine RT dispatch carries no shader identity the host could match, and a baked library reads the
  * register at every dispatch. So: every library the ENGINE creates is checked (its RDAT) and must not declare the
@@ -193,7 +196,8 @@ typedef struct rg_lease_desc {
   const rg_handle* patches;   /* a patch / companion may hold several leases (different registers) */
   uint32_t patch_count;
   rg_handle cbuffer;           /* CBV: what is bound there */
-  const rg_handle* companions; /* rg_host::companion_register handles (stage CS) */
+  const rg_handle* companions; /* stage CS: rg_host::companion_register handles; stage VS / PS (0.5.2):
+                                  rg_host::draw_companion_register handles of that stage */
   uint32_t companion_count;
   rg_handle view;              /* SRV / UAV (or a CBV view): what is bound there */
   const rg_handle* rtlibs;     /* rg_host::rtlib_register handles (stage CS) - see above */
@@ -605,8 +609,9 @@ typedef struct rg_host {
    * none) applied, as a patch variant would. Issued by draw_companion_request from inside a draw subscription of the same
    * engine PSO: the host records the SAME draw again (the same counts / indirect arguments) with the companion PSO, every
    * root argument, render target, viewport and vertex / index buffer still the engine's, then sets back the PSO the
-   * engine drew with. Leases cannot name a draw companion (v1): it reads what the
-   * engine's draw has bound. Register-time only. */
+   * engine drew with. It reads what the engine's draw has bound, plus its own leases (rg_lease_desc.companions with
+   * stage VS / PS, since 0.5.2 - an older host answers RG_E_ARG): staged at every draw of the engine's shader, the
+   * companion drawn only when they sat in that draw's table. A state-only companion cannot hold one. Register-time only. */
   rg_handle (*draw_companion_register)(const char* name, uint32_t stage, const uint8_t* hash16, rg_blob shader,
                                        const rg_pso_state* state);
   /* From inside a draw subscription: 1 = the companion is recorded right after the subscriptions return (before any

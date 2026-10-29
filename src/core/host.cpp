@@ -188,8 +188,10 @@ int32_t lease_owned(const void* ret, const rg_lease_desc* d) {
   int32_t r = 0;
   for (uint32_t i = 0; !r && d->patches && i < d->patch_count; ++i)
     r = clients::owner_check(ret, clients::sPatch, d->patches[i], "lease_register");
+  // companions: compute ones at stage CS, draw companions at VS / PS
+  const clients::Space cs = d->stage == RG_STAGE_CS ? clients::sCompanion : clients::sDrawCompanion;
   for (uint32_t i = 0; !r && d->companions && i < d->companion_count; ++i)
-    r = clients::owner_check(ret, clients::sCompanion, d->companions[i], "lease_register");
+    r = clients::owner_check(ret, cs, d->companions[i], "lease_register");
   for (uint32_t i = 0; !r && d->rtlibs && i < d->rtlib_count; ++i)
     r = clients::owner_check(ret, clients::sRtLib, d->rtlibs[i], "lease_register");
   if (!r && d->cbuffer > 0) r = clients::owner_check(ret, clients::sCbuffer, d->cbuffer, "lease_register");

@@ -100,7 +100,7 @@ The header documents each call in detail. This table is the map: which call you 
 | to know when an engine CS dispatches | `dispatch_subscribe` (M4c) | direct and indirect dispatches |
 | raw D3D12 work after a dispatch | `pass_register` + `pass_after_dispatch` (M4b) | |
 | to know when an engine VS / PS draws, and what it drew | `draw_subscribe` (M4, graphics) | every GpuApi draw entry; a batch of instances reports each draw |
-| the same draw again with another VS / PS and / or pipeline state | `draw_companion_register` + `draw_companion_request` (from a draw subscription), `draw_companion_scope` | every root argument, render target and vertex buffer stays the engine's; no leases yet |
+| the same draw again with another VS / PS and / or pipeline state | `draw_companion_register` + `draw_companion_request` (from a draw subscription), `draw_companion_scope` | every root argument, render target and vertex buffer stays the engine's; your own data through a lease (`companions` with stage VS / PS) |
 | raw D3D12 work after a draw | `pass_register` + `pass_after_draw` | leave render targets, viewports, vertex / index buffers as you found them: the next draw of the batch does not re-set them |
 | a whole RT library replaced | `rtlib_register` (M3), `rtlib_stats` | baked into the engine's state object at creation, not switchable |
 | an RT raygen variant, switchable live, per node | `rtlib_register` + `rt_variant` + `rt_variant_set` (M12) | the engine's library stays byte-identical. See section 6 |
@@ -172,6 +172,11 @@ Notes:
      * the vanilla shader does **not** read it (checked at the first PSO);
      * the engine's root signature covers it (checked at the first bind).
    * Otherwise the patch stays vanilla, and the log says why.
+   * A companion leases the same way: `l.companions` instead of `l.patches` - a compute companion with `l.stage =
+     RG_STAGE_CS`, a draw companion with the stage it was registered for (VS / PS; it needs a shader of its own). Its
+     lease is staged at every dispatch / draw of the engine shader it accompanies, and `companion_request` /
+     `draw_companion_request` answers 0 for a dispatch / draw where it did not land - the companion never reads the
+     engine's descriptor in that slot.
    * A texture: `view_create_texture(kind, &desc, ring)`. With `desc.flow = 0` it is yours (`view_set_resource(view,
      texture, 0)`; its states are yours). With `desc.flow` = a `flow_register` handle it is the ENGINE's texture by
      name, resolved at every draw / dispatch: where it is not alive the patch stays vanilla for that draw. Scope the
@@ -262,7 +267,7 @@ host->rt_variant_set(v, 1);   /* live, any thread; 0 = the engine's raygen */
 |---|---|
 | one engine shader patched by two clients | the higher `priority` wins (ties: the first registered); the other is refused, with the reason |
 | one draw whose VS one client patches and PS (or added GS) another | allowed: both apply, each switches on its own (a clone per combination of their variants) |
-| one register leased by shaders of two clients | allowed: each lease stages only for its own shaders |
+| one register leased by shaders of two clients | allowed for DIFFERENT engine shaders: each lease stages only for its own; for the SAME engine shader (a patch and a companion of it, say) the second gets `RG_E_TAKEN` - one register of one shader holds one descriptor per draw |
 | one register leased for RT by two clients | the second gets `RG_E_TAKEN` |
 | one node removed by two clients | the second gets `RG_E_TAKEN` |
 | one node wrapped by several clients | all run: every `before`, the node, every `after`, in registration order |

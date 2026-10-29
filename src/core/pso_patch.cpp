@@ -122,6 +122,7 @@ struct DrawComp {
   dxil_hash::Hash hash;
   rg_blob shader;
   rg_pso_state st;  // st.set 0 = none
+  std::atomic<uint32_t> state{RG_STATE_PENDING};  // REFUSED = a lease failed its vanilla test: never built, never drawn
   Counters c;
   Scope scope;
 };
@@ -487,8 +488,15 @@ Match identify(Pipe pipe, const void* desc_v) {
     const auto vs = hash_of(g->VS), ps = hash_of(g->PS);
     m.subs = passes::draw_subs_for(vs ? vs->data() : nullptr, ps ? ps->data() : nullptr);
     for (uint32_t i = 0; i < ndc && m.ndc < Mapping::kMaxDc; ++i) {
-      const auto& h = g_dc[i].stage == RG_STAGE_VS ? vs : ps;
-      if (h && *h == g_dc[i].hash) m.dc[m.ndc++] = i;
+      const bool on_vs = g_dc[i].stage == RG_STAGE_VS;
+      const auto& h = on_vs ? vs : ps;
+      if (!h || *h != g_dc[i].hash || g_dc[i].state.load() == RG_STATE_REFUSED) continue;
+      // The lease test on that stage's vanilla bytecode, as for a compute companion: a refusal builds no companion.
+      const D3D12_SHADER_BYTECODE& code = on_vs ? g->VS : g->PS;
+      if (!bindings::on_draw_companion_matched(static_cast<rg_handle>(i + 1), code.pShaderBytecode,
+                                               code.BytecodeLength))
+        continue;
+      m.dc[m.ndc++] = i;
     }
   }
   return m;
@@ -789,6 +797,8 @@ ID3D12PipelineState* swap(Pipe pipe, const void* state, ID3D12PipelineState* eng
       const Mapping& m = s->m;
       if (pipe == kCompute) t_bound_subs = m.subs;
       else draw_subs = m.subs;
+      // Draw companions' leases learn the ShaderRef (staged at every draw of this shader, inert for the engine's).
+      for (uint32_t i = 0; i < m.ndc; ++i) bindings::draw_companion_bind(static_cast<rg_handle>(m.dc_idx[i] + 1), state);
       if (m.kind == kSubOnly) {
         // subscriptions only - the engine PSO stays bound
       } else if (m.kind == kComp) {
@@ -1165,7 +1175,9 @@ void draw_companion_stats(rg_handle h, rg_patch_stats* out) {
   *out = {};
   DrawComp* c = draw_comp_of(h);
   if (!c) return;
-  out->state = g_attached[kGraphics] ? RG_STATE_OK : RG_STATE_PENDING;
+  out->state = c->state.load() == RG_STATE_REFUSED ? static_cast<uint32_t>(RG_STATE_REFUSED)
+               : g_attached[kGraphics]                 ? RG_STATE_OK
+                                                       : RG_STATE_PENDING;
   c->c.fill(out);
   out->out_of_scope = c->scope.out_of_scope.load();
 }
@@ -1185,7 +1197,7 @@ bool draw_subs_pending() { return t_gfx.subs != 0; }
 
 ID3D12PipelineState* draw_companion_of(ID3D12PipelineState* engine, rg_handle h) {
   DrawComp* c = draw_comp_of(h);
-  if (!c || !engine) return nullptr;
+  if (!c || !engine || c->state.load(std::memory_order_relaxed) == RG_STATE_REFUSED) return nullptr;
   const Slot* s = find(reinterpret_cast<uintptr_t>(engine));
   if (!s) return nullptr;
   for (uint32_t i = 0; i < s->m.ndc; ++i)
@@ -1199,6 +1211,35 @@ ID3D12PipelineState* draw_companion_of(ID3D12PipelineState* engine, rg_handle h)
 
 void draw_companion_count(rg_handle h) {
   if (DrawComp* c = draw_comp_of(h)) c->c.swaps.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool draw_companion_info(rg_handle h, uint32_t* stage, rg_blob* shader) {
+  DrawComp* c = draw_comp_of(h);
+  if (!c) return false;
+  *stage = c->stage;
+  *shader = c->shader;
+  return true;
+}
+
+void draw_companion_refuse(rg_handle h, const char* why) {
+  DrawComp* c = draw_comp_of(h);
+  if (!c || c->state.exchange(RG_STATE_REFUSED) == RG_STATE_REFUSED) return;
+  g_sdk->logger->ErrorF(g_handle, "host: draw companion '%s' REFUSED - %s; it is never drawn", c->name, why);
+  clients::refused(clients::kDrawCompanion, h, why);
+}
+
+bool owner_target(uint32_t owner, rg_handle h, uint8_t hash16[16]) {
+  const dxil_hash::Hash* hash = nullptr;
+  if (owner == 0) {
+    if (Patch* p = patch_of(h)) hash = &p->hash;
+  } else if (owner == 1) {
+    if (Comp* c = comp_of(h)) hash = &c->hash;
+  } else if (DrawComp* c = draw_comp_of(h)) {
+    hash = &c->hash;
+  }
+  if (!hash) return false;
+  std::memcpy(hash16, hash->data(), 16);
+  return true;
 }
 
 // ---- [Dev] ShaderHotReload (core/shader_reload.cpp drives it from the frame thread) ----

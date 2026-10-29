@@ -527,6 +527,9 @@ uint32_t draw_companion_request(rg_handle h) {
     if (d.comp[i] == h) return 1;  // once per draw
   ID3D12PipelineState* pso = pso::draw_companion_of(d.engine, h);
   if (!pso) return 0;
+  // Its leased registers must be in the table the engine's draw used (as for a compute companion; bindings: NOT
+  // STAGED, counted per lease) - else it would read the engine's descriptor in that slot.
+  if (!bindings::draw_companion_staged(h, d.ctx)) return 0;
   d.comp[d.ncomp] = h;
   d.comp_pso[d.ncomp++] = pso;
   return 1;
