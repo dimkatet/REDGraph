@@ -294,6 +294,11 @@ constexpr uintptr_t kTexHandles = 0x10;
 constexpr size_t kTexStride = 0xb0;
 constexpr uintptr_t kTexResource = 0x08;
 constexpr uint32_t kTexSlots = 32768;
+// GpuApi buffer container, the same template (GpuApi::CreateBuffer -> ResourceContainer::Create at SDeviceData +
+// 0x5C0AE0; GpuApi::GetD3DBuffer reads +0x5C0B08 + (id - 1) * 0xB0, GetBufferDesc +0x5C0AF8): 32768 handles of 0xB0
+// {i32 refCount (< 0 = unused), +8 BufferDesc, +0x18 ID3D12Resource*}
+constexpr uintptr_t kBufContainer = 0x5c0ae0;
+constexpr uintptr_t kBufResource = 0x18;
 
 // ---- our own render-graph node (M6, render_nodes.cpp) ----
 // rend::NodeGraphFactory::Register(factory, NodeGroupID, const SRenderNodeParameters&) - every Create<T> -> it

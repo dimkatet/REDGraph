@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- For mod developers: `engine_buffer(gpuapi_id)` / `engine_buffer_va(gpuapi_id)` - a game buffer by its GpuApi id (one
+  a mod read off a game object of its own knowledge) as its `ID3D12Resource` / its GPU address (a buffer may be a
+  piece of a larger resource). Two entries appended (check `struct_size`); API version stays 1.
+
 ## 0.5.2
 
 - Fixed: the game could crash when a mod asked for a render-graph texture by name at a point of the frame where that

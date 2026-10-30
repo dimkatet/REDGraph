@@ -490,6 +490,8 @@ const rg_host kHost = {
     &w_ab_switch,
     &ab::prof_active,
     &ab::prof_add,
+    &render_flow::engine_buffer,
+    &render_flow::engine_buffer_va,
 };
 
 }  // namespace

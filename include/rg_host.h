@@ -681,6 +681,17 @@ typedef struct rg_host {
    * pointer. Leave out the engine's original your hook calls. Call it on the thread that ran the code: an engine
    * node's CPU time on that thread is reported without it. */
   void (*prof_add)(const char* name, uint64_t tsc_cycles);
+
+  /* 2026-10-30: an ENGINE BUFFER by its GpuApi id (a BufferRef's u32 - the id a client read off an engine object of
+   * its own knowledge) -> its ID3D12Resource, NULL = no such live buffer; *bytes (optional) = its size. Not AddRef'd:
+   * use it within this frame's recording (bind its GPU address); the engine may release a buffer between frames. A
+   * client checks struct_size before calling (older hosts end before it). [hot] */
+  void* (*engine_buffer)(uint32_t gpuapi_id, uint64_t* bytes);
+  /* 2026-10-30: the GPU VIRTUAL ADDRESS of a GpuApi buffer - where the engine binds it from. A GpuApi buffer may be a
+   * sub-allocation of a larger ID3D12Resource (material constants share pools of 256 KB): engine_buffer's resource
+   * starts elsewhere. *bytes (optional) = from the address to the end of its resource (an upper bound). 0 = no such
+   * live buffer. Same lifetime rule as engine_buffer; check struct_size. [hot] */
+  uint64_t (*engine_buffer_va)(uint32_t gpuapi_id, uint64_t* bytes);
 } rg_host;
 
 RG_HOST_EXPORT const rg_host* rg_host_get(uint32_t version);

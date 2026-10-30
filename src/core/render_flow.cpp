@@ -257,6 +257,34 @@ void* texture_resource(uint32_t id) {
 
 }  // namespace
 
+void* engine_buffer(uint32_t id, uint64_t* bytes) {
+  if (bytes) *bytes = 0;
+  if (id == 0 || id > kTexSlots) return nullptr;
+  const auto* dev = *reinterpret_cast<const uint8_t* const*>(g_base + kDeviceData);
+  if (!dev) return nullptr;
+  const uint8_t* h = dev + kBufContainer + kTexHandles + size_t(id - 1) * kTexStride;
+  if (rd<int32_t>(h, 0) < 0) return nullptr;
+  auto* res = rd<ID3D12Resource*>(h, kBufResource);
+  if (res && bytes) *bytes = res->GetDesc().Width;
+  return res;
+}
+
+uint64_t engine_buffer_va(uint32_t id, uint64_t* bytes) {
+  if (bytes) *bytes = 0;
+  if (id == 0 || id > kTexSlots) return 0;
+  const auto* dev = *reinterpret_cast<const uint8_t* const*>(g_base + kDeviceData);
+  if (!dev) return 0;
+  const uint8_t* h = dev + kBufContainer + kTexHandles + size_t(id - 1) * kTexStride;
+  if (rd<int32_t>(h, 0) < 0) return 0;
+  auto* res = rd<ID3D12Resource*>(h, kBufResource);
+  const uint64_t va = rd<uint64_t>(dev + kBufferVa + size_t(id - 1) * kBufferStride, 0);
+  if (!res || !va) return 0;
+  const uint64_t base = res->GetGPUVirtualAddress(), end = base + res->GetDesc().Width;
+  if (va < base || va >= end) return 0;  // not this resource's: refuse rather than guess
+  if (bytes) *bytes = end - va;
+  return va;
+}
+
 void want() { g_want.store(true); }
 bool attached() { return g_attached; }
 bool declaring(const void* ctx) {

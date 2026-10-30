@@ -255,6 +255,8 @@ uint32_t flow_hash(rg_handle h);  // the name hash of a registered resource, 0 =
 // 24); payload = the u32 param or the 40 B desc. Both runs of the graph must issue the same sequence.
 void request(const void* node_ctx, uint8_t type, uint32_t name_hash, const void* payload, uint32_t size);
 void* flow_texture(rg_handle h, uint32_t* gpuapi_id);
+void* engine_buffer(uint32_t gpuapi_id, uint64_t* bytes);  // a GpuApi buffer id -> its ID3D12Resource*, NULL = none
+uint64_t engine_buffer_va(uint32_t gpuapi_id, uint64_t* bytes);  // ... -> its GPU VA (a sub-allocation's own), 0 = none
 uint32_t flow_transition(rg_handle h, uint32_t d3d12_state);
 void flow_stats(rg_handle h, rg_flow_stats* out);
 // M9: the node's RenderFlow requests of the declaration run, recorded on this thread (HandleRequest detour) and replayed
