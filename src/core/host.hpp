@@ -36,6 +36,11 @@ namespace blas_census {
 void enable();
 }  // namespace blas_census
 
+// [Diagnostics] MeshProxyCensus: every skinned component's proxy and its chunk table logged (mesh_proxy.cpp).
+namespace mesh_proxy {
+void enable_census();
+}  // namespace mesh_proxy
+
 // [Dev] ShaderHotReload: enable() before attach - pso keeps every mapped PSO's desc, `dir` is watched ("" =
 // shader_reload/ next to REDGraph.dll).
 namespace shader_reload {

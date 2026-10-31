@@ -60,6 +60,9 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle handle, RED4ex
     float blas = 0.0f;
     rg_settings::get("Diagnostics.BlasCensus", &blas);
     if (blas > 0.5f) core::blas_census::enable();  // draw subscriptions: before the registration window closes
+    float proxies = 0.0f;
+    rg_settings::get("Diagnostics.MeshProxyCensus", &proxies);
+    if (proxies > 0.5f) core::mesh_proxy::enable_census();
     float reload = 0.0f;
     rg_settings::get("Dev.ShaderHotReload", &reload);
     if (reload > 0.5f) core::shader_reload::enable(rg_settings::text("Dev.ShaderReloadDir"));  // before attach

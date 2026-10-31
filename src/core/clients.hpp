@@ -15,7 +15,7 @@ namespace core::clients {
 
 enum Kind : uint8_t {
   kPatch, kPatchScope, kCompanion, kCompanionScope, kLease, kCbuffer, kFeed, kView, kRtLib, kRtVariant, kPass,
-  kSubscribe, kDeviceReady, kFlow, kNode, kNodeUse, kNodeAlloc, kWrap, kRemove, kPatchState, kWrapUse, kDrawSubscribe, kDrawCompanion, kDrawCompanionScope, kCensusWatch, kEngineBlock, kAbSwitch, kKinds
+  kSubscribe, kDeviceReady, kFlow, kNode, kNodeUse, kNodeAlloc, kWrap, kRemove, kPatchState, kWrapUse, kDrawSubscribe, kDrawCompanion, kDrawCompanionScope, kCensusWatch, kEngineBlock, kAbSwitch, kMeshProxy, kKinds
 };
 
 // A client reached the table: rg_host_get from module of `addr`, or the host ran its waiting init `fn`.
@@ -57,7 +57,7 @@ std::string client_of(Kind kind, rg_handle h);
 // One handle space per kind of object (node_alloc returns a flow handle: the flow space).
 enum Space : uint8_t {
   sPatch, sCompanion, sCbuffer, sLease, sView, sRtLib, sRtVariant, sPass, sSubscribe, sFlow, sNode, sWrap, sRemove,
-  sDrawSubscribe, sDrawCompanion, kSpaces
+  sDrawSubscribe, sDrawCompanion, sMeshProxy, kSpaces
 };
 // 0 = the call returning to `ret` comes from the client that made handle h; RG_E_FOREIGN = another client's;
 // RG_E_ARG = no such handle. A failure is logged (the first few) with `call` and handed to reason(). Lock-free: cheap

@@ -40,6 +40,9 @@ const Def kDefs[] = {
     // builds - static / updatable / not in the BVH - and the deform pool's writers, every 10 s as [blas]
     // (core/blas_census). At the start only.
     {"Diagnostics", "BlasCensus", false, "BLAS census"},
+    // Every skinned mesh render proxy's own chunk table (render mask per chunk, its materials), once per mesh, as
+    // [proxy] (core/mesh_proxy_census, docs/plan-mesh-proxy.md). Read only. At the start only.
+    {"Diagnostics", "MeshProxyCensus", false, "mesh proxy census"},
     // The frame time every 10 s as [frame] (core/prof) - an on/off A/B of any feature against its own log's switches.
     {"Diagnostics", "FrameTimer", true, "frame timer"},
     // The A/B profile (core/ab): Game.RG_AB(switches, block, settle, pairs) switches clients' features off / on in

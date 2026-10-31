@@ -30,6 +30,8 @@ bool registration_open();
 bool verbose();
 // Attach one detour at base + rva after its call-site check. false (and a log line naming `what`) on failure.
 bool attach_hook(uintptr_t rva, uintptr_t ret_rva, void* detour, void** orig, const char* what);
+// The same for a function with no direct caller (a virtual): checked by its first n bytes instead.
+bool attach_hook_head(uintptr_t rva, const uint8_t* head, size_t n, void* detour, void** orig, const char* what);
 void detach_hook(uintptr_t rva);
 // M4c: the device_ready callbacks - fired once, from pso's first Create detour.
 bool device_ready_wanted();
@@ -209,6 +211,19 @@ struct IaViews {
 };
 bool ia_views(IaViews* out);
 }  // namespace blas_census
+
+// mesh_proxy.cpp - the engine's mesh render proxies (rg_host::mesh_proxy_*) + [Diagnostics] MeshProxyCensus
+namespace mesh_proxy {
+bool census_on();
+void enable_census();  // at Load
+rg_handle subscribe(const char* name, const uint64_t* meshes, uint32_t count, rg_mesh_proxy_fn fn, void* user);
+int32_t chunks(rg_handle proxy, rg_mesh_chunk_info* out, uint32_t max);
+int32_t hide(rg_handle sub, rg_handle proxy, uint64_t chunk_bits, uint32_t flags);
+int32_t frame(rg_handle proxy, rg_mesh_proxy_frame* out);
+bool needed();  // a subscription or the census
+void attach();  // at attach: SetupRenderProxy (skinned, mesh) + the proxy ctor / dtor / CollectElements
+void detach();
+}  // namespace mesh_proxy
 
 // passes.cpp - M4
 namespace passes {

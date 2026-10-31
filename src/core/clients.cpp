@@ -23,7 +23,7 @@ constexpr uint32_t kMaxEntries = 1024;
 const char* const kKindName[kKinds] = {
     "patch", "patch scope", "companion", "companion scope", "lease", "cbuffer", "cbuffer feed", "view", "RT library",
     "RT variant", "pass", "subscription", "device_ready", "flow", "node", "node use", "node alloc", "wrap", "remove", "patch state", "wrap use", "draw subscription", "draw companion",
-    "draw companion scope", "census watch", "engine block", "A/B switch"};
+    "draw companion scope", "census watch", "engine block", "A/B switch", "mesh proxy subscription"};
 
 struct Client {
   HMODULE module;
@@ -136,6 +136,7 @@ Space space_of(Kind k) {
     case kRemove: return sRemove;
     case kDrawSubscribe: return sDrawSubscribe;
     case kDrawCompanion: return sDrawCompanion;
+    case kMeshProxy: return sMeshProxy;
     default: return kSpaces;
   }
 }

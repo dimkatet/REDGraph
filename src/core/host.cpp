@@ -419,6 +419,18 @@ __declspec(noinline) rg_handle w_ab_switch(const char* name, rg_ab_set_fn set, r
   return r;
 }
 
+__declspec(noinline) rg_handle w_mesh_proxy_subscribe(const char* name, const uint64_t* meshes, uint32_t count,
+                                                     rg_mesh_proxy_fn fn, void* user) {
+  const rg_handle r = mesh_proxy::subscribe(name, meshes, count, fn, user);
+  clients::note(_ReturnAddress(), clients::kMeshProxy, r, 0, name ? name : "",
+                (std::to_string(count) + " mesh(es)").c_str());
+  return r;
+}
+int32_t h_mesh_proxy_hide(rg_handle sub, rg_handle proxy, uint64_t chunk_bits, uint32_t flags) {
+  const int32_t r = clients::owner_check(_ReturnAddress(), clients::sMeshProxy, sub, "mesh_proxy_hide");
+  return r ? r : mesh_proxy::hide(sub, proxy, chunk_bits, flags);
+}
+
 void h_node_remove_set(rg_handle remove, uint32_t on) {
   if (own(_ReturnAddress(), clients::sRemove, remove, "node_remove_set")) render_nodes::node_remove_set(remove, on);
 }
@@ -492,6 +504,10 @@ const rg_host kHost = {
     &ab::prof_add,
     &render_flow::engine_buffer,
     &render_flow::engine_buffer_va,
+    &w_mesh_proxy_subscribe,
+    &mesh_proxy::chunks,
+    &h_mesh_proxy_hide,
+    &mesh_proxy::frame,
 };
 
 }  // namespace
@@ -522,6 +538,19 @@ void fire_device_ready() {
 bool attach_hook(uintptr_t rva, uintptr_t ret_rva, void* detour, void** orig, const char* what) {
   if (!e231::call_site_ok(g_base, ret_rva, rva)) {
     g_sdk->logger->WarnF(g_handle, "host: %s - the call site is not game 2.31's, NOT attached", what);
+    return false;
+  }
+  if (!g_sdk->hooking->Attach(g_handle, reinterpret_cast<void*>(g_base + rva), detour, orig)) {
+    g_sdk->logger->WarnF(g_handle, "host: %s did not attach", what);
+    return false;
+  }
+  return true;
+}
+
+bool attach_hook_head(uintptr_t rva, const uint8_t* head, size_t n, void* detour, void** orig, const char* what) {
+  if (std::memcmp(reinterpret_cast<const void*>(g_base + rva), head, n) != 0) {
+    g_sdk->logger->WarnF(g_handle, "host: %s - its first bytes are not game 2.5's (or another plugin hooked it), NOT "
+                         "attached", what);
     return false;
   }
   if (!g_sdk->hooking->Attach(g_handle, reinterpret_cast<void*>(g_base + rva), detour, orig)) {
@@ -607,6 +636,7 @@ void attach() {
   // M12 variants, the census's DispatchRays rows and / or GPU timing of raygens in state objects with our libraries
   rtlib::attach_rays(graph_probe::rays_wanted(), gpu_timing::enabled());
   blas_census::attach();  // [Diagnostics] BlasCensus only; after attach_rays (shares its NvAPI BLAS hook)
+  mesh_proxy::attach();  // a mesh proxy subscription or [Diagnostics] MeshProxyCensus
   if (readback::on()) rtlib::attach_nv_census();  // [Dev] Readback's blas: the BLAS builds' inputs
   prof::attach_frames();                         // the profile timer (RG_Profile)
   auto s = [](bool want, bool ok) { return want ? (ok ? "on" : "FAILED") : "none"; };
@@ -622,6 +652,7 @@ void detach() {
   if (g_init_hooked) detach_hook(e231::kGpuInitDevice);
   g_init_hooked = false;
   blas_census::detach();
+  mesh_proxy::detach();
   rtlib::detach_rays();
   prof::detach();
   graph_probe::detach();

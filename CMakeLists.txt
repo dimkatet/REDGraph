@@ -77,6 +77,7 @@ add_library(redgraph SHARED
   src/core/bindings.cpp
   src/core/rt_lib.cpp
   src/core/blas_census.cpp
+  src/core/mesh_proxy.cpp
   src/core/passes.cpp
   src/core/graph_probe.cpp
   src/core/graph_debug.cpp

@@ -169,6 +169,28 @@ constexpr uintptr_t kNvBuildAsExRet = 0x2fa77b0;     // the BLAS batch builder -
 // path of UpdateSkinnedInstances (ret below). The chunk's material = *(proxy[+0x118] + (proxy[+0x122 + 2*lod] + chunk)
 // * 48 + 8), its [+0x58] = the RT material handler's index. UpdateSkinnedInstances reuses a built BLAS while
 // proxy[+0x90] < blas[+0x1c] (a change-driven refit).
+// The mesh proxies (docs/plan-mesh-proxy.md, the proxy census): ent::SkinnedMeshComponent::SetupRenderProxy(this,
+// RenderProxyMeshComponentInitData&) - the garment component's calls it too; ent::MeshComponent::SetupRenderProxy(
+// this, bool, RenderProxyMeshComponentInitData&) - the init data THIRD; CRenderProxy_Mesh::CRenderProxy_Mesh(const
+// RenderProxyInitInfo&) (CreateProxy, and the morph target proxy's ctor).
+constexpr uintptr_t kSkinnedSetupRenderProxy = 0x4b2d80;
+constexpr uintptr_t kSkinnedSetupRenderProxyRet = 0x715187;  // SkinnedMeshComponent::CreateRenderingProxy -> it
+constexpr uintptr_t kMeshSetupRenderProxy = 0x7156d4;
+constexpr uintptr_t kMeshSetupRenderProxyRet = 0x715328;     // MeshComponent::CreateRenderingProxy -> it
+constexpr uintptr_t kMeshProxyCtor = 0x3dad50;
+constexpr uintptr_t kMeshProxyCtorRet = 0x3d97bf;            // CRenderInterface::CreateProxy -> it
+// CRenderProxy_Mesh::~CRenderProxy_Mesh() - also from the morph target proxy's dtor
+constexpr uintptr_t kMeshProxyDtor = 0x49b3e8;
+constexpr uintptr_t kMeshProxyDtorRet = 0x49b3d0;            // its scalar deleting dtor ??_G -> it
+// CRenderProxy_Mesh::CollectElements(this, IRenderProxyBase::SUpdateContext&) - virtual (no direct caller, checked by
+// its first bytes): the proxy's SCENE collection, per view it is visible in; byte (*(ctx + 0x18) + 0xdf2c0) = the
+// collection's index (the engine makes a bit of it). The proxy's +0x18..+0x47 = its LocalToWorld as the collection
+// copies it into the instance buffer (3 float4 columns, .w = the translation in 2^-17 m fixed point).
+constexpr uintptr_t kMeshProxyCollect = 0x330320;
+constexpr uint8_t kMeshProxyCollectHead[12] = {0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x20, 0x55, 0x56, 0x57, 0x41, 0x54};
+constexpr uint32_t kCollectorIndex = 0xdf2c0;
+// The engine's render frame counter (u32) - in the GpuApi device data (kDeviceData + 8).
+constexpr uintptr_t kRenderFrame = 0x3bcdcb0;
 constexpr uintptr_t kEvaluatePositions = 0x22a2100;  // 2.5: no longer in the address list - found by its one caller
 constexpr uintptr_t kEvaluatePositionsRet = 0x2299adc;  // UpdateSkinnedInstances' per-instance helper -> it
 constexpr uintptr_t kAddProxiesEvalRet1 = 0x2e8ee7f;    // CRenderAccelerationStructure::AddProxies -> it (x2)

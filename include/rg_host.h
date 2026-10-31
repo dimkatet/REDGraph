@@ -270,6 +270,43 @@ typedef void (*rg_device_fn)(void* user, void* d3d12_device);
 typedef void (*rg_ab_set_fn)(void* user, uint32_t on);
 typedef uint32_t (*rg_ab_get_fn)(void* user);  /* 1 = on now (restored at the end of a run) */
 
+/* ---- 2026-10-31: the engine's mesh render proxies (docs/plan-mesh-proxy.md) ----
+ * A proxy = one mesh as one component (of one entity) puts it into the scene. Its chunks carry a render mask
+ * (EMeshChunkFlags, the mesh's renderChunkInfos[].renderMask, a copy PER PROXY): a pass collects a chunk only when the
+ * mask has the bit it asks for. */
+#define RG_MCF_RENDER_IN_SCENE 1u   /* every scene pass (G-buffer, hair, forward, ...) */
+#define RG_MCF_RENDER_IN_SHADOWS 2u /* the shadow passes */
+enum rg_mesh_proxy_event { RG_MESH_PROXY_CREATED = 0, RG_MESH_PROXY_DESTROYED = 1 };
+typedef struct rg_mesh_proxy_info {
+  uint32_t struct_size;  /* sizeof(rg_mesh_proxy_info) - fields are only ever appended */
+  rg_handle proxy;       /* valid from CREATED until DESTROYED */
+  uint64_t mesh_hash;    /* FNV-1a 64 of the .mesh path (the component's `mesh`) */
+  const void* component; /* the entity component that set the proxy up (an entSkinnedMeshComponent / entMeshComponent) */
+  const void* entity;    /* that component's owner entity, NULL = none - whose proxy it is */
+  uint32_t chunk_count;  /* entries of the proxy's chunk table (every LOD) - the size mesh_proxy_chunks wants */
+  uint32_t skinned;      /* 1 = set up by a skinned mesh component (or a garment) */
+} rg_mesh_proxy_info;
+/* CREATED: on the thread that made the proxy (a job thread too), the proxy built, before its first frame.
+ * DESTROYED: before the engine frees it - the handle is already dead (calls on it answer RG_E_ARG). */
+typedef void (*rg_mesh_proxy_fn)(void* user, uint32_t event, const rg_mesh_proxy_info* info);
+typedef struct rg_mesh_chunk_info {
+  uint32_t chunk;       /* the mesh chunk index (renderChunkInfos[], every LOD's own) - its bit in chunk_bits */
+  uint32_t lod;
+  uint32_t render_mask; /* EMeshChunkFlags as the ENGINE has it for this proxy (without any client's hide) */
+  uint32_t pad;
+  uint64_t material;    /* the chunk material's name - its template's short name as a CName: "hair",
+                           "mesh_decal_gradientmap_recolor" (FNV-1a 64 of the name) */
+} rg_mesh_chunk_info;
+typedef struct rg_mesh_proxy_frame {
+  uint32_t struct_size;       /* the caller sets sizeof(rg_mesh_proxy_frame) */
+  uint32_t frame;             /* the engine's render frame counter now */
+  uint32_t collected_frame;   /* the render frame of the proxy's last SCENE collection (0 = never) */
+  uint32_t collected_views;   /* in that frame, a bit per collection it was in (the engine's collection index & 31) -
+                                 a proxy whose scene chunks a client hid is still collected */
+  uint32_t local_to_world[12]; /* the proxy's LocalToWorld as the engine copies it into the instance buffer:
+                                  3 float4 columns, .w = the translation as int32, 2^-17 m */
+} rg_mesh_proxy_frame;
+
 typedef struct rg_host_stats {
   uint32_t pso_hooks;          /* 1 = the PSO hooks are attached */
   uint32_t mapped;             /* engine PSOs mapped to clones / companions */
@@ -692,6 +729,27 @@ typedef struct rg_host {
    * starts elsewhere. *bytes (optional) = from the address to the end of its resource (an upper bound). 0 = no such
    * live buffer. Same lifetime rule as engine_buffer; check struct_size. [hot] */
   uint64_t (*engine_buffer_va)(uint32_t gpuapi_id, uint64_t* bytes);
+
+  /* 2026-10-31: MESH PROXIES - the engine's mesh render proxies as components set them up (rg_mesh_proxy_info).
+   * mesh_proxy_subscribe: fn gets CREATED / DESTROYED for every proxy of these meshes (path hashes, copied; count 0 =
+   * every mesh - thousands at a save load). Proxies a component does not set up (heads' morph targets, the distant
+   * crowd, world meshes, foliage) are not reported. A handle (the subscription), RG_E_ARG, RG_E_FULL (16 in all),
+   * RG_E_LATE after registration. Register-time. Check struct_size before calling any of the three. */
+  rg_handle (*mesh_proxy_subscribe)(const char* name, const uint64_t* mesh_hashes, uint32_t count, rg_mesh_proxy_fn fn,
+                                    void* user);
+  /* The proxy's chunk table, every LOD (rg_mesh_chunk_info): fills up to max, returns the count (call with max 0 for
+   * it), RG_E_ARG = not a live proxy. Any thread, any time. */
+  int32_t (*mesh_proxy_chunks)(rg_handle proxy, rg_mesh_chunk_info* out, uint32_t max);
+  /* Takes `flags` (RG_MCF_*) out of the render masks of the chunks in chunk_bits (bit = rg_mesh_chunk_info.chunk) of a
+   * proxy your subscription was told about; 0 bits or 0 flags = back to the engine's own. Per subscription: the
+   * proxy's masks = the engine's minus every subscription's flags on its chunks. Lands at the proxy's next
+   * collection (the next frame); kept until changed or the proxy dies. Any thread. 0 = ok, RG_E_ARG (not a live proxy
+   * of yours), RG_E_FOREIGN. [hot] */
+  int32_t (*mesh_proxy_hide)(rg_handle subscription, rg_handle proxy, uint64_t chunk_bits, uint32_t flags);
+  /* The proxy NOW (rg_mesh_proxy_frame): its transform and whether / in which collections the engine took it into the
+   * scene this frame - per frame, without drawing it. 0 = ok, RG_E_ARG (not a live proxy, struct_size too small).
+   * Any thread. [hot] */
+  int32_t (*mesh_proxy_frame)(rg_handle proxy, rg_mesh_proxy_frame* out);
 } rg_host;
 
 RG_HOST_EXPORT const rg_host* rg_host_get(uint32_t version);
