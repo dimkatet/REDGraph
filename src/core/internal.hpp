@@ -220,6 +220,7 @@ rg_handle subscribe(const char* name, const uint64_t* meshes, uint32_t count, rg
 int32_t chunks(rg_handle proxy, rg_mesh_chunk_info* out, uint32_t max);
 int32_t hide(rg_handle sub, rg_handle proxy, uint64_t chunk_bits, uint32_t flags);
 int32_t frame(rg_handle proxy, rg_mesh_proxy_frame* out);
+int32_t material(rg_handle proxy, uint32_t chunk, uint32_t lod, void** mat, void** params);
 bool needed();  // a subscription or the census
 void attach();  // at attach: SetupRenderProxy (skinned, mesh) + the proxy ctor / dtor / CollectElements
 void detach();
@@ -303,6 +304,16 @@ uint32_t gpu_descriptors(uint32_t count, rg_descriptors* out);  // M10
 uint32_t resolve_here(uint32_t name_hash, void** resource);
 bool transition_here(uint32_t id, uint32_t d3d12_state);
 }  // namespace render_flow
+
+// gpu_assets.cpp - buffer_create / buffer_ready / retire / vram_stats: client buffers copied into DEFAULT heaps and
+// released by the host's frame fence on the direct queue. `caller` = the API call's return address (its module).
+namespace gpu_assets {
+void* buffer_create(uint64_t bytes, uint32_t flags, const void* data, const void* caller);
+int32_t buffer_ready(void* resource);
+void retire(void* resource);
+int32_t vram_stats(rg_vram_stats* out, const void* caller);
+void frame_tick();  // the frame hook (prof.cpp), before the graph: the copies, the fence's signal, the releases
+}  // namespace gpu_assets
 
 // readback.cpp - [Dev] Readback: engine blocks / RenderFlow textures at a node into files, on request (CET, rg_dev.h)
 namespace readback {

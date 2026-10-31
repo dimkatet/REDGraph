@@ -84,6 +84,8 @@ add_library(redgraph SHARED
   src/core/graph_debug.hpp
   src/core/gpu_timing.cpp
   src/core/gpu_timing.hpp
+  src/core/gpu_assets.cpp
+  src/core/gpu_assets.hpp
   src/core/hlsl.cpp
   src/core/shader_reload.cpp
   src/core/readback.cpp

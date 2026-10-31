@@ -307,6 +307,26 @@ typedef struct rg_mesh_proxy_frame {
                                   3 float4 columns, .w = the translation as int32, 2^-17 m */
 } rg_mesh_proxy_frame;
 
+/* buffer_create flags */
+#define RG_BUFFER_UAV 1u  /* D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS */
+/* vram_stats (2026-10-31). The DXGI figures are the PROCESS's (IDXGIAdapter3::QueryVideoMemoryInfo of the engine's
+ * adapter), 0 when DXGI did not answer; the buffer figures are buffer_create's. */
+typedef struct rg_vram_stats {
+  uint32_t struct_size;            /* the caller sets sizeof(rg_vram_stats) */
+  uint32_t buffers;                /* buffer_create buffers alive, all clients */
+  uint64_t local_budget, local_usage;        /* DXGI_MEMORY_SEGMENT_GROUP_LOCAL (VRAM) */
+  uint64_t nonlocal_budget, nonlocal_usage;  /* ... NON_LOCAL (system memory the GPU reads) */
+  uint64_t bytes;                  /* buffer_create buffers alive, all clients */
+  uint64_t own_bytes;              /* ... of the calling client's module */
+  uint32_t own_buffers;
+  uint32_t uploads_pending;        /* copies not submitted yet (the next frames') */
+  uint64_t upload_pending_bytes;
+  uint32_t retire_pending;         /* resources waiting for their fence (retire + the copies' staging) */
+  uint32_t pad;
+  uint64_t frame;                  /* the host's frame (one per graph execution) */
+  uint64_t fence_completed;        /* the host's fence on the direct queue: the last frame the GPU finished */
+} rg_vram_stats;
+
 typedef struct rg_host_stats {
   uint32_t pso_hooks;          /* 1 = the PSO hooks are attached */
   uint32_t mapped;             /* engine PSOs mapped to clones / companions */
@@ -750,6 +770,36 @@ typedef struct rg_host {
    * scene this frame - per frame, without drawing it. 0 = ok, RG_E_ARG (not a live proxy, struct_size too small).
    * Any thread. [hot] */
   int32_t (*mesh_proxy_frame)(rg_handle proxy, rg_mesh_proxy_frame* out);
+
+  /* 2026-10-31: a client's own ASSETS in VRAM, and their lifetime by a GPU fence. The host keeps a fence on the
+   * engine's direct queue, signalled at the start of every graph execution (the frame). Check struct_size before
+   * calling any of these four.
+   * buffer_create: a DEFAULT-heap buffer of `bytes` (flags RG_BUFFER_*), filled with `data` by a copy the host submits
+   * on the direct queue at the start of a frame, before the graph - `data` is copied at the call (into an UPLOAD
+   * staging buffer the host owns), the caller may free it at once; data NULL = no copy (contents undefined, ready at
+   * once). Created in COMMON: no barriers are needed - the copy promotes it, the end of the host's list decays it, a
+   * client's read promotes it again (the buffer rules). Copies are budgeted (64 MB a frame, at least one): a burst
+   * spreads over frames. Any thread. Returns the ID3D12Resource* - the client's reference: give it back with retire,
+   * never Release it; NULL = failed (logged).
+   * buffer_ready: 1 = the data is on the GPU (the copy's fence passed) - bind it from now on, on any queue; 0 = not
+   * yet; RG_E_ARG = not a live buffer_create buffer. Any thread. [hot]
+   * retire: hands a resource (an ID3D12Pageable the client holds one reference to - a buffer_create buffer or one of
+   * its own) to the host, which Releases it once the GPU finished the frame it was retired in and the next one (the
+   * engine records a frame while the GPU runs the last). The reference is the host's from the call on. Any thread;
+   * NULL is ignored.
+   * vram_stats: the budget / usage and the host's buffers (rg_vram_stats; out->struct_size set by the caller). 0 = ok,
+   * RG_E_ARG (struct_size too small). Any thread; DXGI is asked per call - not per draw. */
+  void* (*buffer_create)(uint64_t bytes, uint32_t flags, const void* data);
+  int32_t (*buffer_ready)(void* d3d12_resource);
+  void (*retire)(void* d3d12_resource);
+  int32_t (*vram_stats)(rg_vram_stats* out);
+
+  /* 2026-10-31: a proxy chunk's MATERIAL as the proxy has it NOW - its chunk table entry's CRenderMaterial* (*material)
+   * and CRenderMaterialParameters* (*params), either may be NULL. An appearance's material override swaps them in
+   * place, so this follows what the engine draws, hidden chunks too. `chunk` / `lod` as rg_mesh_chunk_info has them.
+   * Not AddRef'd: read them at once and guarded (the engine releases a swapped-out material between frames). 0 = ok,
+   * RG_E_ARG (not a live proxy, no such chunk), RG_E_UNAVAILABLE. Any thread. Check struct_size. [hot] */
+  int32_t (*mesh_proxy_material)(rg_handle proxy, uint32_t chunk, uint32_t lod, void** material, void** params);
 } rg_host;
 
 RG_HOST_EXPORT const rg_host* rg_host_get(uint32_t version);

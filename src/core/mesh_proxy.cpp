@@ -168,6 +168,7 @@ struct Entry {
   uint16_t chunk, mask;
   uint8_t lod;
   uint64_t material;  // CName
+  uintptr_t mat, params;  // the entry's CRenderMaterial* (+0), CRenderMaterialParameters* (+8)
 };
 struct Table {
   uintptr_t ptr;
@@ -191,6 +192,7 @@ bool read_table(uintptr_t proxy, Table* t) {
         o.mask = *reinterpret_cast<const uint16_t*>(e + 0x28);
         const uintptr_t mat = *reinterpret_cast<const uintptr_t*>(e);
         o.material = mat ? *reinterpret_cast<const uint64_t*>(mat + 0x130) : 0;
+        o.mat = mat, o.params = *reinterpret_cast<const uintptr_t*>(e + 8);
       }
     }
     return true;
@@ -472,6 +474,23 @@ int32_t chunks(rg_handle proxy, rg_mesh_chunk_info* out, uint32_t max) {
     out[k].material = t.e[k].material;
   }
   return static_cast<int32_t>(t.n);
+}
+
+int32_t material(rg_handle proxy, uint32_t chunk, uint32_t lod, void** mat, void** params) {
+  if (mat) *mat = nullptr;
+  if (params) *params = nullptr;
+  std::lock_guard<std::mutex> lk(g_mx);  // the dtor takes it: the proxy stays alive while we read it
+  Slot* x = slot_of(proxy);
+  if (!x) return RG_E_ARG;
+  static thread_local Table t;
+  if (!read_table(x->proxy, &t)) return RG_E_UNAVAILABLE;
+  for (uint32_t k = 0; k < t.n; ++k)
+    if (t.e[k].chunk == chunk && t.e[k].lod == lod) {
+      if (mat) *mat = reinterpret_cast<void*>(t.e[k].mat);
+      if (params) *params = reinterpret_cast<void*>(t.e[k].params);
+      return 0;
+    }
+  return RG_E_ARG;
 }
 
 int32_t hide(rg_handle sub, rg_handle proxy, uint64_t chunk_bits, uint32_t flags) {

@@ -198,6 +198,7 @@ void d_execute_parallel(const void* graph, const void* ctx, void* builder) {
   gpu_timing::frame_tick();
   shader_reload::frame_tick();
   readback::frame_tick();
+  gpu_assets::frame_tick();
   ab::frame_begin();
   g_orig(graph, ctx, builder);
   ab::frame_end();
@@ -285,6 +286,7 @@ void on_graph_execute() {
   gpu_timing::frame_tick();
   shader_reload::frame_tick();  // with the census on, graph_probe's detour is the only frame hook
   readback::frame_tick();
+  gpu_assets::frame_tick();
   ab::frame_begin();
 }
 

@@ -33,6 +33,7 @@
 #include "rg_dev.h"
 #include "core/ab.hpp"
 #include "core/clients.hpp"
+#include "core/gpu_assets.hpp"
 #include "core/gpu_timing.hpp"
 #include "core/graph_debug.hpp"
 #include "core/prof.hpp"
@@ -93,6 +94,7 @@ std::string status() {
                 static_cast<unsigned long long>(hs.creates_unhashed), hs.mapped);
   o += line;
   o += "Clients: " + core::clients::summary() + "\n";
+  o += core::gpu_assets::summary() + "\n";
   const std::string prof = core::prof::report();
   o += prof.empty() ? "host profile: not run (Host tab, Profile)\n" : prof;
   const std::string gpu = core::gpu_timing::report();

@@ -431,6 +431,11 @@ int32_t h_mesh_proxy_hide(rg_handle sub, rg_handle proxy, uint64_t chunk_bits, u
   return r ? r : mesh_proxy::hide(sub, proxy, chunk_bits, flags);
 }
 
+__declspec(noinline) void* w_buffer_create(uint64_t bytes, uint32_t flags, const void* data) {
+  return gpu_assets::buffer_create(bytes, flags, data, _ReturnAddress());
+}
+__declspec(noinline) int32_t w_vram_stats(rg_vram_stats* out) { return gpu_assets::vram_stats(out, _ReturnAddress()); }
+
 void h_node_remove_set(rg_handle remove, uint32_t on) {
   if (own(_ReturnAddress(), clients::sRemove, remove, "node_remove_set")) render_nodes::node_remove_set(remove, on);
 }
@@ -508,6 +513,11 @@ const rg_host kHost = {
     &mesh_proxy::chunks,
     &h_mesh_proxy_hide,
     &mesh_proxy::frame,
+    &w_buffer_create,
+    &gpu_assets::buffer_ready,
+    &gpu_assets::retire,
+    &w_vram_stats,
+    &mesh_proxy::material,
 };
 
 }  // namespace

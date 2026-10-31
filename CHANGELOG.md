@@ -5,6 +5,13 @@
 - For mod developers: `engine_buffer(gpuapi_id)` / `engine_buffer_va(gpuapi_id)` - a game buffer by its GpuApi id (one
   a mod read off a game object of its own knowledge) as its `ID3D12Resource` / its GPU address (a buffer may be a
   piece of a larger resource). Two entries appended (check `struct_size`); API version stays 1.
+- For mod developers: a mod's own data in video memory - `buffer_create` (a GPU-only buffer, filled by a copy REDGraph
+  makes before the next frame), `buffer_ready`, `retire` (a mod's buffer released once the GPU is done with it, by a
+  fence REDGraph signals every frame) and `vram_stats` (the video memory budget and use). Four entries appended (check
+  `struct_size`); API version stays 1.
+- For mod developers: `mesh_proxy_material(proxy, chunk, lod, ...)` - the material and its parameters a mesh proxy's
+  chunk has now (an appearance's material change swaps them in place; hidden chunks included). One entry appended
+  (check `struct_size`); API version stays 1.
 
 ## 0.5.2
 
