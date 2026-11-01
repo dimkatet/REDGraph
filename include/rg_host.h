@@ -668,7 +668,9 @@ typedef struct rg_host {
    * root argument, render target, viewport and vertex / index buffer still the engine's, then sets back the PSO the
    * engine drew with. It reads what the engine's draw has bound, plus its own leases (rg_lease_desc.companions with
    * stage VS / PS, since 0.5.2 - an older host answers RG_E_ARG): staged at every draw of the engine's shader, the
-   * companion drawn only when they sat in that draw's table. A state-only companion cannot hold one. Register-time only. */
+   * companion drawn only when they sat in that draw's table. A state-only companion cannot hold one. Up to 32 draw
+   * companions in all, shared by every client (RG_E_FULL past that); one engine PSO carries at most 8 of them.
+   * Register-time only. */
   rg_handle (*draw_companion_register)(const char* name, uint32_t stage, const uint8_t* hash16, rg_blob shader,
                                        const rg_pso_state* state);
   /* From inside a draw subscription: 1 = the companion is recorded right after the subscriptions return (before any

@@ -129,16 +129,21 @@ std::atomic<uint32_t> g_nview{0};
 // Sizes with headroom, not a measured budget (raised 2026-10-11 for a client patching many material shaders through
 // one lease). The bind path walks only what is REGISTERED (groups, their leases, a lease's learned refs), so a larger
 // array costs memory, not time.
-constexpr uint32_t kMaxLeases = 32;
-constexpr uint32_t kMaxLeaseOwners = 16;
-constexpr uint32_t kMaxRefs = 64;  // ShaderRefs a lease learns - one per engine shader of its owners it is bound with
+// Raised 2026-11-01 with the draw companions (8 -> 32 of them): a companion holds one lease per register it reads, so
+// 32 companions alone can want 32 leases, and one lease shared by them all can have 32 owners.
+constexpr uint32_t kMaxLeases = 64;
+constexpr uint32_t kMaxLeaseOwners = 32;
+// ShaderRefs a lease learns - one per engine shader of its owners it is bound with. Past this a shader is NOT staged
+// (logged once), so it must outgrow the owners a lease may have (32) with room for the engine's own variants.
+constexpr uint32_t kMaxRefs = 128;
 constexpr uint32_t kMaxGroups = 32;
 constexpr uint32_t kMaxPatchHandles = kMaxPatchCount;
 constexpr uint32_t kMaxCompHandles = 8;
-constexpr uint32_t kMaxDrawCompHandles = 8;  // pso_patch.cpp kMaxDrawComps
+constexpr uint32_t kMaxDrawCompHandles = pso::kMaxDrawComps;  // ONE source of truth: pso_patch.cpp's g_dc
 constexpr uint32_t kMaxLeasesPerOwner = 8;
 static_assert(kMaxGroups <= 32, "FrSave::mask is a uint32_t bit per group");
 static_assert(kMaxLeases <= 127, "g_lease_of_patch / g_lease_of_comp hold a lease index in an int8_t");
+static_assert(pso::kMaxDrawComps <= 1024, "a handle is an index in clients.cpp's per-handle owner table (kMaxHandle)");
 
 // The shader owners a lease can have. rg_lease_desc.companions takes compute companions (stage CS) and draw companions
 // (stage VS / PS): the lease's stage tells them apart, so a Lease's comps[] holds one kind or the other.

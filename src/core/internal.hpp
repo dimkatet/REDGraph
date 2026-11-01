@@ -78,6 +78,13 @@ void draw_companion_refuse(rg_handle h, const char* why);
 // For bindings: the engine shader hash an owner targets (owner 0 patch, 1 companion, 2 draw companion).
 bool owner_target(uint32_t owner, rg_handle h, uint8_t hash16[16]);
 // The graphics wing of M4: draw companions, and which PSO drew on this thread.
+// How many draw companions the host holds, for EVERY client together (a handle is an index + 1). bindings.cpp keeps one
+// lease-table row per handle (kMaxDrawCompHandles = this), so the two can never drift apart. 8 until 2026-11-01: one
+// companion per shader hash means a vehicle paint alone takes 8 (hr glass another 8), and two such mods filled the host.
+constexpr uint32_t kMaxDrawComps = 32;
+// The most of them ONE engine PSO carries (a Mapping's dc[]): a companion only matches a PSO that carries its hash, so
+// this bites only where several companions share one hash (or one client wants variants of the same shader).
+constexpr uint32_t kMaxDrawCompsPerPso = 8;
 rg_handle draw_companion_register(const char* name, uint32_t stage, const uint8_t* hash16, rg_blob shader,
                                   const rg_pso_state* state);
 int32_t draw_companion_scope(rg_handle h, const char* node);

@@ -114,8 +114,8 @@ Comp g_c[kMaxComps];
 std::atomic<uint32_t> g_nc{0};
 
 // Draw companions: a graphics PSO per engine PSO whose `stage` shader has the hash - that stage's bytecode replaced
-// (bytes NULL = the engine's) and / or its pipeline state edited.
-constexpr uint32_t kMaxDrawComps = 8;
+// (bytes NULL = the engine's) and / or its pipeline state edited. How many the host holds is kMaxDrawComps
+// (internal.hpp): bindings.cpp sizes its per-handle lease table from the same constant.
 struct DrawComp {
   const char* name;
   uint32_t stage;
@@ -177,7 +177,7 @@ struct Mapping {
   uint32_t stride[kMaxStages] = {};
   uint32_t subs = 0;  // passes' subscription mask: dispatch subscriptions (compute) / draw subscriptions (graphics)
   // Draw companions of this (graphics) engine PSO: dc[i] = the PSO of g_dc[dc_idx[i]], nullptr = its build failed.
-  static constexpr uint32_t kMaxDc = 4;
+  static constexpr uint32_t kMaxDc = kMaxDrawCompsPerPso;
   uint32_t ndc = 0;
   uint32_t dc_idx[kMaxDc] = {};
   ID3D12PipelineState* dc[kMaxDc] = {};

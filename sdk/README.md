@@ -330,7 +330,9 @@ The log has the same information in one line at startup: `registration CLOSED - 
   a whole-library swap (`rtlib_register` without variants) does not.
 * Leases are space0 registers of the engine's tables: the count is limited, and each depends on the stage.
 * Up to 4 variants per patch and 4 scope nodes per patch.
-* Up to 256 patches, 32 leases (8 per patch / companion, 16 owners per lease), and a lease reaches up to 64 different
+* Up to 256 patches, 64 leases (8 per patch / companion, 32 owners per lease), and a lease reaches up to 128 different
   engine shaders (one ShaderRef each - the log says when a lease is full).
+* Up to 32 draw companions in all (shared by every client of the process - past that `draw_companion_register` answers
+  `RG_E_FULL`), and at most 8 of them on one engine PSO.
 * The engine's texture formats in `rg_flow_desc` are its own enum, not DXGI. Only what the header documents is
   decoded.

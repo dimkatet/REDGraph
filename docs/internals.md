@@ -322,6 +322,9 @@ Every other draw costs one thread-local load.
   `SetPipelineState(companion) -> the same draw -> SetPipelineState(what the engine drew with)` (indirect: the
   engine's command signature at device data `+0x13bc678` / `+0x13bc670`, `GetD3DBuffer(ctx+0x6c)`, offset
   `ctx+0x70` - still bound). Leases: as a compute companion's ("Leases (M2)"). `draw_companion_scope` as `companion_scope`.
+  The host holds 32 of them in all, for every client together (`kMaxDrawComps`, internal.hpp - `RG_E_FULL` past that),
+  and `Mapping::kMaxDc` = 8 of them on one engine PSO: one companion per shader hash means a single feature (a vehicle
+  paint, its glass) takes 8, so 8 was reached by two mods and raised 2026-11-01.
 * **pass after a draw** (`pass_after_draw`): as after a dispatch, plus the topology cache (`ctx+0x628`) cleared on a
   restore. NOT restored: render targets, viewports, scissors, VB / IB, stencil ref, blend factor - the next draw of the
   batch re-sets none of them.

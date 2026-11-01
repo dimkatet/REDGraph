@@ -13,6 +13,13 @@
   chunk has now (an appearance's material change swaps them in place; hidden chunks included). One entry appended
   (check `struct_size`); API version stays 1.
 
+- For mod developers: more draw companions - 32 in all (was 8), shared by every client, and 8 on one engine PSO (was
+  4). One companion per shader hash means a vehicle paint alone takes 8 and its glass another 8, so two mods using the
+  feature together ran into the cap (`RG_E_FULL`). Leases, their owners and learned shader refs were raised with it
+  (32 -> 64 leases, 16 -> 32 owners per lease, 64 -> 128 ShaderRefs each) - a companion holds one lease per register it
+  reads, so 32 companions alone can want 32 of them. No ABI change; API version stays 1 (an older REDGraph still answers
+  `RG_E_FULL` at 8, so a mod can check).
+
 ## 0.5.2
 
 - Fixed: the game could crash when a mod asked for a render-graph texture by name at a point of the frame where that
