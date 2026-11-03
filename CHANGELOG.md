@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
 
 - For mod developers: `mesh_proxy_subscribe_flags(name, meshes, count, fn, user, flags)` - a mesh-proxy subscription
   that says what it NEEDS. `RG_MPF_NEEDS_BVH` is what attaches the instance-desc hook, so `RG_MCF_OUT_OF_BVH`,
