@@ -57,4 +57,12 @@ namespace readback_test {  // [Tests] ReadbackTest: [Dev] Readback (a known patt
 void register_with(const rg_host* host, bool on);
 }  // namespace readback_test
 
+namespace bvh_swap_test {  // [Tests] BvhSwapTest: mesh proxies in the TLAS (OUT_OF_BVH, a swap, RG_E_TAKEN, bvh_retire)
+void register_with(const rg_host* host, bool on);
+}  // namespace bvh_swap_test
+
+namespace hit_records_test {  // [Tests] HitRecordsTest: rt_hit_records' ranges, refusals, engine_high
+void register_with(const rg_host* host, bool on);
+}  // namespace hit_records_test
+
 }  // namespace selftest

@@ -23,7 +23,7 @@ constexpr uint32_t kMaxEntries = 1024;
 const char* const kKindName[kKinds] = {
     "patch", "patch scope", "companion", "companion scope", "lease", "cbuffer", "cbuffer feed", "view", "RT library",
     "RT variant", "pass", "subscription", "device_ready", "flow", "node", "node use", "node alloc", "wrap", "remove", "patch state", "wrap use", "draw subscription", "draw companion",
-    "draw companion scope", "census watch", "engine block", "A/B switch", "mesh proxy subscription"};
+    "draw companion scope", "census watch", "engine block", "A/B switch", "mesh proxy subscription", "RT hit group"};
 
 struct Client {
   HMODULE module;
@@ -137,6 +137,7 @@ Space space_of(Kind k) {
     case kDrawSubscribe: return sDrawSubscribe;
     case kDrawCompanion: return sDrawCompanion;
     case kMeshProxy: return sMeshProxy;
+    case kRtHitGroup: return sRtHitGroup;
     default: return kSpaces;
   }
 }
@@ -238,6 +239,16 @@ void live(const Entry& e, std::string* state, std::string* counters) {
                     static_cast<unsigned long long>(s.off), s.missing ? ", MISSING in its state object" : "");
       break;
     }
+    case kRtHitGroup: {
+      rg_rt_hit_group_stats s{};
+      rtlib::hit_group_stats(h, &s);
+      *state = state_name(s.state);
+      std::snprintf(b, sizeof b, "in %u collection(s), %u pipeline(s), %u identifier(s)%s%s%s%s", s.collections,
+                    s.pipelines, s.identifiers, s.lss ? ", LSS on" : "", s.failed ? ", collections FAILED with it" : "",
+                    s.mismatches ? ", identifier MISMATCHES" : "",
+                    s.uncovered ? ", pipelines linking its payload WITHOUT it" : "");
+      break;
+    }
     case kNode: {
       rg_node_stats s{};
       render_nodes::node_stats(h, &s);
@@ -292,7 +303,7 @@ const char* family(Kind k) {
   switch (k) {
     case kWrap: case kRemove: case kNode: return "node";
     case kPatch: case kCompanion: case kSubscribe: case kDrawSubscribe: case kDrawCompanion: return "shader";
-    case kRtLib: case kRtVariant: return "RT";
+    case kRtLib: case kRtVariant: case kRtHitGroup: return "RT";
     default: return kKindName[k];
   }
 }
@@ -351,7 +362,8 @@ int32_t owner_check(const void* ret, Space s, rg_handle h, const char* call) {
   static const Range self = image_of(self_module());
   static const char* const kSpaceName[kSpaces] = {"patch", "companion", "cbuffer", "lease", "view", "RT library",
                                                    "RT variant", "pass", "subscription", "flow", "node", "wrap",
-                                                   "remove", "draw subscription", "draw companion"};
+                                                   "remove", "draw subscription", "draw companion",
+                                                   "mesh proxy subscription", "RT hit group"};
   const uint8_t owner = s < kSpaces && h > 0 && static_cast<uint32_t>(h) <= kMaxHandle
                             ? g_owner[s][h].load(std::memory_order_acquire)
                             : 0;
@@ -374,6 +386,16 @@ int32_t owner_check(const void* ret, Space s, rg_handle h, const char* call) {
     g_sdk->logger->ErrorF(g_handle, "host: %s (called from %s)%s", why, c >= 0 ? g_clients[c].name : "an unknown module",
                           g_foreign_logged.load() == 16 ? " - further ones not logged" : "");
   return r;
+}
+
+uint32_t client_at(const void* ret) {
+  static const Range self = image_of(self_module());
+  uintptr_t a = reinterpret_cast<uintptr_t>(ret);
+  if (a >= self.lo && a < self.hi && t_init) a = reinterpret_cast<uintptr_t>(t_init);  // a tail call out of client code
+  const uint32_t n = g_nranges.load(std::memory_order_acquire);
+  for (uint32_t i = 0; i < n; ++i)
+    if (a >= g_range[i].lo && a < g_range[i].hi) return i + 1;
+  return 0;
 }
 
 void refused(Kind kind, rg_handle h, const char* why) {

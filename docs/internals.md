@@ -1,4 +1,4 @@
-# REDGraph internals
+﻿# REDGraph internals
 
 How the host works inside the engine - for people changing REDGraph itself. Modders writing a CLIENT need only
 [`sdk/README.md`](../sdk/README.md) and [`include/rg_host.h`](../include/rg_host.h).
@@ -111,6 +111,9 @@ native part out (for a bisect).
 | `CRenderNodeGraph::ExecuteParallel` 0xa86438 | frame tick: census windows, graph walk, profile | once per frame | always (one detour per frame) |
 | `GpuApi::UpdateBuffer`, `SetComputeShaderConstsRaw` | engine constant blocks (the catalog) | filtered on return address | when one of its entries is asked for (entries 0-3: always), unless `no_hooks` |
 | `GpuApi::InitDevice` 0x7e0bb4 | registration window | once | always |
+| `NvAPI_D3D12_SetCreatePipelineStateOptions` (2.5 0x91c0, from `GpuApi::InitDevice`) | LSS support in every RT pipeline | once (only with OMM on) | an `RG_HIT_GROUP_LSS` hit group |
+| `CRenderAccelerationStructure::PrepareGpuGeometryAndMaterialProxyData` (2.5 0x2e910cc, by its head) | TLAS instance descs: out of the BVH, BLAS swap, `bvh_retire` pacing | every instance of the scene, every frame (job threads) | any mesh proxy subscription |
+| `GpuApi::BuildTopLevelAccelerationStructure` | DRED markers; `[bvh]` builds | every TLAS build | DRED armed, or `[Diagnostics] BvhProbe` |
 
 Detours go through RED4ext's hooking API (`sdk->hooking->Attach`). Other plugins compare prologues in their own Load,
 so REDGraph attaches late (at `InitDevice`), after every plugin's Load.
@@ -264,6 +267,37 @@ run fully in parallel. (Until 2026-10-10 the swap rewrote the entry for the leng
 lock, which serialized every state-object build in the game behind the driver's DXR compile - tens of seconds on a
 cold driver cache.) `rtlib_stats`: swapped / added / failed state objects per library.
 
+### Hit groups in the engine's collections
+
+`rt_hit_group(name, desc)` (2026-11-01): a client's closest-hit / any-hit as a TRIANGLES hit group in every engine
+COLLECTION (CPOS `+5` set) whose max payload (`+0x19`) is `payload_bytes`. The same subobject-append detour puts it in
+AFTER the engine's last hit group (`+7` = how many to wait for), so the engine's own order stays: our DXIL library
+(only our two exports, renamed `<export>_<tag>`, the tag = the first 4 bytes of the collection's hash - a pipeline links
+several collections and an export name is one function in it) and our hit group `<name>_<tag>`. NO associations: our
+exports take the collection's shader config and root signatures by default, as the engine's own do (an explicit
+association is no default any more - the debug layer refuses the shader config's, and the root signatures' hung the
+RT reflections, 2026-11-01). The room check keeps the creator's own later appends (its linked collections) inside the
+64-entry array.
+
+At every PIPELINE creation the host reads, per collection of ours it links, the identifier of every engine hit group
+and of ours from that pipeline (`ID3D12StateObjectProperties`), so `rt_hit_group_identifier` / `rt_hit_group_pairs`
+translate an engine record into ours; identifiers are per collection, so a second pipeline with a different one for a
+known engine identifier is a `mismatch`. It also checks every collection the pipeline links: one with the group's
+payload WITHOUT the group (not added, rebuilt out) is `uncovered` - rays of that pipeline run nothing of the group.
+Failures: a collection that fails with ours is retried vanilla and the group is refused; a pipeline that fails
+linking a collection of ours has that collection rebuilt vanilla in its own slot (`unlink_ours`, with no lock held
+across the creator and the slot's old `ID3D12StateObject` released once the rebuild took its place) and is retried.
+A collection is known again by its WHOLE 16-byte DXIL hash, not by the 4-byte `tag` its export names carry.
+`RG_HIT_GROUP_LSS` asks for NvAPI's `ENABLE_LSS_SUPPORT` (bit 4) in the device's RT pipeline options - the HOST's
+capability, not a side effect of the engine's own call: the detour adds the bit to the engine's
+`NvAPI_D3D12_SetCreatePipelineStateOptions` when it makes one (it does only with OMM on), and when it does not the host
+makes the call itself, once, at the first state object (`lss_apply_once`) - before the first pipeline that carries the
+group. It is device-global: every RT pipeline created afterwards has LSS, and the log says which call turned it on.
+`[dev]` flag file `d3d12_debug`: the debug layer, and a failed creation logs the runtime's reasons.
+
+The client shades with the ENGINE's registers (the local cb0 / t0 / t1 space200 of a record, the global tables) and
+owns the records it writes into the engine's hit tables - the host does not hand out record ranges (Known gaps).
+
 ### RT per node
 
 M12, `rt_variant(lib, raygen, variant, node)`: "in node X, instead of raygen Y run Z", switchable live.
@@ -280,6 +314,40 @@ libraries baked into it and the raygen's name; for a variant of that raygen that
 priority wins, an off one falls through) it arms a thread-local override, and the hook on `GetShaderGroupIdentifier`
 (0x3141f0 - which `GpuApi::DispatchRays` calls for exactly that raygen record) returns
 `GetShaderIdentifier(variant)`. Root signature, miss / hit tables and every other export stay the engine's.
+
+## Mesh proxies in the TLAS
+
+The engine writes EVERY instance desc of the scene on the CPU every render frame -
+`PrepareGpuGeometryAndMaterialProxyData(this, InstanceData&, u32 contribution, D3D12_RAYTRACING_INSTANCE_DESC& desc,
+...)`, called by the per-instance job loop, `InstanceData + 8` = the `CRenderProxy_Mesh*` - whatever view collected
+the proxy. ONE post-detour edits a proxy's desc after the engine wrote it (two atomic loads for every other instance),
+and it is attached only when a subscription asked for it: `mesh_proxy_subscribe_flags(..., RG_MPF_NEEDS_BVH)` (the
+2026-10-31 `mesh_proxy_subscribe` = flags 0, chunks only). It is the same detour that drains `mesh_proxy_bvh_retire`,
+so with no such subscription nothing of this section exists:
+
+* `RG_MCF_OUT_OF_BVH` (`mesh_proxy_hide`): InstanceMask 0 while any subscription has it on.
+* `mesh_proxy_bvh_swap`: BLAS (`+0x38`), contribution and flags (`+0x34`), optionally the mask (`+0x33`); transform
+  and InstanceID stay the engine's, so the client's BLAS is in the proxy's object space. The four fields are one
+  swap behind a per-slot seqlock - a desc never gets one call's BLAS with another's contribution. One owner per proxy
+  (the subscription that set it; another gets `RG_E_TAKEN`). A line per change of what a ray sees, not per call.
+* `mesh_proxy_bvh_desc`: the desc as the engine wrote it, recorded from the first ask - `mask` and `flags` are the
+  ENGINE's, on purpose (a client that swaps needs them to keep them), and `applied_mask` / `applied_flags` (appended
+  2026-11-03; `applied_flags` took the tail `pad`, so the layout did not move) are what the host writes: mask 0 while
+  the proxy is out of the BVH, a swap's `RG_BVH_MASK` when one set it; flags = the engine's with the swap's
+  `flags_set` / `flags_clear` applied (the engine's while no swap is on - out of the BVH only the mask is zeroed). That
+  is the observable of all three mechanisms without a GPU readback. An OLDER `struct_size` (`RG_BVH_DESC_V1` = 80,
+  before `swapped`) is accepted and only the fields it holds are written - `mesh_proxy_frame` the same
+  (`RG_MESH_PROXY_FRAME_V1` = 16, before `local_to_world`), so appending a field never breaks an older client.
+* `mesh_proxy_bvh_retire`: a swap that ended is still in the TLAS of the frames already recorded, so a client's BLAS
+  (and its records' inputs) cannot go to the plain fence `retire` at once. The queue is drained by the same detour:
+  once render frame `F + 2` writes descs, frame `F + 1` rewrote every desc after the call, and the resource goes to
+  `gpu_assets::retire` (the frame it is retired in and the next). A resource a LIVE swap still points into is held and
+  logged once until that swap ends; `rg_vram_stats.retire_pending` counts what waits (the hold included). No desc
+  written (RT off) = it waits; `detach` flushes it.
+
+`[Diagnostics] BvhProbe` (`bvh_probe.cpp`): per render frame, the desc writes of the swapped / watched proxies, every
+TLAS build (instances, instance buffer, caller) and every DispatchRays (state object, call site); a `[bvh]` line while
+it changes, plus a heartbeat.
 
 ## Work on the engine's command list (M4)
 
@@ -324,7 +392,8 @@ Every other draw costs one thread-local load.
   `ctx+0x70` - still bound). Leases: as a compute companion's ("Leases (M2)"). `draw_companion_scope` as `companion_scope`.
   The host holds 32 of them in all, for every client together (`kMaxDrawComps`, internal.hpp - `RG_E_FULL` past that),
   and `Mapping::kMaxDc` = 8 of them on one engine PSO: one companion per shader hash means a single feature (a vehicle
-  paint, its glass) takes 8, so 8 was reached by two mods and raised 2026-11-01.
+  paint, its glass) takes 8, so 8 was reached by two mods and raised 2026-11-01. A draw records at most 8 of them
+  (`kMaxDrawRequests`, passes.cpp) and the first overflow of either cap is logged - neither said a word before.
 * **pass after a draw** (`pass_after_draw`): as after a dispatch, plus the topology cache (`ctx+0x628`) cleared on a
   restore. NOT restored: render targets, viewports, scissors, VB / IB, stencil ref, blend factor - the next draw of the
   batch re-sets none of them.
@@ -842,6 +911,9 @@ graph-debug skip rules on it were switched off - not investigated.
 | `WrapUseTest = true` | M8 declarations: our transient `rgwrapuse/tmp` written in Lighting (`RgNode_WrapUseWriter` after ClassifyMaterials), declared by a wrap of `CRenderNode_ApplyBloomAndTonemapping` (PostFX) with `node_wrap_use` and copied in its `before`; a wrap of `DrawHUD` without the declaration as an informational control; registration refusals (access 0, no such flow, a 9th declaration) and a group target | `wrap use test: registered ... PASS`, host `wrap 'PostFX' - a GROUP: its 1 node_wrap_use declaration(s) are NOT issued`, then every 1800 frames `wrap use test #N ... DECLARED: ok N (exact M) stale 0 bad 0 ... miss 0 ... -> PASS` (ok = the pattern with a counter within 2 of the writer's: PostFX may record on the CPU before this frame's Lighting). Nothing on screen |
 | `ReloadTest = true` (+ REDGraph's `[Dev] ShaderHotReload`, DXC) | Shader hot reload: a patch of the visible sky's PS 5f079e10 (a magenta PS from `compile_hlsl`), then every 600 sky runs a file dropped into the reload folder: a green `.dxbc` (rebuilt), a compute `.dxbc` (refused: stage), text that is no IR as `.ll` (refused: assembly), a blue PS as `.ll` (assembled, rebuilt); files removed at the end | `reload test step 1..4 ... -> PASS` (clones grow exactly at 1 and 4, `clone_failed` never, swaps every step), `reload test: DONE - 4 pass, 0 fail`; host `DEV reload:` lines. On screen only far off: the sky's bottom layer magenta -> green -> blue. Alone among the 5f079e10 tests. 4/4 PASS on 2.5, 2026-10-24 (default folder and `ShaderReloadDir`) |
 | `ReadbackTest = true` (+ REDGraph's `[Dev] Readback`) | GPU readback (dev): `RgNode_ReadbackWriter` (after ClassifyMaterials) clears `rgreadback/pattern` (40x24 RGBA8) to a known pattern with its run counter; from run 300, through `rg_dev_readback`: the pattern after our node (the `.dds` checked texel by texel), t64 after `RenderVolumetricCloudsLighting` (512x512, DXGI 28, size), t64 before `VolumetricFog` (informational), cb12 (2512 B), four specs that must fail (no key:value, no such block, no node, a node that never runs with `frames:30`); `vsout:69090ccd...` (the sky-scattering VS: vertices = the draw's count x instances by topology, file = vertices x stride, SV_Position finite) and two vsout refusals (a bad hash, a VS never drawn with `frames:30`) | `readback test step 1..11 ... -> PASS` (3: INFO), `readback test: DONE - 10 pass, 0 fail`; host `DEV readback #N` lines; files in the readback folder. Nothing on screen. 10/10 PASS on 2.5, 2026-10-24 |
+| `BvhSwapTest = true` | the instance-desc mechanisms from a CLIENT, no GPU readback: `RG_MCF_OUT_OF_BVH` (`bvh_desc.applied_mask` 0 in the next desc write, the engine's `mask` untouched), a swap carrying the proxy's OWN BLAS + FORCE_OPAQUE (`applied_flags` bit 4 while the engine's `flags` stay, the `swapped` counter growing, BLAS / contribution unchanged - a ray sees the same geometry and records), `RG_E_TAKEN` for a second subscription's swap and its end (and the owner's end freeing it), `mesh_proxy_bvh_retire` waiting for a full frame of descs, and the HOLD of a resource a live swap still points into (made on a proxy that was never collected, so the stand-in BLAS cannot reach a TLAS; SKIP when no such proxy is at hand) | `bvh swap test: <step> - PASS` per step and a final line with all six; subscribes to EVERY mesh with `RG_MPF_NEEDS_BVH` (two subscriptions), ticks on the sky PS 5f079e10, needs a loaded save, ~15 frames. Nothing on screen |
+| `HitRecordsTest = true` | `rt_hit_records` at registration: a range from the top of the tables down (`base + count <= capacity`), a second call right below the first (never twice), a capacity other than the first caller's -> `RG_E_ARG`, count 0 -> `RG_E_ARG`, no room left -> `RG_E_FULL`, `engine_high` | one `hit records test: ... - PASS` line. Nothing on screen. The cross-module half (a contribution inside ANOTHER module's range -> `RG_E_TAKEN`) needs a second module - a plugin is one; see Known gaps 11 |
+
 | `LeaseTexTest = true` | M2 texture sources: a companion of the tonemapping-LUT CS 88c57ef1 (scoped to `CRenderNode_GenerateTonemappingLUT`, after the frame's third dispatch) reads our 4x4x2 R32_UINT texture through a 2D_ARRAY view of slice 1 (t64) and the engine's LUT `2ae9f45c` by name through a 3D UAV view (u16) into our raw buffer (u17); the registration checks (a raw view at a Texture2DArray refused, a cube UAV refused, a buffer into a texture view / a resource into a flow view refused) | `lease tex test: registered`, `views set`, then every 300 frames `lease tex test #N ... client texture 16/16 = slice 1 ... LUT texels 2/2 equal to the copy ... PASS`. Nothing on screen |
 
 The short hashes in this table are game 2.31's names. On 2.5 the tests target 318cee44 -> 535195dc, 0c359133 -> f8a34e57, 5f079e10 -> b932ca8e, 53c455b6 -> 9de16e4e, a58d01db -> 20e19582, 3dd31a42 -> c4a2262b, and the LUT CS is a NEW shader e1c6df2f (`m_LUTGenerateACES2019`; 88c57ef1's successor is never dispatched); 69090ccd / 5c7ab952 unchanged. All PASS on 2.5, 2026-10-23.
@@ -927,3 +999,71 @@ validates an item; it does not set the order.
    inputs of its meshes by GPU VA (`blas:1`). Open: a BLAS self-test (only run on CRT's palms), raw `va:` ranges
    (source 7), the resource bound at a shader's register (source 3, RE), RT inputs, watch mode.
    [`plan-dev-readback.md`](plan-dev-readback.md).
+10. **CLOSED 2026-11-03: records in the engine's hit tables now have an owner** (`rt_hit_records`, `rg_hit_records`).
+    The problem it closed: a hit group (`rt_hit_group`) runs only from a record holding its identifier, and a BLAS swap
+    points its instance at a contribution - but the records are the client's to write (a compute companion over the
+    engine's tables) at an index it picked ITSELF (the hair mod picked `199999 - 2i`), so a second RT client would have
+    overwritten the first with no word. Now the host hands the indices out: from the TOP of the tables downwards, one
+    range per call, per CLIENT (the module the call came from - `clients::client_at`), never twice, kept for the
+    session; `mesh_proxy_bvh_swap` refuses a contribution inside ANOTHER client's range (`RG_E_TAKEN`, logged), and
+    counts + says once a contribution inside no range at all (allowed: a swap may keep the ENGINE's contribution, and
+    an older client keeps its own pick). The tables' size is the CALLER's: it reads it off the engine itself
+    (GetDimensions of the table buffers in its own companion - 200001 records of 64 B on 2.5, `strand-hair.md` 3, step
+    D4), and every call naming another size is refused - the host never guesses a table it cannot see.
+    `rg_hit_records.engine_high` (from the instance-desc writer: the highest contribution the ENGINE's own descs
+    carried) is there to confirm a client's range sits above the scene; 0 = the desc hook is not attached, nothing has
+    looked. The hair mod adopts it (`lss_bvh` `g_rec_top`, the companion's `c_n.z`, clamped to the tables' own top).
+11. **CLOSED 2026-11-03 (later the same day): the rest of that review** (item 1, the record ranges, is gap 10 above;
+    what was BUILT is in the CHANGELOG). Two things changed the API, both append-only:
+    * **`mesh_proxy_subscribe_flags`** (the last entry) - a subscription declares what it NEEDS with `RG_MPF_NEEDS_BVH`.
+      The instance-desc hook is attached only when some subscription asks (`mesh_proxy::needs_bvh`): it is a
+      post-detour on a writer the engine calls once per scene instance per frame (~78k), and a client that only hides
+      chunks gets nothing from it. The 2026-10-31 `mesh_proxy_subscribe` is that call with flags 0 - a client that used
+      it for `RG_MCF_OUT_OF_BVH` / `mesh_proxy_bvh_swap` / `_desc` must pass the flag or those answer
+      `RG_E_UNAVAILABLE`. The hair mod passes it (`hair_mesh::proxies_register`, both subscriptions) and falls back to
+      the old call on an older host.
+    * **`rg_bvh_desc.applied_mask`** (appended): the InstanceMask the host WRITES into the running desc - the `mask`
+      field is the ENGINE's write, deliberately (a client that swaps needs it), so neither `RG_MCF_OUT_OF_BVH` nor a
+      swap's `RG_BVH_MASK` was observable from a client before. It is now: 0 = out of the ray-traced scene.
+    * **`rg_bvh_desc.applied_flags`** (2026-11-03, the same run's finding): `flags` was the engine's too, so a swap's
+      `flags_set` / `flags_clear` - FORCE_OPAQUE is what makes the strands' swapped instances opaque to a PT ray - had
+      no observable either. BvhSwapTest's "the swap's desc" step failed on exactly that (the swap was `swapped 0 -> 1`
+      with BLAS and contribution unchanged, and `flags` stayed `0x2`), i.e. the mechanism worked and the binding did not
+      report it. `applied_flags` is the engine's flags with the live swap applied, computed the way `d_prepare` computes
+      it; it took the tail `pad` of the struct, so nothing moved.
+    Also: `mesh_proxy_bvh_desc` / `_frame` accept an OLDER `struct_size` (`RG_BVH_DESC_V1` = 80, the layout before
+    `swapped`; `RG_MESH_PROXY_FRAME_V1` = 16, before `local_to_world`) and write only the fields the caller's size
+    holds; `rg_vram_stats.retire_pending` counts a resource held for a live swap's `mesh_proxy_bvh_retire`, so a client
+    can see the hold.
+    The other four, closed in place:
+    * **`unlink_ours`** (rt_lib.cpp): the engine's creator now runs OUTSIDE `g_colls_lock` (it is a driver compile; the
+      lock is held only to pick the victims and to record the outcome - before, every other state object of the session
+      waited behind it); the rebuilt collection RELEASES the slot's old `ID3D12StateObject` once the creator replaced it
+      (the slot's `+0` ComPtr owns that reference; the creator stores its own object without releasing the old one, so
+      it leaked ~M of VRAM per rebuild); and the hand-built input is validated first - the creator's shape is
+      `{u32 blob; u32 pad; u32 vector of the LINKED collections at +8}` (engine_231.hpp `kCposCollection`), a
+      collection passes an EMPTY vector, but the blob must really be a collection (its CPOS `+5`) or the rebuild is
+      refused and logged instead of building a pipeline with no linked collections.
+    * **LSS without OMM** (rt_lib.cpp): the option is the host's capability now, not a side effect of the engine's own
+      call. The detour still adds our bit to the engine's `NvAPI_D3D12_SetCreatePipelineStateOptions` when it happens
+      (OMM on); when the engine never calls it (OMM off), the host makes the call ITSELF, once, at the first state
+      object (`lss_apply_once`, before the engine's creator runs) with the LSS bit alone, and the log says which of the
+      two happened. It is device-global by NvAPI's design - every RT pipeline created afterwards has LSS - which the
+      log line states.
+    * **`note_collection`** compares the collection's WHOLE 16-byte DXIL hash, not `tag` (its first 4 bytes, which stay
+      a name suffix): two collections whose tags collided used to be ONE entry, their hit groups merged and one of their
+      slots rebuilt for the other.
+    * **self-tests**: `[Tests] BvhSwapTest` and `[Tests] HitRecordsTest` (the table above). What a self-test CANNOT
+      cover from one module: a contribution inside ANOTHER module's range (`RG_E_TAKEN`) - a range belongs to the module
+      that asked and a plugin is one module; that half is covered by a session with a second real RT client (the hair
+      mod's range and the test's stay apart), and the "no client's range holds" warning is the tell when they do not.
+      **RUN 2026-11-03 19:41 in game 2.5** (`redgraph-2026-11-03-19-41-18.log`, a loaded save, `-SelfTest` deploy):
+      HitRecordsTest PASS in one line; BvhSwapTest PASS on all six steps (`the hold` SKIP - no never-collected proxy was
+      at hand, which the test counts as PASS by design). The FIRST run of BvhSwapTest failed `the swap's desc` with
+      `flags 0x2 -> 0x2 (want bit 4)` and thereby found the API gap that became `applied_flags` above: the swap worked
+      (`swapped 0 -> 1`, BLAS and contribution unchanged) and the binding reported the engine's flags, so a client could
+      not see its own FORCE_OPAQUE. The plugin is removed from the mod again (`REDGraphSelfTest` is a testing-only
+      deploy).
+12. **Still open, from the same review:** `RG_MCF_OUT_OF_BVH` is a per-PROXY switch carried in a per-CHUNK call (it
+    needs non-zero `chunk_bits` and answers `RG_E_UNAVAILABLE` for a partial success) - a function of its own
+    (`mesh_proxy_bvh_out`) would be cleaner, before a release freezes the shape.

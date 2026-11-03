@@ -57,6 +57,19 @@ constexpr uint32_t kCposMagic = 0x534f5043;          // "CPOS"
 constexpr uintptr_t kSubobjectAdd = 0x782eec;
 constexpr uintptr_t kSubobjectAddLibRet = 0x782c9c;  // the creator -> it, for the DXIL library
 constexpr uint32_t kSubobjectMax = 64, kSubobjectCount = 0x400;
+// The CPOS header (2.5, read off the creator): +5 collection (state-object type 0, else a pipeline), +6 export count,
+// +7 hit-group count, +8 u64 bit per export = a hit group (three UTF-16 names: closest-hit, any-hit, the group; else
+// one), +0x10 the names, +0x14 the DXIL, +0x18 max recursion, +0x19 max payload bytes, +0x1a max attribute bytes. The
+// creator's subobjects: [0] pipeline config (0xc with ALLOW_OPACITY_MICROMAPS when OMM is on, else 0xa), [1] shader
+// config, [2] the global and [3] the local root signature (device data +0x1410648 / +0x1410650, unassociated), [4] the
+// DXIL library, then one TRIANGLES hit group per hit-group export, then (a pipeline) the collections it links - their
+// ids in a u32 vector at `in + 8`.
+constexpr uint32_t kCposCollection = 5, kCposExports = 6, kCposHitGroups = 7, kCposHitGroupMask = 8,
+                   kCposNames = 0x10, kCposPayload = 0x19;
+// NvAPI_D3D12_SetCreatePipelineStateOptions (statically linked; interface 0x5c607a27): GpuApi::InitDevice calls it
+// once, {0x10008, flags 1 = ENABLE_OMM_SUPPORT}, only when OMM is on - and a non-zero return turns OMM off.
+constexpr uintptr_t kNvSetCreatePsoOptions = 0x91c0;
+constexpr uintptr_t kNvSetCreatePsoOptionsRet = 0x686ab1;  // GpuApi::InitDevice -> it
 
 // ---- command lists (M4, phase 4) ----
 constexpr uintptr_t kDispatchCompute = 0x3e3924;         // GpuApi::DispatchCompute(x, y, z, ComputeCuUsage)
@@ -189,6 +202,14 @@ constexpr uintptr_t kMeshProxyDtorRet = 0x49b3d0;            // its scalar delet
 constexpr uintptr_t kMeshProxyCollect = 0x330320;
 constexpr uint8_t kMeshProxyCollectHead[12] = {0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x20, 0x55, 0x56, 0x57, 0x41, 0x54};
 constexpr uint32_t kCollectorIndex = 0xdf2c0;
+// CRenderAccelerationStructure::PrepareGpuGeometryAndMaterialProxyData(this, const InstanceData&, u32 hit-group
+// contribution, GeometryObjectInstance& desc, ...) (2.31 0x142920608 by symbol; 2.5 by its tail `shl edi, 18h; or
+// edi, esi; shl ebx, 18h`): the TLAS instance desc of one proxy, written on the CPU every frame by the per-instance
+// job loop (3 call sites in it). desc = D3D12_RAYTRACING_INSTANCE_DESC: +0x30 InstanceID | InstanceMask << 24, +0x34
+// contribution | flags << 24, +0x38 the BLAS. InstanceData + 8 = the CRenderProxy_Mesh*. 8 args (4 on the stack).
+constexpr uintptr_t kPrepareInstanceDesc = 0x2e910cc;
+constexpr uint8_t kPrepareInstanceDescHead[15] = {0x48, 0x89, 0x5c, 0x24, 0x10, 0x4c, 0x89, 0x4c,
+                                                  0x24, 0x20, 0x44, 0x89, 0x44, 0x24, 0x18};
 // The engine's render frame counter (u32) - in the GpuApi device data (kDeviceData + 8).
 constexpr uintptr_t kRenderFrame = 0x3bcdcb0;
 constexpr uintptr_t kEvaluatePositions = 0x22a2100;  // 2.5: no longer in the address list - found by its one caller

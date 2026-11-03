@@ -256,6 +256,40 @@ __declspec(noinline) rg_handle w_rt_variant(rg_handle lib, const char* raygen, c
   return r;
 }
 
+__declspec(noinline) rg_handle w_rt_hit_group(const char* name, const rg_rt_hit_group_desc* desc) {
+  const rg_handle r = rtlib::hit_group_add(name, desc);
+  const std::string t = desc && desc->struct_size >= sizeof(rg_rt_hit_group_desc)
+                            ? std::to_string(desc->payload_bytes) + "-byte payload collections"
+                            : std::string("?");
+  clients::note(_ReturnAddress(), clients::kRtHitGroup, r, 0, name ? name : "", t.c_str());
+  return r;
+}
+int32_t h_rt_hit_group_identifier(rg_handle group, const void* engine_identifier, void* out) {
+  const int32_t r = clients::owner_check(_ReturnAddress(), clients::sRtHitGroup, group, "rt_hit_group_identifier");
+  return r ? r : rtlib::hit_group_identifier(group, engine_identifier, out);
+}
+int32_t h_rt_hit_group_pairs(rg_handle group, rg_rt_hit_group_pair* out, uint32_t max) {
+  const int32_t r = clients::owner_check(_ReturnAddress(), clients::sRtHitGroup, group, "rt_hit_group_pairs");
+  return r ? r : rtlib::hit_group_pairs(group, out, max);
+}
+int32_t h_mesh_proxy_bvh_swap(rg_handle sub, rg_handle proxy, const rg_bvh_swap* swap) {
+  const int32_t r = clients::owner_check(_ReturnAddress(), clients::sMeshProxy, sub, "mesh_proxy_bvh_swap");
+  if (r) return r;
+  // 2026-11-03: the swap's contribution against the CLIENT's record range (rt_hit_records). Per client, not per
+  // subscription: the range is asked for by a module, a swap is made through a subscription of it.
+  if (swap && swap->struct_size >= sizeof(rg_bvh_swap)) {
+    const int32_t q = rtlib::records_check(clients::client_at(_ReturnAddress()), swap->contribution);
+    if (q) return q;
+  }
+  return mesh_proxy::bvh_swap(sub, proxy, swap);
+}
+
+// 2026-11-03: a client's own range of the engine's hit-table records - handed out per CLIENT (the module the call came
+// from), from the top of the tables down: what a second RT client needs to stop colliding with the first.
+int32_t h_rt_hit_records(uint32_t count, uint32_t capacity, rg_hit_records* out) {
+  return rtlib::records_alloc(clients::client_at(_ReturnAddress()), count, capacity, out);
+}
+
 __declspec(noinline) rg_handle w_pass_register(const char* name) {
   const rg_handle r = passes::pass_register(name);
   clients::note(_ReturnAddress(), clients::kPass, r, 0, name, "");
@@ -420,12 +454,18 @@ __declspec(noinline) rg_handle w_ab_switch(const char* name, rg_ab_set_fn set, r
 }
 
 __declspec(noinline) rg_handle w_mesh_proxy_subscribe(const char* name, const uint64_t* meshes, uint32_t count,
-                                                     rg_mesh_proxy_fn fn, void* user) {
-  const rg_handle r = mesh_proxy::subscribe(name, meshes, count, fn, user);
+                                                     rg_mesh_proxy_fn fn, void* user, uint32_t flags) {
+  const rg_handle r = mesh_proxy::subscribe(name, meshes, count, fn, user, flags);
   clients::note(_ReturnAddress(), clients::kMeshProxy, r, 0, name ? name : "",
-                (std::to_string(count) + " mesh(es)").c_str());
+                (std::to_string(count) + " mesh(es)" + (flags & RG_MPF_NEEDS_BVH ? ", BVH" : "")).c_str());
   return r;
 }
+// The 2026-10-31 entry (no flags): a subscription that only hides chunks - no flags is exactly RG_MPF_* 0.
+__declspec(noinline) rg_handle w_mesh_proxy_subscribe_v1(const char* name, const uint64_t* meshes, uint32_t count,
+                                                         rg_mesh_proxy_fn fn, void* user) {
+  return w_mesh_proxy_subscribe(name, meshes, count, fn, user, 0);
+}
+
 int32_t h_mesh_proxy_hide(rg_handle sub, rg_handle proxy, uint64_t chunk_bits, uint32_t flags) {
   const int32_t r = clients::owner_check(_ReturnAddress(), clients::sMeshProxy, sub, "mesh_proxy_hide");
   return r ? r : mesh_proxy::hide(sub, proxy, chunk_bits, flags);
@@ -434,7 +474,15 @@ int32_t h_mesh_proxy_hide(rg_handle sub, rg_handle proxy, uint64_t chunk_bits, u
 __declspec(noinline) void* w_buffer_create(uint64_t bytes, uint32_t flags, const void* data) {
   return gpu_assets::buffer_create(bytes, flags, data, _ReturnAddress());
 }
-__declspec(noinline) int32_t w_vram_stats(rg_vram_stats* out) { return gpu_assets::vram_stats(out, _ReturnAddress()); }
+__declspec(noinline) int32_t w_vram_stats(rg_vram_stats* out) {
+  const int32_t r = gpu_assets::vram_stats(out, _ReturnAddress());
+  // 2026-11-03: a resource waiting for mesh_proxy_bvh_retire's grace is waiting for a fence just the same (and one held
+  // for a live swap waits indefinitely) - a client that retires a BLAS sees it here.
+  // Only on success: gpu_assets refuses a struct smaller than its own, and writing into that would be the overflow this
+  // very review is about.
+  if (r == 0 && out) out->retire_pending += mesh_proxy::bvh_retire_pending();
+  return r;
+}
 
 void h_node_remove_set(rg_handle remove, uint32_t on) {
   if (own(_ReturnAddress(), clients::sRemove, remove, "node_remove_set")) render_nodes::node_remove_set(remove, on);
@@ -509,7 +557,7 @@ const rg_host kHost = {
     &ab::prof_add,
     &render_flow::engine_buffer,
     &render_flow::engine_buffer_va,
-    &w_mesh_proxy_subscribe,
+    &w_mesh_proxy_subscribe_v1,
     &mesh_proxy::chunks,
     &h_mesh_proxy_hide,
     &mesh_proxy::frame,
@@ -518,6 +566,15 @@ const rg_host kHost = {
     &gpu_assets::retire,
     &w_vram_stats,
     &mesh_proxy::material,
+    &w_rt_hit_group,
+    &h_rt_hit_group_identifier,
+    &rtlib::hit_group_stats,
+    &h_rt_hit_group_pairs,
+    &h_mesh_proxy_bvh_swap,
+    &mesh_proxy::bvh_desc,
+    &mesh_proxy::bvh_retire,
+    &h_rt_hit_records,
+    &w_mesh_proxy_subscribe,
 };
 
 }  // namespace
@@ -580,6 +637,9 @@ void open(RED4ext::v1::PluginHandle handle, const RED4ext::v1::Sdk* sdk) {
 }
 
 void arm() {
+  // [dev] a flag file d3d12_debug next to REDGraph.dll: the D3D12 debug layer (the game's Agility SDK ships it) - slow,
+  // for reading why an RT state object with a client's library / hit group was refused; never in a release
+  if (flag_file(L"d3d12_debug")) rtlib::debug_layer();
   g_init_hooked = attach_hook(e231::kGpuInitDevice, e231::kGpuInitDeviceRet, reinterpret_cast<void*>(&d_init_device),
                               reinterpret_cast<void**>(&g_orig_init), "GpuApi::InitDevice (the registration window)");
   if (g_init_hooked) {

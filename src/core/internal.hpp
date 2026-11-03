@@ -200,6 +200,19 @@ void variant_stats(rg_handle v, rg_rt_variant_stats* out);
 void attach_rays(bool census, bool timing);  // timing: GpuTiming on at the start (raygens of client libraries)
 void detach_rays();
 bool attach_nv_census();  // the NvAPI BLAS build hook for the BLAS census (attached once, shared with the markers)
+// 2026-11-01: a client's hit group in the engine's collections (+ the LSS pipeline option)
+rg_handle hit_group_add(const char* name, const rg_rt_hit_group_desc* desc);
+int32_t hit_group_identifier(rg_handle h, const void* engine_identifier, void* out);
+void hit_group_stats(rg_handle h, rg_rt_hit_group_stats* out);
+int32_t hit_group_pairs(rg_handle h, rg_rt_hit_group_pair* out, uint32_t max);
+// 2026-11-03: a client's own range of the engine's HIT-TABLE records (rg_hit_records): handed out from the top of the
+// tables down, never twice, `capacity` as the caller read it off the engine; and checked at every mesh_proxy_bvh_swap
+// (a contribution inside ANOTHER client's range is refused). docs/internals.md "Known gaps" 10.
+int32_t records_alloc(uint32_t client, uint32_t count, uint32_t capacity, rg_hit_records* out);
+int32_t records_check(uint32_t client, uint32_t contribution);
+// [dev] flag file d3d12_debug: the D3D12 debug layer on (at Load, before the device) - a creation that fails with our
+// libraries / hit groups logs the runtime's reasons
+void debug_layer();
 }  // namespace rtlib
 
 // blas_census.cpp - [Diagnostics] BlasCensus: raster draws of watched VS joined to the BLAS geometries
@@ -223,11 +236,21 @@ bool ia_views(IaViews* out);
 namespace mesh_proxy {
 bool census_on();
 void enable_census();  // at Load
-rg_handle subscribe(const char* name, const uint64_t* meshes, uint32_t count, rg_mesh_proxy_fn fn, void* user);
+rg_handle subscribe(const char* name, const uint64_t* meshes, uint32_t count, rg_mesh_proxy_fn fn, void* user,
+                    uint32_t flags);
 int32_t chunks(rg_handle proxy, rg_mesh_chunk_info* out, uint32_t max);
 int32_t hide(rg_handle sub, rg_handle proxy, uint64_t chunk_bits, uint32_t flags);
 int32_t frame(rg_handle proxy, rg_mesh_proxy_frame* out);
 int32_t material(rg_handle proxy, uint32_t chunk, uint32_t lod, void** mat, void** params);
+int32_t bvh_swap(rg_handle sub, rg_handle proxy, const rg_bvh_swap* swap);
+int32_t bvh_desc(rg_handle proxy, rg_bvh_desc* out);
+void bvh_retire(void* resource);  // gpu_assets::retire, once a full frame of descs no longer carries it
+// The highest InstanceContributionToHitGroupIndex the ENGINE's own descs carried (and its frame), for rt_hit_records:
+// 0 = the desc hook is not attached, so nothing has looked. `frame` may be NULL.
+void desc_high(uint32_t* high, uint32_t* frame);
+// Resources waiting for mesh_proxy_bvh_retire's grace (a full frame of descs) - rg_vram_stats.retire_pending adds them.
+uint32_t bvh_retire_pending();
+bool needs_bvh();  // a subscription with RG_MPF_NEEDS_BVH: the instance-desc hook is attached
 bool needed();  // a subscription or the census
 void attach();  // at attach: SetupRenderProxy (skinned, mesh) + the proxy ctor / dtor / CollectElements
 void detach();

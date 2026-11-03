@@ -104,6 +104,9 @@ The header documents each call in detail. This table is the map: which call you 
 | raw D3D12 work after a draw | `pass_register` + `pass_after_draw` | leave render targets, viewports, vertex / index buffers as you found them: the next draw of the batch does not re-set them |
 | a whole RT library replaced | `rtlib_register` (M3), `rtlib_stats` | baked into the engine's state object at creation, not switchable |
 | an RT raygen variant, switchable live, per node | `rtlib_register` + `rt_variant` + `rt_variant_set` (M12) | the engine's library stays byte-identical. See section 6 |
+| your own closest-hit / any-hit for your own ray-traced geometry | `rt_hit_group` (+ `RG_HIT_GROUP_LSS`), `rt_hit_group_identifier` / `rt_hit_group_pairs`, `rt_hit_group_stats` | in every engine collection of your payload size; shade with the engine's registers. The records are yours to write - the host does not reserve them yet |
+| a mesh proxy out of the ray-traced scene | `mesh_proxy_hide` with `RG_MCF_OUT_OF_BVH` | per proxy, every frame |
+| your BLAS in a mesh proxy's TLAS instance | `mesh_proxy_bvh_swap`, `mesh_proxy_bvh_desc`, `mesh_proxy_bvh_retire` | the engine's transform stays (your BLAS in the proxy's object space); free a BLAS that was swapped in ONLY by `mesh_proxy_bvh_retire` - the TLAS of frames in flight still holds it |
 | an engine texture by name | `flow_register` + `flow_texture` (M5), `flow_transition` | valid only inside a node's recording |
 | your own node in the render graph | `node_register` (M6), `node_use` / `node_alloc` (M7) | the engine schedules it; transients are aliased by the engine; a transient's name is `"<yourmod>/<name>"` |
 | another mod's transient | `flow_register("<theirmod>/<name>", 0)` + `node_use` | the only way clients share a resource - see section 8 |
@@ -333,6 +336,8 @@ The log has the same information in one line at startup: `registration CLOSED - 
 * Up to 256 patches, 64 leases (8 per patch / companion, 32 owners per lease), and a lease reaches up to 128 different
   engine shaders (one ShaderRef each - the log says when a lease is full).
 * Up to 32 draw companions in all (shared by every client of the process - past that `draw_companion_register` answers
-  `RG_E_FULL`), and at most 8 of them on one engine PSO.
+  `RG_E_FULL`), at most 8 of them on one engine PSO and at most 8 requested on one draw; the log names the first overflow.
+* Up to 8 RT hit groups in all, 512 (engine, ours) identifier pairs (the log says when the map is full). One BLAS
+  swap per mesh proxy, owned by the subscription that set it.
 * The engine's texture formats in `rg_flow_desc` are its own enum, not DXGI. Only what the header documents is
   decoded.

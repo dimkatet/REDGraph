@@ -2,6 +2,75 @@
 
 ## Unreleased
 
+- For mod developers: `mesh_proxy_subscribe_flags(name, meshes, count, fn, user, flags)` - a mesh-proxy subscription
+  that says what it NEEDS. `RG_MPF_NEEDS_BVH` is what attaches the instance-desc hook, so `RG_MCF_OUT_OF_BVH`,
+  `mesh_proxy_bvh_swap`, `mesh_proxy_bvh_desc` and `rg_hit_records.engine_high` exist only for a subscription that asks
+  (~78k calls a frame otherwise, for nothing). `mesh_proxy_subscribe` is this call with flags 0 - a mod that used it for
+  the BVH must pass the flag. One entry appended (the last); API version stays 1.
+
+- For mod developers: `rg_bvh_desc.applied_mask` - the InstanceMask the host actually writes into the running desc
+  (0 = the proxy is out of the ray-traced scene, a swap's `RG_BVH_MASK` when one set it), where `mask` stays the
+  game's own write. That makes `RG_MCF_OUT_OF_BVH` and a swap's mask observable without a GPU readback. Field appended;
+  API version stays 1.
+
+- `mesh_proxy_bvh_desc` and `mesh_proxy_frame` accept an OLDER `struct_size` (`RG_BVH_DESC_V1` = 80,
+  `RG_MESH_PROXY_FRAME_V1` = 16) and write only the fields the caller's size holds, so appending a field no longer
+  breaks a mod built before it; `rg_vram_stats.retire_pending` now counts the resources a `mesh_proxy_bvh_retire` holds
+  for a live swap.
+
+- `RG_HIT_GROUP_LSS` is the host's own capability now: with OMM off the game never calls
+  `NvAPI_D3D12_SetCreatePipelineStateOptions`, so the host makes that call itself, once, before the first state object.
+  Before, a mod asking for LSS got nothing at all on such a setup (the collection log said `LSS OFF`).
+
+- Fixed: a collection rebuilt after a pipeline failed to link it (`unlink_ours`) leaked the old `ID3D12StateObject`
+  (now released once the rebuild took its place), held the exclusive collection lock across the driver's compile (now
+  no lock is held across it), and could be handed a blob that is no longer a collection (checked first).
+
+- Fixed: a hit group's collection is known again by its whole 16-byte DXIL hash, not the 4-byte tag its export names
+  carry - two collections whose tags collided merged into one entry (their groups together, one slot rebuilt for the
+  other).
+
+- For mod developers: `rg_bvh_desc.applied_flags` - the D3D12_RAYTRACING_INSTANCE_FLAGS the host actually writes into
+  the running desc (the engine's `flags` with a live swap's `flags_set` / `flags_clear` applied; the engine's while no
+  swap is on, since out of the BVH only the mask is zeroed). `flags` stays the game's own write, as `mask` does. The
+  field took the struct's tail `pad`, so the layout is unchanged and API version stays 1.
+
+- Two self-tests: `BvhSwapTest` (the instance-desc mechanisms from a client: OUT_OF_BVH, a swap and its desc,
+  `RG_E_TAKEN`, `mesh_proxy_bvh_retire` waiting and holding) and `HitRecordsTest` (`rt_hit_records`'s ranges and
+  refusals) - `docs/internals.md` "Self-tests".
+
+- For mod developers: `rt_hit_records(count, capacity, out)` - a mod's own RECORDS in the game's hit tables (the
+  64-byte entries its hit shaders read, where a swapped instance's contribution points) at indices no other mod can
+  take: the host hands ranges out from the top of the tables downwards, one per calling module, and
+  `mesh_proxy_bvh_swap` refuses a contribution inside ANOTHER mod's range (`RG_E_TAKEN`) - two mods that shade their own
+  ray-traced geometry can no longer overwrite each other's records. `capacity` is the mod's own reading of the tables
+  (GetDimensions of the bound table buffers, 200001 on 2.5); `rg_hit_records.engine_high` reports the highest
+  contribution the game's own instance descs carried. One entry appended (check `struct_size`); API version stays 1.
+
+- For mod developers: `rt_hit_group` - a mod's own closest-hit / any-hit shaders as a hit group in the game's
+  ray-tracing hit-group collections (every collection with the mod's payload size), so its own ray-traced geometry can
+  be shaded; `rt_hit_group_identifier` gives the group's shader identifier for a record the game filled with one of its
+  own, `rt_hit_group_pairs` every such pair at once (for a mod that recognises the game's records on the GPU),
+  `rt_hit_group_stats` where it went - including `uncovered`, the pipelines that link a collection of the group's
+  payload without it (logged too). With `RG_HIT_GROUP_LSS` the game's ray-tracing pipelines are created with NVIDIA's
+  linear swept spheres support (when the driver accepts it). A collection or pipeline that fails with a mod's group is
+  rebuilt without it. Four entries appended (check `struct_size`); API version stays 1.
+
+- For mod developers: a mesh proxy's ray-tracing instance with a mod's own geometry - `mesh_proxy_bvh_swap` puts a
+  mod's BLAS (with its hit-group records, instance flags and mask) into the proxy's TLAS instance every frame, the
+  game's transform kept; `mesh_proxy_bvh_desc` reads the instance as the game wrote it; `mesh_proxy_bvh_retire`
+  releases a BLAS (or what its records read) only once no TLAS can still reference it - a swap that ended is still in
+  the TLAS of the frames already recorded, so freeing it at once faults the GPU. One mod owns a proxy's swap (another
+  gets `RG_E_TAKEN`). Three entries appended (check `struct_size`); API version stays 1.
+
+- For mod developers: `RG_MCF_OUT_OF_BVH` for `mesh_proxy_hide` - a mesh proxy out of the ray-traced scene (its TLAS
+  instance mask 0 from the next frame: no RT / PT shadow, reflection or GI ray hits it), per proxy, switchable every
+  frame. No new entry; API version stays 1 (an older REDGraph ignores the flag).
+
+- `[Diagnostics] BvhProbe` (off by default): one `[bvh]` line a frame while it changes - the instance-desc writes of
+  the proxies a mod swapped or watches, every TLAS build (instances, buffer, caller) and every DispatchRays (state
+  object, call site).
+
 - For mod developers: `engine_buffer(gpuapi_id)` / `engine_buffer_va(gpuapi_id)` - a game buffer by its GpuApi id (one
   a mod read off a game object of its own knowledge) as its `ID3D12Resource` / its GPU address (a buffer may be a
   piece of a larger resource). Two entries appended (check `struct_size`); API version stays 1.
@@ -19,6 +88,11 @@
   (32 -> 64 leases, 16 -> 32 owners per lease, 64 -> 128 ShaderRefs each) - a companion holds one lease per register it
   reads, so 32 companions alone can want 32 of them. No ABI change; API version stays 1 (an older REDGraph still answers
   `RG_E_FULL` at 8, so a mod can check).
+
+- Log: a draw companion that does not fit now says why. A registration past the host's 32 (`RG_E_FULL`) names the table
+  shared by every client, a companion that does not fit on one engine PSO (8) is reported, and one that does not fit on
+  one draw (8 requested) is reported too. All three were silent - the only sign was a return code a mod could ignore.
+  `kMaxDrawRequests` was 4 and is 8 with the per-PSO cap, so the 8 companions one PSO carries can all be drawn.
 
 ## 0.5.2
 

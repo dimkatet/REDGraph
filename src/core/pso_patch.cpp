@@ -128,6 +128,7 @@ struct DrawComp {
 };
 DrawComp g_dc[kMaxDrawComps];
 std::atomic<uint32_t> g_ndc{0};
+std::atomic<bool> g_dc_cap_logged{false};  // the per-PSO cap warning below was written
 
 // engine PSO -> clones, open addressing: a writer (Create, rare, under g_insert_lock) stores the value, then publishes
 // the key with release; the bind detours read lock-free. A tree VS pairs with many PS / states.
@@ -487,10 +488,18 @@ Match identify(Pipe pipe, const void* desc_v) {
   if (passes::has_draw_subs() || ndc) {
     const auto vs = hash_of(g->VS), ps = hash_of(g->PS);
     m.subs = passes::draw_subs_for(vs ? vs->data() : nullptr, ps ? ps->data() : nullptr);
-    for (uint32_t i = 0; i < ndc && m.ndc < Mapping::kMaxDc; ++i) {
+    for (uint32_t i = 0; i < ndc; ++i) {
       const bool on_vs = g_dc[i].stage == RG_STAGE_VS;
       const auto& h = on_vs ? vs : ps;
       if (!h || *h != g_dc[i].hash || g_dc[i].state.load() == RG_STATE_REFUSED) continue;
+      // Past the per-PSO cap this PSO keeps the first kMaxDc companions and this one is never built for it - once silent.
+      if (m.ndc >= Mapping::kMaxDc) {
+        if (!g_dc_cap_logged.exchange(true))
+          g_sdk->logger->WarnF(g_handle, "pso swap: draw companion '%s' matches an engine PSO that already carries %u - "
+                                "the most ONE engine PSO can (kMaxDrawCompsPerPso); it is never built for that PSO "
+                                "(one companion per shader hash avoids this)", g_dc[i].name, Mapping::kMaxDc);
+        break;
+      }
       // The lease test on that stage's vanilla bytecode, as for a compute companion: a refusal builds no companion.
       const D3D12_SHADER_BYTECODE& code = on_vs ? g->VS : g->PS;
       if (!bindings::on_draw_companion_matched(static_cast<rg_handle>(i + 1), code.pShaderBytecode,
@@ -1148,7 +1157,14 @@ rg_handle draw_companion_register(const char* name, uint32_t stage, const uint8_
     return RG_E_ARG;
   }
   const uint32_t n = g_ndc.load();
-  if (n >= kMaxDrawComps) return RG_E_FULL;
+  if (n >= kMaxDrawComps) {  // silent until 2026-11-01: a code the mod could ignore was the only sign
+    char why[160];
+    std::snprintf(why, sizeof why, "the host holds all %u draw companions already - one table for every client of the "
+                                   "process, so another mod (or an earlier registration) took the last one", kMaxDrawComps);
+    g_sdk->logger->ErrorF(g_handle, "host: draw companion '%s' REFUSED - %s", name ? name : "?", why);
+    clients::reason(why);
+    return RG_E_FULL;
+  }
   DrawComp& c = g_dc[n];
   c.name = name ? name : "?";
   c.stage = stage;

@@ -40,6 +40,7 @@
 #include <string>
 #include <vector>
 
+#include "core/bvh_probe.hpp"
 #include "core/engine_231.hpp"
 #include "core/clients.hpp"
 #include "core/crash_log.hpp"
@@ -103,7 +104,36 @@ struct AddLib {
   D3D12_EXPORT_DESC exports[kMaxExports];
   D3D12_DXIL_LIBRARY_DESC desc;  // must live until CreateStateObject returns - the creator runs on this thread
 };
-// One creation's edits of the subobject list: `swap` replaces the engine's library, `libs` go in after it.
+// HIT GROUPS (2026-11-01): a client's closest-hit / any-hit in every engine COLLECTION with its payload size. The
+// creator builds a collection from one CPOS blob (the engine's library + one TRIANGLES hit group per hit-group export);
+// ours go in after the engine's last hit group: our library (only our exports, renamed with the collection's tag - a
+// pipeline links several collections, and an export name is one function in it) and our hit group. NO associations:
+// our exports take the creator's shader config and root signatures by default, as the engine's own do - a subobject
+// associated explicitly is no default any more (2026-11-01: the shader config associated with ours -> the debug
+// layer's "Export chs_main is missing a required subobject association of type RAYTRACING_SHADER_CONFIG"; the root
+// signatures associated with ours -> creation fine, but the RT reflections hung the GPU at once, three runs).
+constexpr uint32_t kMaxHg = 8;
+struct HitGroup {
+  char name[48];
+  uint32_t payload, flags;
+  wchar_t chs[64], ahs[64];  // the library's export names, L"" = none
+  rg_blob lib;
+  std::atomic<uint32_t> collections{0}, failed{0}, pipelines{0}, mismatches{0}, uncovered{0};
+};
+HitGroup g_hg[kMaxHg];
+std::atomic<uint32_t> g_nhg{0};
+std::atomic<uint32_t> g_hg_refused{0};  // bit = g_hg index: a pipeline failed linking it - not added any more
+std::atomic<uint32_t> g_lss{0}, g_pso_calls{0};  // the LSS pipeline option took; the engine set its options
+struct HgAdd {
+  uint32_t hg;
+  wchar_t group[64], chs[64], ahs[64];  // the export names in this collection
+  D3D12_EXPORT_DESC exports[2];
+  D3D12_DXIL_LIBRARY_DESC lib;
+  D3D12_HIT_GROUP_DESC desc;
+};
+
+// One creation's edits of the subobject list: `swap` replaces the engine's library, `libs` go in after it, then the
+// hit groups `hgs` (a collection only).
 struct AddCtx {
   bool armed = false;
   uint32_t n = 0;
@@ -113,13 +143,26 @@ struct AddCtx {
   bool swapped = false;
   D3D12_DXIL_LIBRARY_DESC swap_desc{};  // must live until CreateStateObject returns - the creator runs on this thread
   AddLib libs[kMaxAdd];
+  uint32_t nhg = 0;
+  uint32_t hg_added = 0;  // bit i = hgs[i] went in
+  uint32_t hg_wait = 0;   // the engine's own hit groups still to come - ours go in after its last
+  uint32_t reserve = 0;   // subobjects the creator appends after them (linked collections)
+  HgAdd hgs[kMaxHg];
 };
 thread_local AddCtx t_add;
 uint32_t variant_exports(uint32_t lib, D3D12_EXPORT_DESC* out, uint32_t max);  // below, with the variants
 std::atomic<uint64_t> g_said_dup{0}, g_said_noswap{0};
 
+void append_hit_groups(uint8_t* arr);
+
 void d_sub(uint8_t* arr, const D3D12_STATE_SUBOBJECT* sub) {
   AddCtx& c = t_add;
+  // Our hit groups go in after the ENGINE's last: its own subobject order stays as it was.
+  if (c.armed && c.seen && c.hg_wait && sub && sub->Type == D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP) {
+    g_orig_sub(arr, sub);
+    if (--c.hg_wait == 0) append_hit_groups(arr);
+    return;
+  }
   const bool engine_lib = c.armed && !c.seen && sub && sub->Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY;
   if (!engine_lib) {
     g_orig_sub(arr, sub);
@@ -141,6 +184,399 @@ void d_sub(uint8_t* arr, const D3D12_STATE_SUBOBJECT* sub) {
     g_orig_sub(arr, &ours);  // copies the 16 bytes
     c.added |= 1u << i;
   }
+  if (c.nhg && !c.hg_wait) append_hit_groups(arr);  // a collection without hit groups of its own
+}
+
+void append_hit_groups(uint8_t* arr) {
+  AddCtx& c = t_add;
+  for (uint32_t i = 0; i < c.nhg; ++i) {
+    uint32_t count = 0;
+    std::memcpy(&count, arr + kSubobjectCount, 4);
+    if (count + 2 + c.reserve > kSubobjectMax) break;  // the creator's own appends after ours must still fit
+    HgAdd& a = c.hgs[i];
+    const D3D12_STATE_SUBOBJECT lib = {D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &a.lib};
+    const D3D12_STATE_SUBOBJECT group = {D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &a.desc};
+    g_orig_sub(arr, &lib);
+    g_orig_sub(arr, &group);
+    c.hg_added |= 1u << i;
+  }
+}
+
+// [dev] d3d12_debug: the runtime's errors of a failed creation (the debug layer's info queue) into the log.
+std::atomic<bool> g_debug_layer{false};
+ID3D12InfoQueue* info_queue() {
+  if (!g_debug_layer.load(std::memory_order_relaxed)) return nullptr;
+  const auto* data = *reinterpret_cast<const uint8_t* const*>(g_base + kDeviceData);
+  auto* dev = data ? *reinterpret_cast<IUnknown* const*>(data + kDeviceInData) : nullptr;
+  ID3D12InfoQueue* q = nullptr;
+  return dev && SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&q))) ? q : nullptr;
+}
+void d3d12_messages(uint32_t n) {
+  ID3D12InfoQueue* q = info_queue();
+  if (!q) return;
+  const UINT64 k = q->GetNumStoredMessages();
+  uint32_t said = 0;
+  for (UINT64 i = 0; i < k && said < 16; ++i) {
+    SIZE_T len = 0;
+    if (FAILED(q->GetMessage(i, nullptr, &len)) || !len) continue;
+    std::vector<uint8_t> b(len);
+    auto* m = reinterpret_cast<D3D12_MESSAGE*>(b.data());
+    if (FAILED(q->GetMessage(i, m, &len)) || m->Severity > D3D12_MESSAGE_SEVERITY_ERROR) continue;
+    g_sdk->logger->ErrorF(g_handle, "d3d12 (state object #%u): %.1800s", n, m->pDescription);
+    ++said;
+  }
+  q->ClearStoredMessages();
+  q->Release();
+}
+
+// Arm the hit groups of `mask` for one collection creation, named with the collection's tag.
+void arm_hit_groups(uint32_t mask, uint32_t tag) {
+  AddCtx& c = t_add;
+  c.nhg = 0;
+  const uint32_t n = g_nhg.load(std::memory_order_acquire);
+  for (uint32_t i = 0; i < n && c.nhg < kMaxHg; ++i) {
+    if (!(mask >> i & 1)) continue;
+    const HitGroup& g = g_hg[i];
+    HgAdd& a = c.hgs[c.nhg++];
+    a.hg = i;
+    std::swprintf(a.group, 64, L"%hs_%08x", g.name, tag);
+    a.chs[0] = a.ahs[0] = 0;
+    uint32_t ne = 0;
+    if (g.chs[0]) {
+      std::swprintf(a.chs, 64, L"%ls_%08x", g.chs, tag);
+      a.exports[ne++] = {a.chs, g.chs, D3D12_EXPORT_FLAG_NONE};
+    }
+    if (g.ahs[0]) {
+      std::swprintf(a.ahs, 64, L"%ls_%08x", g.ahs, tag);
+      a.exports[ne++] = {a.ahs, g.ahs, D3D12_EXPORT_FLAG_NONE};
+    }
+    a.lib = {};
+    a.lib.DXILLibrary = {g.lib.bytes, g.lib.size};
+    a.lib.NumExports = ne;
+    a.lib.pExports = a.exports;
+    a.desc = {};
+    a.desc.HitGroupExport = a.group;
+    a.desc.Type = D3D12_HIT_GROUP_TYPE_TRIANGLES;  // LSS: the built-in intersection, as for triangles
+    a.desc.ClosestHitShaderImport = a.chs[0] ? a.chs : nullptr;
+    a.desc.AnyHitShaderImport = a.ahs[0] ? a.ahs : nullptr;
+  }
+}
+
+uint32_t hit_groups_for(uint32_t payload) {
+  uint32_t m = 0;
+  const uint32_t n = g_nhg.load(std::memory_order_acquire);
+  const uint32_t refused = g_hg_refused.load(std::memory_order_relaxed);
+  for (uint32_t i = 0; i < n; ++i)
+    if (g_hg[i].payload == payload && !(refused >> i & 1)) m |= 1u << i;
+  return m;
+}
+
+// The collections that hold hit groups of ours: which of ours, the engine's hit-group names (for the identifier map at
+// each pipeline that links them), and how the collection is known again.
+struct Coll {
+  uint32_t tag, hgs, payload;
+  dxil_hash::Hash hash;  // the collection's own DXIL hash, ALL 16 bytes: the tag is its first 4 only, and two
+                         // collections whose tags collide would otherwise be ONE entry (their groups merged, one slot
+                         // rebuilt for the other) - 2026-11-03
+  std::vector<std::wstring> groups;
+  void* slot;     // the creator's `out` (the state-object container's entry) and blob id - to rebuild it vanilla
+  uint32_t blob;
+};
+std::vector<Coll> g_colls;
+SRWLOCK g_colls_lock = SRWLOCK_INIT;
+std::atomic<uint32_t> g_ncolls{0};
+// engine hit-group identifier -> ours from the same collection, per hit group of ours
+struct IdPair {
+  uint32_t hg, tag;
+  uint8_t eng[32], ours[32];
+};
+constexpr uint32_t kMaxIdPairs = 512;
+IdPair g_pairs[kMaxIdPairs];
+uint32_t g_npairs = 0;
+SRWLOCK g_pairs_lock = SRWLOCK_INIT;
+std::atomic<uint32_t> g_pipelines_mapped{0};
+std::atomic<bool> g_pairs_full{false};  // kMaxIdPairs reached (logged once)
+
+// EVERY collection created while a hit group is registered: its state-object slot and payload - with g_colls (the
+// ones holding ours), what tells a pipeline that links a payload-N collection without our group (g_colls_lock).
+struct CollPayload {
+  void* slot;
+  uint32_t payload;
+};
+std::vector<CollPayload> g_coll_payload;
+std::atomic<uint32_t> g_uncovered_said{0};
+
+void note_collection_payload(void* slot, uint32_t payload) {
+  AcquireSRWLockExclusive(&g_colls_lock);
+  bool found = false;
+  for (CollPayload& c : g_coll_payload)
+    if (c.slot == slot) c.payload = payload, found = true;
+  if (!found) g_coll_payload.push_back({slot, payload});
+  ReleaseSRWLockExclusive(&g_colls_lock);
+}
+
+// After a PIPELINE creation: every collection it links whose payload is a hit group's, without that group in it -
+// counted per group (rg_rt_hit_group_stats.uncovered) and logged for the first few. A ray of that pipeline that hits a
+// record holding the group's identifier runs nothing of it (the identifier is not in the pipeline).
+void check_coverage(const uint32_t* in, uint32_t n) {
+  const uint32_t nhg = g_nhg.load(std::memory_order_acquire);
+  if (!nhg || !in) return;
+  const auto* v = reinterpret_cast<const uint8_t*>(in) + 8;
+  const uint32_t *b = nullptr, *end = nullptr;
+  std::memcpy(&b, v, 8);
+  std::memcpy(&end, v + 8, 8);
+  auto* dev = *reinterpret_cast<uint8_t* const*>(g_base + kDeviceData);
+  if (!dev || !b || end <= b) return;
+  uint32_t missing = 0;  // bit = hit group: some linked collection of its payload lacks it
+  const uint32_t refused = g_hg_refused.load(std::memory_order_relaxed);  // those are logged as refused already
+  AcquireSRWLockShared(&g_colls_lock);
+  for (const uint32_t* id = b; id < end; ++id) {
+    if (*id == 0) continue;
+    const void* slot = dev + kRtStateObjects + size_t(*id - 1) * kRtStateObjectStride;
+    uint32_t payload = 0;
+    bool known = false;
+    for (const CollPayload& c : g_coll_payload)
+      if (c.slot == slot) payload = c.payload, known = true;
+    if (!known) continue;  // created before any group was registered - cannot happen after the registration window
+    uint32_t ours = 0;
+    for (const Coll& c : g_colls)
+      if (c.slot == slot) ours |= c.hgs;
+    for (uint32_t i = 0; i < nhg; ++i)
+      if (g_hg[i].payload == payload && !(ours >> i & 1) && !(refused >> i & 1)) missing |= 1u << i;
+  }
+  ReleaseSRWLockShared(&g_colls_lock);
+  for (uint32_t i = 0; i < nhg; ++i) {
+    if (!(missing >> i & 1)) continue;
+    g_hg[i].uncovered.fetch_add(1, std::memory_order_relaxed);
+    if (g_uncovered_said.fetch_add(1, std::memory_order_relaxed) < 8)
+      g_sdk->logger->WarnF(g_handle, "rt hit group: '%s' - state object #%u (a pipeline) links a %u-byte payload "
+                           "collection WITHOUT it: its rays run no shader of the group (counted in `uncovered`)",
+                           g_hg[i].name, n, g_hg[i].payload);
+  }
+}
+
+// The CPOS export list: a hit-group export is three names (closest-hit, any-hit, the group), the others one.
+std::vector<std::wstring> hit_group_names(const BlobEntry* e) {
+  std::vector<std::wstring> out;
+  const uint8_t* p = e->ptr;
+  uint32_t q = 0, end = 0;
+  uint64_t mask = 0;
+  std::memcpy(&q, p + kCposNames, 4);
+  std::memcpy(&end, p + 0x14, 4);
+  std::memcpy(&mask, p + kCposHitGroupMask, 8);
+  auto next = [&] {
+    std::wstring s;
+    for (; q + 1 < end; ) {
+      const wchar_t ch = static_cast<wchar_t>(p[q] | (p[q + 1] << 8));
+      q += 2;
+      if (!ch) break;
+      s += ch;
+    }
+    return s;
+  };
+  for (uint32_t i = 0; i < p[kCposExports] && q + 1 < end; ++i) {
+    if (i < 64 && (mask >> i & 1)) {
+      next();
+      next();
+      out.push_back(next());
+    } else {
+      next();
+    }
+  }
+  return out;
+}
+
+// After a collection creation with hit groups of ours in it. Returns true for a collection not seen before.
+bool note_collection(const BlobEntry* e, uint32_t tag, const uint8_t hash16[16], uint32_t hgs, void* slot,
+                     uint32_t blob) {
+  std::vector<std::wstring> groups = hit_group_names(e);
+  dxil_hash::Hash hash{};
+  std::memcpy(hash.data(), hash16, hash.size());
+  AcquireSRWLockExclusive(&g_colls_lock);
+  bool fresh = true;
+  for (Coll& c : g_colls)
+    if (c.hash == hash) {  // the WHOLE hash: the tag (its first 4 bytes) is a name suffix, not an identity
+      c.hgs |= hgs;
+      c.slot = slot;
+      c.blob = blob;
+      fresh = false;
+    }
+  if (fresh) g_colls.push_back({tag, hgs, e->ptr[kCposPayload], hash, std::move(groups), slot, blob});
+  g_ncolls.store(static_cast<uint32_t>(g_colls.size()), std::memory_order_release);
+  ReleaseSRWLockExclusive(&g_colls_lock);
+  return fresh;
+}
+
+BlobEntry* entry_of(uint32_t id);  // below (the GpuApi blob container); the rebuild checks its blob here first
+
+// A PIPELINE creation that failed: if it links a collection with hit groups of ours, that collection is rebuilt
+// without them (in its own slot, as the engine would re-create it) and those hit groups are refused from then on.
+// Returns the collections rebuilt - the caller tries the pipeline again.
+//
+// 2026-11-03, three things this got wrong (docs/internals.md "Known gaps" 11, item 2):
+//   * the engine's creator runs OUTSIDE g_colls_lock: it is a driver compile (seconds), and check_coverage /
+//     map_identifiers / note_* take that lock on every other pipeline - so the pipeline retried HERE would block every
+//     state object of the session behind it. The lock is now held only to pick the victims and to record the outcome.
+//   * the rebuilt collection is written into the slot's StateObjectData (device data + kRtStateObjects, +0 = a ComPtr
+//     the slot OWNS). The creator stores its own object without releasing the old one, so the old ID3D12StateObject (M
+//     of VRAM) leaked per rebuild - read the owner off the slot and release it once the creator replaced it.
+//   * the input is hand-built: the creator's shape is `{u32 blob; u32 pad; u32 vector of the LINKED COLLECTIONS at +8}`
+//     (kCposCollection's note, engine_231.hpp; a pipeline passes its collections there, a collection none). A zeroed
+//     vector is exactly a collection's, but the blob must really BE a collection - a pipeline-shaped blob would build a
+//     pipeline with no linked collections here. It is checked against the container entry first.
+uint32_t unlink_ours(const uint32_t* in, uint32_t n) {
+  if (!g_ncolls.load(std::memory_order_acquire) || !in) return 0;
+  const auto* v = reinterpret_cast<const uint8_t*>(in) + 8;
+  const uint32_t *b = nullptr, *end = nullptr;
+  std::memcpy(&b, v, 8);
+  std::memcpy(&end, v + 8, 8);
+  auto* dev = *reinterpret_cast<uint8_t* const*>(g_base + kDeviceData);
+  if (!dev || !b || end <= b) return 0;
+  uint32_t rebuilt = 0;
+  for (const uint32_t* id = b; id < end; ++id) {
+    if (*id == 0) continue;
+    void* slot = dev + kRtStateObjects + size_t(*id - 1) * kRtStateObjectStride;
+    // What to rebuild, picked under the lock; the creator then runs with NO lock held.
+    struct Victim {
+      uint32_t tag, blob;
+      void* slot;
+    };
+    Victim pick[8];
+    uint32_t npick = 0;
+    uint32_t refused_hgs = 0;
+    AcquireSRWLockExclusive(&g_colls_lock);
+    for (size_t k = 0; k < g_colls.size(); ++k) {
+      Coll& c = g_colls[k];
+      if (c.slot != slot || !c.hgs || npick == 8) continue;
+      refused_hgs |= c.hgs;
+      pick[npick++] = {c.tag, c.blob, c.slot};
+      for (uint32_t i = 0; i < kMaxHg; ++i)
+        if (c.hgs >> i & 1) clients::refused(clients::kRtHitGroup, static_cast<rg_handle>(i + 1), "an RT pipeline "
+                                             "failed linking it");
+      c.hgs = 0;      // no other pipeline rebuilds it again in the meantime
+      c.slot = nullptr;
+    }
+    ReleaseSRWLockExclusive(&g_colls_lock);
+    if (!npick) continue;
+    g_hg_refused.fetch_or(refused_hgs);
+    for (uint32_t k = 0; k < npick; ++k) {
+      const Victim& c = pick[k];
+      const BlobEntry* e = entry_of(c.blob);
+      const bool is_collection = e && e->ptr && e->size >= 0x1c && e->ptr[kCposCollection] != 0;
+      void* old = nullptr;  // the slot's own ID3D12StateObject: the creator replaces it without a Release
+      __try {
+        old = *static_cast<void**>(c.slot);
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+        old = nullptr;
+      }
+      bool ok = false;
+      if (!is_collection) {
+        g_sdk->logger->ErrorF(g_handle, "rt hit group: state object #%u (a pipeline) FAILED linking collection %08x with "
+                              "our hit groups - its blob is not a collection any more, NOT rebuilt (%u refused)",
+                              n, c.tag, refused_hgs);
+      } else {
+        struct {
+          uint32_t blob, pad;
+          uint64_t begin, end, cap;  // no linked collections: a collection's input, as the engine builds it
+        } vin = {c.blob, 0, 0, 0, 0};
+        AddCtx& cx = t_add;  // this thread may be inside an armed creation: the rebuild is the engine's alone
+        const bool armed = cx.armed;
+        cx.armed = false;
+        ok = g_orig(c.slot, &vin.blob);
+        cx.armed = armed;
+        g_sdk->logger->ErrorF(g_handle, "rt hit group: state object #%u (a pipeline) FAILED linking collection %08x with "
+                              "our hit groups - the collection rebuilt without them (%s), they are refused from now on",
+                              n, c.tag, ok ? "ok" : "FAILED too");
+      }
+      if (ok && old) {
+        __try {
+          static_cast<IUnknown*>(old)->Release();  // the slot owns one reference; the creator stored another object
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+      }
+      ++rebuilt;
+    }
+    AcquireSRWLockExclusive(&g_pairs_lock);
+    for (uint32_t k = 0; k < npick; ++k)
+      for (uint32_t p = 0; p < g_npairs;)
+        if (g_pairs[p].tag == pick[k].tag) g_pairs[p] = g_pairs[--g_npairs];
+        else ++p;
+    ReleaseSRWLockExclusive(&g_pairs_lock);
+  }
+  return rebuilt;
+}
+
+// The engine's creator; a pipeline that fails on a collection of ours is tried again without our hit groups.
+bool orig_create(void* out, const uint32_t* in, uint32_t n) {
+  if (g_orig(out, in)) return true;
+  if (!unlink_ours(in, n)) return false;
+  AddCtx& c = t_add;  // an armed creation adds its libraries again
+  c.seen = c.swapped = false;
+  c.added = c.hg_added = 0;
+  return g_orig(out, in);
+}
+
+// After a PIPELINE creation: for every collection of ours it links (our group's name resolves), every engine hit group
+// of that collection -> our group's identifier. A collection's identifiers are the same in every pipeline linking it
+// (the engine's own tables rely on that) - a different one for a known engine identifier is counted and logged.
+void map_identifiers(void* out, uint32_t n) {
+  auto* so = out ? *reinterpret_cast<IUnknown**>(out) : nullptr;
+  if (!so) return;
+  ID3D12StateObjectProperties* props = nullptr;
+  if (FAILED(so->QueryInterface(IID_PPV_ARGS(&props))) || !props) return;
+  AcquireSRWLockShared(&g_colls_lock);
+  const std::vector<Coll> colls = g_colls;
+  ReleaseSRWLockShared(&g_colls_lock);
+  uint32_t mapped = 0, linked = 0;
+  for (const Coll& c : colls)
+    for (uint32_t i = 0; i < g_nhg.load(std::memory_order_acquire); ++i) {
+      if (!(c.hgs >> i & 1)) continue;
+      wchar_t name[64];
+      std::swprintf(name, 64, L"%hs_%08x", g_hg[i].name, c.tag);
+      const void* ours = props->GetShaderIdentifier(name);
+      if (!ours) continue;
+      ++linked;
+      g_hg[i].pipelines.fetch_add(1, std::memory_order_relaxed);
+      for (const std::wstring& gname : c.groups) {
+        const void* eng = gname.empty() ? nullptr : props->GetShaderIdentifier(gname.c_str());
+        if (!eng) continue;
+        AcquireSRWLockExclusive(&g_pairs_lock);
+        uint32_t k = 0;
+        while (k < g_npairs && !(g_pairs[k].hg == i && std::memcmp(g_pairs[k].eng, eng, 32) == 0)) ++k;
+        if (k < g_npairs) {
+          if (std::memcmp(g_pairs[k].ours, ours, 32) != 0 && g_hg[i].mismatches.fetch_add(1) < 4)
+            g_sdk->logger->WarnF(g_handle, "rt hit group: '%s' - state object #%u gives collection %08x's identifiers "
+                                 "anew (engine group '%ls'): the tables may hold another pipeline's", g_hg[i].name, n,
+                                 c.tag, gname.c_str());
+        } else if (g_npairs < kMaxIdPairs) {
+          g_pairs[g_npairs].hg = i;
+          g_pairs[g_npairs].tag = c.tag;
+          std::memcpy(g_pairs[g_npairs].eng, eng, 32);
+          std::memcpy(g_pairs[g_npairs].ours, ours, 32);
+          if (g_npairs < 32 || verbose()) {
+            uint64_t e8 = 0, o8 = 0, e8b = 0, o8b = 0;
+            std::memcpy(&e8, eng, 8), std::memcpy(&e8b, static_cast<const uint8_t*>(eng) + 8, 8);
+            std::memcpy(&o8, ours, 8), std::memcpy(&o8b, static_cast<const uint8_t*>(ours) + 8, 8);
+            g_sdk->logger->InfoF(g_handle, "rt hit group: collection %08x '%ls' %016llx %016llx.. -> ours %016llx "
+                                 "%016llx..", c.tag, gname.c_str(), static_cast<unsigned long long>(e8),
+                                 static_cast<unsigned long long>(e8b), static_cast<unsigned long long>(o8),
+                                 static_cast<unsigned long long>(o8b));
+          }
+          ++g_npairs;
+          ++mapped;
+        } else if (!g_pairs_full.exchange(true)) {
+          // the identifier of this engine group is never ours: rt_hit_group_identifier answers UNAVAILABLE for it
+          g_sdk->logger->ErrorF(g_handle, "rt hit group: '%s' - the identifier map is FULL (%u pairs, kMaxIdPairs): "
+                                "engine group '%ls' of collection %08x and every later one stay unmapped",
+                                g_hg[i].name, kMaxIdPairs, gname.c_str(), c.tag);
+        }
+        ReleaseSRWLockExclusive(&g_pairs_lock);
+      }
+    }
+  props->Release();
+  if (linked && (g_pipelines_mapped.fetch_add(1) == 0 || mapped))
+    g_sdk->logger->InfoF(g_handle, "rt hit group: state object #%u links %u collection(s) of ours - %u engine hit "
+                         "group(s) newly mapped to our identifiers", n, linked, mapped);
 }
 
 // Arm the libraries of `mask` for one creation: export lists, a name already exported by an earlier one left out.
@@ -216,9 +652,11 @@ void first_export(const BlobEntry* e, char* out, size_t cap) {
 }
 
 // Classify the creation and run every one that is not ours. Returns 0 / -1 (passed through,
-// succeeded / failed) or 1 with `mask` = every registered library on this hash whose leases stand.
-int create_shared(void* out, const uint32_t* in, uint32_t n, uint64_t* mask) {
-  const auto pass = [&] { return g_orig(out, in) ? 0 : -1; };
+// succeeded / failed) or 1 with `mask` = every registered library on this hash whose leases stand and `hgs` = the hit
+// groups for this collection (`tag` its name suffix).
+int create_shared(void* out, const uint32_t* in, uint32_t n, uint64_t* mask, uint32_t* hgs, uint32_t* tag,
+                  uint8_t hash16[16]) {
+  const auto pass = [&] { return orig_create(out, in, n) ? 0 : -1; };
   BlobEntry* e = in ? entry_of(*in) : nullptr;
   uint32_t magic = 0, dxil_off = 0;
   if (e && e->ptr && e->size >= 0x1c) {
@@ -254,8 +692,11 @@ int create_shared(void* out, const uint32_t* in, uint32_t n, uint64_t* mask) {
       g_sdk->logger->WarnF(g_handle, "rt swap: %s NOT baked - a lease of it is refused; state object #%u without it",
                            g_libs[i].name, n);
     }
-  if (!m) return pass();
+  const uint32_t hg = h && e->ptr[kCposCollection] ? hit_groups_for(e->ptr[kCposPayload]) : 0;
+  if (!m && !hg) return pass();
   *mask = m;
+  *hgs = hg;
+  if (hg) std::memcpy(tag, hb, 4), std::memcpy(hash16, hb, 16);
   return 1;
 }
 
@@ -271,26 +712,82 @@ void say_first(uint32_t ti, const char* what, uint32_t n, size_t bytes, uint32_t
 
 // One creation with `swap` (-1 none) in place of the engine's library and the libraries of `add` next to it - both
 // through d_sub on this thread; the engine's container entry is never touched.
-bool create_with(void* out, const uint32_t* in, uint32_t n, int32_t swap, uint64_t add) {
+bool create_with(void* out, const uint32_t* in, uint32_t n, int32_t swap, uint64_t add, uint32_t hgs, uint32_t tag,
+                 const uint8_t hash16[16]) {
   AddCtx& c = t_add;
   c.n = 0;
   c.seen = false;
   c.added = 0;
   c.swap = -1;
   c.swapped = false;
+  c.nhg = 0;
+  c.hg_added = 0;
+  c.hg_wait = 0;
+  c.reserve = 0;
   if (add) arm_add(add);
   if (swap >= 0) {
     c.swap = swap;
     c.swap_desc = {};
     c.swap_desc.DXILLibrary = {g_libs[swap].lib.bytes, g_libs[swap].lib.size};  // NumExports 0 = all, as the engine's
   }
-  c.armed = c.n || c.swap >= 0;
-  bool ok = g_orig(out, in);
-  const uint32_t armed = c.n, added = c.added;
+  const BlobEntry* e = hgs ? entry_of(*in) : nullptr;
+  if (e) {
+    arm_hit_groups(hgs, tag);
+    // after its library the creator appends its hit groups and the collections it links (a u32 vector at in + 8)
+    const auto* v = reinterpret_cast<const uint8_t*>(in) + 8;
+    uint64_t b = 0, end = 0;
+    std::memcpy(&b, v, 8);
+    std::memcpy(&end, v + 8, 8);
+    c.hg_wait = e->ptr[kCposHitGroups];
+    c.reserve = end > b ? static_cast<uint32_t>((end - b) / 4) : 0u;
+  }
+  c.armed = c.n || c.swap >= 0 || c.nhg;
+  if (ID3D12InfoQueue* q = info_queue()) {  // [dev] d3d12_debug: only this creation's messages
+    q->ClearStoredMessages();
+    q->Release();
+  }
+  bool ok = orig_create(out, in, n);
+  if (!ok) d3d12_messages(n);
+  const uint32_t armed = c.n, added = c.added, nhg = c.nhg, hg_added = c.hg_added;
   const bool seen = c.seen, swapped = c.swapped;
   c.armed = false;
   c.n = 0;
   c.swap = -1;
+  c.nhg = 0;
+  uint32_t hg_in = 0;  // hit groups (bit = g_hg index) that went into this collection
+  for (uint32_t i = 0; i < nhg; ++i)
+    if (hg_added >> i & 1) hg_in |= 1u << c.hgs[i].hg;
+  if (ok && e) {
+    const bool fresh = hg_in && note_collection(e, tag, hash16, hg_in, out, *in);
+    for (uint32_t i = 0; i < nhg; ++i) {
+      const HitGroup& g = g_hg[c.hgs[i].hg];
+      if (!(hg_added >> i & 1)) {
+        g_sdk->logger->WarnF(g_handle, "rt hit group: '%s' NOT added to collection %08x (state object #%u: %s)", g.name,
+                             tag, n, !seen ? "no DXIL-library subobject seen" : c.hg_wait ? "fewer engine hit groups "
+                             "than its header says" : "no room in the engine's subobject array");
+        continue;
+      }
+      g_hg[c.hgs[i].hg].collections.fetch_add(1, std::memory_order_relaxed);
+      if (fresh || verbose())
+        g_sdk->logger->InfoF(g_handle, "rt hit group: '%ls' ADDED to collection %08x (state object #%u, %u-byte payload, "
+                             "%u engine hit groups)%s", c.hgs[i].group, tag, n, e->ptr[kCposPayload],
+                             e->ptr[kCposHitGroups], !(g.flags & RG_HIT_GROUP_LSS) ? ""
+                             : g_lss.load() ? ", LSS on"
+                             : g_pso_calls.load() ? ", LSS REFUSED by the driver"
+                             : ", LSS OFF (the engine set no NvAPI pipeline options: OMM off / not NVIDIA)");
+    }
+  }
+  if (!ok && hg_in) {  // a collection that fails with a hit group of ours would fail with it every time
+    g_hg_refused.fetch_or(hg_in);
+    for (uint32_t i = 0; i < nhg; ++i)
+      if (hg_added >> i & 1) {
+        g_hg[c.hgs[i].hg].failed.fetch_add(1, std::memory_order_relaxed);
+        g_sdk->logger->ErrorF(g_handle, "rt hit group: '%ls' - collection %08x FAILED with it (state object #%u): "
+                              "refused from now on", c.hgs[i].group, tag, n);
+        clients::refused(clients::kRtHitGroup, static_cast<rg_handle>(c.hgs[i].hg + 1), "an engine collection failed "
+                         "with it");
+      }
+  }
   if (ok && swap >= 0 && !swapped)
     g_sdk->logger->WarnF(g_handle, "rt swap: %s NOT swapped into state object #%u (no DXIL-library subobject seen) - the "
                          "engine's library ran", g_libs[swap].name, n);
@@ -315,10 +812,11 @@ bool create_with(void* out, const uint32_t* in, uint32_t n, int32_t swap, uint64
     return true;
   }
   g_sdk->logger->ErrorF(g_handle, "rt swap: creation FAILED with our libraries (state object #%u, %u swapped, %u "
-                        "added) - retrying with the engine's alone (vanilla RT)", n, swapped ? 1u : 0u, armed);
+                        "added, %u hit groups) - retrying with the engine's alone (vanilla RT)", n, swapped ? 1u : 0u,
+                        armed, nhg);
   if (swap >= 0) g_libs[swap].failed.fetch_add(1, std::memory_order_relaxed);
   for (uint32_t i = 0; i < armed; ++i) g_libs[c.libs[i].lib].failed.fetch_add(1, std::memory_order_relaxed);
-  ok = g_orig(out, in);
+  ok = orig_create(out, in, n);
   g_sdk->logger->InfoF(g_handle, "rt swap: vanilla retry %s", ok ? "succeeded" : "FAILED too");
   return ok;
 }
@@ -326,14 +824,16 @@ bool create_with(void* out, const uint32_t* in, uint32_t n, int32_t swap, uint64
 bool create(void* out, const uint32_t* in) {
   const uint32_t n = g_calls.fetch_add(1) + 1;
   uint64_t mask = 0;
-  const int r = create_shared(out, in, n, &mask);
+  uint32_t hgs = 0, tag = 0;
+  uint8_t hash16[16] = {};
+  const int r = create_shared(out, in, n, &mask, &hgs, &tag, hash16);
   if (r <= 0) return r == 0;
-  if (!g_sub_attached) {  // swap and add both go through the subobject append
+  if (!g_sub_attached) {  // swap, add and the hit groups all go through the subobject append
     for (uint32_t i = 0; i < g_n.load(std::memory_order_acquire); ++i)
       if ((mask >> i & 1) && !(g_said_noswap.fetch_or(1ull << i) >> i & 1))
         g_sdk->logger->WarnF(g_handle, "rt swap: %s NOT baked - the subobject hook is not attached (vanilla there)",
                              g_libs[i].name);
-    return g_orig(out, in);
+    return orig_create(out, in, n);
   }
   // Every library with variants goes in next to the engine's (never swapped: its blob holds only the variants); of
   // the rest the highest priority swaps (ties: the first registered) - one library in place of the engine's.
@@ -355,19 +855,34 @@ bool create(void* out, const uint32_t* in) {
       std::snprintf(why, sizeof why, "'%s' replaces the same engine library (higher priority)", g_libs[swap].name);
       clients::refused(clients::kRtLib, static_cast<rg_handle>(i + 1), why);
     }
-  return create_with(out, in, n, swap, add);
+  return create_with(out, in, n, swap, add, hgs, tag, hash16);
 }
 
 // The census (graph_probe) maps a DispatchRays to the library it runs: every successful creation reports its
 // container entry, the library hash and the export names (UTF-16, consecutive, from [+0x10]; count = byte +6).
 void forget_slot(const void* slot);  // below, with the identifier cache
+void lss_apply_once();               // below, with the NvAPI pipeline options (LSS): once, at the first state object
+void note_pipeline_options(const void* out, const uint32_t* in);  // below: the options a pipeline was created under
 
 bool d_create(void* out, const uint32_t* in) {
   t_baked = 0;
+  lss_apply_once();  // LSS (RG_HIT_GROUP_LSS): the host's own NvAPI pipeline options, before the first state object
   forget_slot(out);  // `out` is the state-object slot DispatchRays reads (rt_entry): its cached identifiers go
   const bool ok = create(out, in);
   forget_slot(out);  // and anything cached while it was being built
   if (ok) note_entry(out, t_baked);
+  if (ok) note_pipeline_options(out, in);
+  if (ok && g_nhg.load(std::memory_order_acquire)) {
+    const BlobEntry* pe = in ? entry_of(*in) : nullptr;
+    if (pe && pe->ptr && pe->size >= 0x1c) {
+      if (pe->ptr[kCposCollection]) {
+        note_collection_payload(out, pe->ptr[kCposPayload]);
+      } else {  // a pipeline: which of our collections it links, and which of its collections lack ours
+        if (g_ncolls.load(std::memory_order_acquire)) map_identifiers(out, g_calls.load());
+        check_coverage(in, g_calls.load());
+      }
+    }
+  }
   if (!ok || !graph_probe::census()) return ok;
   const BlobEntry* e = in ? entry_of(*in) : nullptr;
   uint32_t magic = 0, names = 0, dxil_off = 0;
@@ -965,6 +1480,13 @@ int d_nv(void* cl_engine, const void* params) {
 }
 
 void d_tlas(uint32_t dest, uint32_t count, uint32_t instances, uint32_t a4, uint32_t scratch, uint32_t scratch_off) {
+  if (bvh_probe::on()) {  // [Diagnostics] BvhProbe: this build, its instance buffer and its collector, per frame
+    const auto* data = *reinterpret_cast<const uint8_t* const*>(g_base + kDeviceData);
+    const uint64_t inst = data && instances - 1u <= 0x7ffffffeu
+                              ? rd64(data + kBufferVa + size_t(instances - 1u) * kBufferStride)
+                              : 0;
+    bvh_probe::on_tlas(count, inst, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(_ReturnAddress()) - g_base));
+  }
   ID3D12GraphicsCommandList2* cl = mark_create() ? mark_list() : nullptr;
   uint32_t seq = 0;
   if (cl) {
@@ -1024,6 +1546,16 @@ void detach_as() {
   g_blas_attached = g_nv_attached = g_tlas_attached = false;
 }
 
+// [Diagnostics] BvhProbe without the DRED markers: only the TLAS builder - the probe's per-frame line needs every
+// build, and one that traces a second instance-desc array is the whole question (docs/plan-mesh-proxy.md).
+void attach_tlas_probe() {
+  if (g_tlas_attached) return;
+  g_tlas_attached = attach_hook(kBuildTlas, kBuildTlasRet, reinterpret_cast<void*>(&d_tlas),
+                                reinterpret_cast<void**>(&g_orig_tlas),
+                                "GpuApi::BuildTopLevelAccelerationStructure (bvh probe)");
+  g_sdk->logger->InfoF(g_handle, "bvh probe: the TLAS builder %s", g_tlas_attached ? "HOOKED" : "NOT hooked");
+}
+
 void d_rays(uint32_t so, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5, uint32_t a6, uint32_t a7, uint32_t a8,
             uint32_t buffer) {
   // Entered from the hooked function's entry: our return address is the engine caller's.
@@ -1031,6 +1563,8 @@ void d_rays(uint32_t so, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5, uin
   if (g_rays_census)
     graph_probe::on_dispatch_rays(so, a2, a3, a5,
                                   static_cast<uint32_t>(reinterpret_cast<uintptr_t>(_ReturnAddress()) - g_base - 5));
+  if (bvh_probe::on())  // [Diagnostics] BvhProbe: this dispatch's state object and engine call site, per frame
+    bvh_probe::on_rays(so, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(_ReturnAddress()) - g_base - 5));
   t_ovr.set = false;
   t_ran = false;
   t_undelivered = false;
@@ -1143,7 +1677,340 @@ const void* d_gsgi(uint32_t id, uint32_t group) {
   return g_orig_gsgi(id, group);
 }
 
+// LSS (2026-11-01): a ray-tracing pipeline intersects linear swept spheres only when created with NvAPI's
+// ENABLE_LSS_SUPPORT pipeline option. The engine sets its options once in GpuApi::InitDevice - ONLY with OMM on (and a
+// refused call turns its OMM off) -, so with OMM off a hit group asking for RG_HIT_GROUP_LSS used to get nothing at all
+// and the collection said "LSS OFF" forever. 2026-11-03 (docs/internals.md "Known gaps" 11, item 3): the option is the
+// HOST's capability now, not a side effect of the engine's call -
+//   * the detour still adds our bit to the engine's own call when it happens (the flags have to be one set: the engine's
+//     0x01 and ours 0x10),
+//   * and when the engine never called, the host makes the call ITSELF with the LSS bit alone, once, at the first state
+//     object (lss_apply_once) - before the first pipeline that carries our hit groups is created.
+// It is device-global by NvAPI's design (every RT pipeline created afterwards has LSS), which is why the log line says so;
+// nothing here can scope it to one collection.
+constexpr uint32_t kNvPsoOptionsVer = 0x10008, kNvPsoLss = 0x10;  // _PARAMS_V1 {u32 version, u32 flags}, NV_BIT(4)
+using NvPsoOptions_t = int (*)(void* device, uint32_t* params);
+NvPsoOptions_t g_orig_pso = nullptr;
+bool g_pso_attached = false;
+std::atomic<bool> g_engine_lss{false};  // the ENGINE's call went out with our bit (its own OMM option + LSS)
+std::atomic<bool> g_own_lss{false};     // the host's own call: tried once, `g_lss` says whether the driver took it
+
+int d_pso_options(void* device, uint32_t* params) {
+  g_pso_calls.fetch_add(1, std::memory_order_relaxed);
+  if (!params || params[0] != kNvPsoOptionsVer ||
+      reinterpret_cast<uintptr_t>(_ReturnAddress()) != g_base + kNvSetCreatePsoOptionsRet)
+    return g_orig_pso(device, params);
+  const uint32_t flags = params[1];
+  params[1] = flags | kNvPsoLss;
+  const int r = g_orig_pso(device, params);
+  params[1] = flags;
+  if (r == 0) {
+    g_lss.store(1, std::memory_order_release);
+    g_engine_lss.store(true, std::memory_order_release);
+    g_sdk->logger->InfoF(g_handle, "rt hit group: LSS ON - the engine's NvAPI pipeline options 0x%x -> 0x%x (every RT "
+                         "pipeline intersects linear swept spheres)", flags, flags | kNvPsoLss);
+    return r;
+  }
+  g_sdk->logger->WarnF(g_handle, "rt hit group: the driver REFUSED LSS support (NvAPI %d) - the engine's options alone "
+                       "(0x%x); no LSS geometry may enter the BVH", r, flags);
+  return g_orig_pso(device, params);
+}
+
+// 2026-11-03 (the hair mod's glass probe, docs/internals.md "Known gaps" 13): the glass reflection's pipeline (engine
+// state object 78) ran its MISS shader for an opaque LSS hit while the PT pipeline ran the hit group - NvAPI: "if the
+// pipeline is not created with the correct primitive support, and that primitive type is encountered during traversal,
+// behavior is undefined", and the options are GLOBAL "until this function is called again". The exe hook above sees
+// only the engine's InitDevice call through its statically linked NvAPI; any other caller (another call site, another
+// module with its own NvAPI) reached the driver unseen and could drop the LSS bit for every pipeline after it. So the
+// DRIVER's function itself is hooked (nvapi64.dll's nvapi_QueryInterface(0x5c607a27)): every call from every module is
+// logged with its caller and gets the LSS bit, and the flags in force are kept for the state-object log (d_create).
+constexpr uint32_t kNvSetCreatePsoOptionsId = 0x5c607a27;
+void* g_driver_pso = nullptr;               // the driver's NvAPI_D3D12_SetCreatePipelineStateOptions, hooked
+std::atomic<uint32_t> g_opts_now{0};        // the options in force (what the driver last accepted)
+std::atomic<uint32_t> g_opts_calls{0};      // the calls the driver accepted
+std::atomic<uint32_t> g_opts_unlss{0};      // ... that came WITHOUT the LSS bit (it was added)
+
+// `addr` as "module+0xoffset", for the log.
+void caller_of(const void* addr, char* out, size_t cap) {
+  HMODULE m = nullptr;
+  wchar_t path[MAX_PATH] = {};
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          static_cast<LPCWSTR>(addr), &m) || !m || !GetModuleFileNameW(m, path, MAX_PATH)) {
+    std::snprintf(out, cap, "%p (no module)", addr);
+    return;
+  }
+  const wchar_t* base = std::wcsrchr(path, L'\\');
+  base = base ? base + 1 : path;
+  char name[64] = {};
+  size_t i = 0;
+  for (; base[i] && i + 1 < sizeof name; ++i) name[i] = base[i] < 0x80 ? static_cast<char>(base[i]) : '?';
+  std::snprintf(out, cap, "%s+0x%llx", name,
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(m)));
+}
+
+bool lss_wanted();
+int d_pso_driver(void* device, uint32_t* params) {
+  if (!params || params[0] != kNvPsoOptionsVer) return g_orig_pso(device, params);
+  char who[128];
+  caller_of(_ReturnAddress(), who, sizeof who);
+  const uint32_t flags = params[1];
+  const bool add = lss_wanted() && !(flags & kNvPsoLss);
+  if (add) params[1] = flags | kNvPsoLss;
+  const int r = g_orig_pso(device, params);
+  const uint32_t sent = params[1];
+  params[1] = flags;
+  const uint32_t n = g_opts_calls.fetch_add(r == 0 ? 1u : 0u) + 1;
+  if (r == 0) {
+    g_opts_now.store(sent, std::memory_order_release);
+    if (sent & kNvPsoLss) g_lss.store(1, std::memory_order_release), g_engine_lss.store(true, std::memory_order_release);
+    if (add) g_opts_unlss.fetch_add(1, std::memory_order_relaxed);
+  }
+  g_sdk->logger->InfoF(g_handle, "rt pipeline options: call #%u from %s - flags 0x%x%s -> NvAPI %d, in force now 0x%x", n,
+                       who, flags, add ? " (+ the LSS bit)" : "", r, g_opts_now.load());
+  if (r != 0 && add) {  // refused with our bit: what the caller asked for alone
+    const int r2 = g_orig_pso(device, params);
+    if (r2 == 0) g_opts_now.store(flags, std::memory_order_release);
+    g_sdk->logger->WarnF(g_handle, "rt pipeline options: the driver REFUSED the LSS bit (NvAPI %d) - the caller's 0x%x "
+                         "alone (NvAPI %d); RT pipelines from here have no LSS", r, flags, r2);
+    return r2;
+  }
+  return r;
+}
+
+// The driver's function, by nvapi64.dll's own query (the DLL is the driver's; loading it initializes nothing).
+bool attach_pso_driver() {
+  HMODULE nv = LoadLibraryW(L"nvapi64.dll");
+  using Query_t = void* (*)(uint32_t);
+  const auto q = nv ? reinterpret_cast<Query_t>(GetProcAddress(nv, "nvapi_QueryInterface")) : nullptr;
+  void* fn = q ? q(kNvSetCreatePsoOptionsId) : nullptr;
+  if (!fn || !g_sdk->hooking->Attach(g_handle, fn, reinterpret_cast<void*>(&d_pso_driver),
+                                     reinterpret_cast<void**>(&g_orig_pso))) {
+    g_sdk->logger->WarnF(g_handle, "rt pipeline options: the driver's SetCreatePipelineStateOptions NOT hooked (%s) - "
+                         "the engine's InitDevice call only", !nv ? "no nvapi64.dll" : !fn ? "no such interface" : "attach");
+    return false;
+  }
+  g_driver_pso = fn;
+  g_sdk->logger->InfoF(g_handle, "rt pipeline options: the driver's SetCreatePipelineStateOptions %p HOOKED - every "
+                       "caller logged, the LSS bit added to every call", fn);
+  return true;
+}
+
+// d_create: one line per PIPELINE (not a collection) - its engine id and the options it was created under.
+void note_pipeline_options(const void* out, const uint32_t* in) {
+  const BlobEntry* pe = in ? entry_of(*in) : nullptr;
+  if (!pe || !pe->ptr || pe->size < 0x1c || pe->ptr[kCposCollection]) return;
+  auto* dev = *reinterpret_cast<uint8_t* const*>(g_base + kDeviceData);
+  if (!dev) return;
+  const uintptr_t first = reinterpret_cast<uintptr_t>(dev + kRtStateObjects), at = reinterpret_cast<uintptr_t>(out);
+  const uint32_t id = at >= first ? static_cast<uint32_t>((at - first) / kRtStateObjectStride) + 1 : 0;
+  const uint32_t o = g_opts_now.load(std::memory_order_acquire);
+  const bool bad = lss_wanted() && !(o & kNvPsoLss);
+  if (bad)
+    g_sdk->logger->WarnF(g_handle, "rt pipeline options: state object #%u (a pipeline) created WITHOUT the LSS option (in "
+                         "force 0x%x, %u call(s) so far) - an LSS hit there is undefined (a miss)", id, o,
+                         g_opts_calls.load());
+  else
+    g_sdk->logger->InfoF(g_handle, "rt pipeline options: state object #%u (a pipeline) created with options 0x%x", id, o);
+}
+
+// The host's own ENABLE_LSS_SUPPORT call: once, when a hit group asked for LSS and the engine set no pipeline options at
+// all (it does only with OMM on). Called at the first state object, before the engine's creator runs - a PSO built
+// afterwards carries LSS, every one built before does not (a state object is immutable).
+bool lss_wanted();
+void lss_apply_once() {
+  if (!g_pso_attached || g_engine_lss.load(std::memory_order_acquire) || g_own_lss.exchange(true)) return;
+  if (!lss_wanted()) return;
+  const auto* data = *reinterpret_cast<const uint8_t* const*>(g_base + kDeviceData);
+  auto* engine_dev = data ? *reinterpret_cast<IUnknown* const*>(data + kDeviceInData) : nullptr;
+  ID3D12Device* dev = nullptr;
+  if (!engine_dev || FAILED(engine_dev->QueryInterface(IID_PPV_ARGS(&dev))) || !dev) {
+    g_sdk->logger->WarnF(g_handle, "rt hit group: LSS NOT enabled - the engine's device is not there yet at the first state "
+                         "object (the hit group's LSS geometry has no pipeline option)");
+    return;
+  }
+  uint32_t params[2] = {kNvPsoOptionsVer, kNvPsoLss};  // the LSS bit alone: the engine set nothing for us to keep
+  const int r = g_orig_pso(dev, params);
+  dev->Release();
+  if (r == 0) {
+    g_lss.store(1, std::memory_order_release);
+    g_opts_now.store(kNvPsoLss, std::memory_order_release);
+    g_sdk->logger->InfoF(g_handle, "rt hit group: LSS ON - the host's own NvAPI pipeline options 0x%x (the engine set none: "
+                         "OMM off), before the first state object (every RT pipeline from here intersects linear swept "
+                         "spheres)", kNvPsoLss);
+  } else {
+    g_sdk->logger->WarnF(g_handle, "rt hit group: the driver REFUSED the host's LSS pipeline options (NvAPI %d) - no LSS "
+                         "geometry may enter the BVH", r);
+  }
+}
+
+bool lss_wanted() {
+  for (uint32_t i = 0; i < g_nhg.load(std::memory_order_acquire); ++i)
+    if (g_hg[i].flags & RG_HIT_GROUP_LSS) return true;
+  return false;
+}
+
+bool valid_name(const char* s, size_t max) {
+  if (!s || !*s || std::strlen(s) > max) return false;
+  for (; *s; ++s)
+    if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || (*s >= '0' && *s <= '9') || *s == '_')) return false;
+  return true;
+}
+
 }  // namespace
+
+rg_handle hit_group_add(const char* name, const rg_rt_hit_group_desc* d) {
+  if (!registration_open()) return RG_E_LATE;
+  if (!d || d->struct_size < sizeof(rg_rt_hit_group_desc) || !valid_name(name, 40) || !d->payload_bytes ||
+      !d->library.bytes || d->library.size < 32 || (!d->closest_hit && !d->any_hit) ||
+      (d->closest_hit && !valid_name(d->closest_hit, 48)) || (d->any_hit && !valid_name(d->any_hit, 48)))
+    return RG_E_ARG;
+  if (std::memcmp(d->library.bytes, "DXBC", 4) != 0) return RG_E_BLOB;
+  const uint32_t n = g_nhg.load();
+  if (n >= kMaxHg) return RG_E_FULL;
+  for (uint32_t i = 0; i < n; ++i)
+    if (std::strcmp(g_hg[i].name, name) == 0) return RG_E_TAKEN;
+  HitGroup& g = g_hg[n];
+  std::snprintf(g.name, sizeof g.name, "%s", name);
+  g.payload = d->payload_bytes;
+  g.flags = d->flags;
+  std::swprintf(g.chs, 64, L"%hs", d->closest_hit ? d->closest_hit : "");
+  std::swprintf(g.ahs, 64, L"%hs", d->any_hit ? d->any_hit : "");
+  g.lib = d->library;
+  g_nhg.store(n + 1, std::memory_order_release);
+  g_sdk->logger->InfoF(g_handle, "host: RT hit group '%s' (closest-hit %s, any-hit %s, %u B DXIL) for every collection "
+                       "with a %u-byte payload%s", name, d->closest_hit ? d->closest_hit : "-",
+                       d->any_hit ? d->any_hit : "-", d->library.size, d->payload_bytes,
+                       (d->flags & RG_HIT_GROUP_LSS) ? ", LSS" : "");
+  return static_cast<rg_handle>(n + 1);
+}
+
+int32_t hit_group_identifier(rg_handle h, const void* engine_identifier, void* out) {
+  if (h <= 0 || static_cast<uint32_t>(h) > g_nhg.load(std::memory_order_acquire) || !engine_identifier || !out)
+    return RG_E_ARG;
+  int32_t r = RG_E_UNAVAILABLE;
+  AcquireSRWLockShared(&g_pairs_lock);
+  for (uint32_t i = 0; i < g_npairs; ++i)
+    if (g_pairs[i].hg == static_cast<uint32_t>(h - 1) && std::memcmp(g_pairs[i].eng, engine_identifier, 32) == 0) {
+      std::memcpy(out, g_pairs[i].ours, 32);
+      r = 0;
+      break;
+    }
+  ReleaseSRWLockShared(&g_pairs_lock);
+  return r;
+}
+
+int32_t hit_group_pairs(rg_handle h, rg_rt_hit_group_pair* out, uint32_t max) {
+  if (h <= 0 || static_cast<uint32_t>(h) > g_nhg.load(std::memory_order_acquire) || (max && !out)) return RG_E_ARG;
+  int32_t n = 0;
+  AcquireSRWLockShared(&g_pairs_lock);
+  for (uint32_t i = 0; i < g_npairs; ++i) {
+    if (g_pairs[i].hg != static_cast<uint32_t>(h - 1)) continue;
+    if (static_cast<uint32_t>(n) < max) {
+      std::memcpy(out[n].engine, g_pairs[i].eng, 32);
+      std::memcpy(out[n].ours, g_pairs[i].ours, 32);
+    }
+    ++n;
+  }
+  ReleaseSRWLockShared(&g_pairs_lock);
+  return n;
+}
+
+// ---- rt_hit_records: a client's own range of the ENGINE's hit-table records (rg_hit_records) ----
+// The indices above the engine's own contributions are shared by every client that shades geometry of its own, and until
+// 2026-11-03 each such client picked its own (`199999 - 2i` in the hair mod) - a second RT client would overwrite the
+// first with no word (docs/internals.md `Known gaps` 10). The host cannot read those tables (its hit shaders have them
+// bound; no CPU-side structure holds them), so the CALLER says how many records they hold - what its own companion read
+// with GetDimensions (200001 on 2.5) - and the host does only what no client can do alone: allocate from the top down,
+// never twice, and remember whose range is whose for the swap check below.
+struct RecRange {
+  uint32_t base, count, client;  // [base, base + count)
+};
+constexpr uint32_t kMaxRecRanges = 16;
+RecRange g_recr[kMaxRecRanges];
+uint32_t g_nrecr = 0, g_recr_capacity = 0, g_recr_top = 0;
+std::mutex g_recr_mx;
+std::atomic<uint32_t> g_recr_taken{0};  // swaps refused: a contribution inside ANOTHER client's range
+std::atomic<uint32_t> g_recr_unowned{0};  // ... inside no range at all, while ranges exist (warned twice)
+
+int32_t records_alloc(uint32_t client, uint32_t count, uint32_t capacity, rg_hit_records* out) {
+  if (!out || out->struct_size < sizeof(rg_hit_records) || !count || !capacity) return RG_E_ARG;
+  if (!client) {  // a module the host cannot name: a range nobody can be charged for is not worth handing out
+    g_sdk->logger->WarnF(g_handle, "rt hit records: the caller is not a module the host knows - refused");
+    return RG_E_ARG;
+  }
+  std::lock_guard<std::mutex> lk(g_recr_mx);
+  if (!g_recr_capacity) g_recr_capacity = capacity, g_recr_top = capacity;
+  if (capacity != g_recr_capacity) {
+    g_sdk->logger->WarnF(g_handle, "rt hit records: %u records reported where the first caller said %u - refused (one "
+                                   "set of tables, one size)",
+                         capacity, g_recr_capacity);
+    return RG_E_ARG;
+  }
+  if (g_nrecr >= kMaxRecRanges || g_recr_top < count) {
+    g_sdk->logger->WarnF(g_handle, "rt hit records: no room for %u more (%u range(s), %u records left below the top)",
+                         count, g_nrecr, g_recr_top);
+    return RG_E_FULL;
+  }
+  const uint32_t base = g_recr_top - count;
+  g_recr_top = base;
+  g_recr[g_nrecr++] = {base, count, client};
+  const uint32_t ss = out->struct_size;
+  *out = {};
+  out->struct_size = ss;
+  out->base = base, out->count = count;
+  mesh_proxy::desc_high(&out->engine_high, &out->frame);
+  g_sdk->logger->InfoF(g_handle, "rt hit records: client #%u's records at [%u, %u] of %u - the engine's own scene is at "
+                                 "or below %u%s",
+                       client, base, base + count - 1, capacity, out->engine_high,
+                       out->engine_high ? "" : " (not measured: the instance desc hook is not attached)");
+  return 0;
+}
+
+// mesh_proxy_bvh_swap's contribution against the ranges: inside ANOTHER client's = refused - that is exactly the
+// collision the ranges exist for. Inside none = allowed (a swap may keep the ENGINE's contribution, and a client that
+// asked for no range keeps the pre-2026-11-03 behaviour), counted and said once: it is the state ranges are meant to end.
+int32_t records_check(uint32_t client, uint32_t contribution) {
+  bool mine = false, other = false;
+  uint32_t other_client = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_recr_mx);
+    for (uint32_t i = 0; i < g_nrecr; ++i)
+      if (contribution >= g_recr[i].base && contribution < g_recr[i].base + g_recr[i].count) {
+        if (g_recr[i].client == client) mine = true;
+        else other = true, other_client = g_recr[i].client;
+      }
+  }
+  if (other) {
+    if (g_recr_taken.fetch_add(1, std::memory_order_relaxed) < 4)
+      g_sdk->logger->ErrorF(g_handle, "rt hit records: client #%u's swap names contribution %u - that is client #%u's "
+                                      "range: its records are not ours to point a BLAS at (refused)",
+                            client, contribution, other_client);
+    return RG_E_TAKEN;
+  }
+  if (!mine && g_nrecr && g_recr_unowned.fetch_add(1, std::memory_order_relaxed) < 2)
+    g_sdk->logger->WarnF(g_handle, "rt hit records: client #%u's swap names contribution %u, which no client's range "
+                                   "holds - allowed, but those records are not checked against another client's",
+                         client, contribution);
+  return 0;
+}
+
+void hit_group_stats(rg_handle h, rg_rt_hit_group_stats* out) {
+  if (!out) return;
+  *out = {};
+  out->lss = g_lss.load(std::memory_order_acquire);
+  if (h <= 0 || static_cast<uint32_t>(h) > g_nhg.load(std::memory_order_acquire)) return;
+  const HitGroup& g = g_hg[h - 1];
+  out->collections = g.collections.load(std::memory_order_relaxed);
+  out->failed = g.failed.load(std::memory_order_relaxed);
+  out->pipelines = g.pipelines.load(std::memory_order_relaxed);
+  out->mismatches = g.mismatches.load(std::memory_order_relaxed);
+  out->uncovered = g.uncovered.load(std::memory_order_relaxed);
+  AcquireSRWLockShared(&g_pairs_lock);
+  for (uint32_t i = 0; i < g_npairs; ++i) out->identifiers += g_pairs[i].hg == static_cast<uint32_t>(h - 1);
+  ReleaseSRWLockShared(&g_pairs_lock);
+  const bool refused = (g_hg_refused.load(std::memory_order_relaxed) >> (h - 1)) & 1;
+  out->state = refused ? RG_STATE_REFUSED : out->collections ? RG_STATE_OK : RG_STATE_PENDING;
+}
 
 rg_handle variant_add(rg_handle lib, const char* raygen, const char* variant, const char* node) {
   if (!registration_open()) return RG_E_LATE;
@@ -1220,13 +2087,15 @@ void attach_rays(bool census, bool timing) {
   const bool variants = g_nvar.load() != 0 && g_attached;
   const bool timed = timing && g_attached && g_n.load() != 0;  // GPU timing on at the start + client libraries
   const bool marks = ::crash_log::dred_armed();  // DispatchRays markers for a device-removal report
-  if (!census && !variants && !timed && !marks) return;
+  const bool probe = bvh_probe::on();  // [Diagnostics] BvhProbe: its per-frame line needs the TLAS builder too
+  if (!census && !variants && !timed && !marks && !probe) return;
   g_rays_attached = attach_hook(kDispatchRays, kDispatchRaysRet, reinterpret_cast<void*>(&d_rays),
                                 reinterpret_cast<void**>(&g_orig_rays), "DispatchRays (global)");
   g_rays_census = g_rays_attached && census;
   g_marks_on = g_rays_attached && marks;
   if (g_marks_on) ::crash_log::set_extra_dump(&mark_dump);
   if (g_marks_on) attach_as();
+  else if (probe) attach_tlas_probe();
   if (g_rays_attached && variants)
     g_gsgi_attached = attach_hook(kGetShaderGroupIdentifier, kGpuDispatchRaysGsgiRet, reinterpret_cast<void*>(&d_gsgi),
                                   reinterpret_cast<void**>(&g_orig_gsgi), "GpuApi::GetShaderGroupIdentifier");
@@ -1270,7 +2139,7 @@ rg_handle add(const char* name, const uint8_t* hash16, rg_blob lib, int32_t prio
   return static_cast<rg_handle>(n + 1);
 }
 
-bool needed() { return g_n.load() != 0; }
+bool needed() { return g_n.load() != 0 || g_nhg.load() != 0; }
 
 bool info(rg_handle h, rg_blob* lib) {
   if (h <= 0 || static_cast<uint32_t>(h) > g_n.load(std::memory_order_acquire) || !lib) return false;
@@ -1289,6 +2158,21 @@ void stats(rg_handle h, rg_rtlib_stats* out) {
   out->state = l.refused ? RG_STATE_REFUSED : (out->swapped || out->added) ? RG_STATE_OK : RG_STATE_PENDING;
 }
 
+void debug_layer() {
+  HMODULE d3d12 = LoadLibraryW(L"d3d12.dll");
+  using GetDebugInterface = HRESULT(WINAPI*)(REFIID, void**);
+  auto* get = d3d12 ? reinterpret_cast<GetDebugInterface>(GetProcAddress(d3d12, "D3D12GetDebugInterface")) : nullptr;
+  ID3D12Debug* d = nullptr;
+  if (!get || FAILED(get(IID_PPV_ARGS(&d))) || !d) {
+    g_sdk->logger->Warn(g_handle, "DEV: d3d12_debug - no D3D12 debug layer (D3D12SDKLayers.dll missing?)");
+    return;
+  }
+  d->EnableDebugLayer();
+  d->Release();
+  g_debug_layer.store(true);
+  g_sdk->logger->Warn(g_handle, "DEV: d3d12_debug - the D3D12 DEBUG LAYER is on (slow): a failed RT creation logs why");
+}
+
 uint64_t baked_mask() { return g_baked.load(std::memory_order_acquire); }
 
 bool attach() {
@@ -1296,9 +2180,18 @@ bool attach() {
                    reinterpret_cast<void**>(&g_orig), "the state-object creator"))
     return false;
   g_attached = true;
-  if (g_n.load())
+  if (g_n.load() || g_nhg.load())
     g_sub_attached = attach_hook(kSubobjectAdd, kSubobjectAddLibRet, reinterpret_cast<void*>(&d_sub),
                                  reinterpret_cast<void**>(&g_orig_sub), "the state-object creator's subobject append");
+  if (g_nhg.load())
+    g_sdk->logger->InfoF(g_handle, "rt hit group: %u hit group(s) - %s", g_nhg.load(),
+                         g_sub_attached ? "ADDED to the engine's collections by payload size" : "NOT used (hook failed)");
+  // Before InitDevice's body: the pipeline options are set there, before any state object exists.
+  // The driver's function first (every caller); the engine's InitDevice call site alone is the fallback.
+  if (lss_wanted())
+    g_pso_attached = attach_pso_driver() ||
+                     attach_hook(kNvSetCreatePsoOptions, kNvSetCreatePsoOptionsRet, reinterpret_cast<void*>(&d_pso_options),
+                                 reinterpret_cast<void**>(&g_orig_pso), "NvAPI_D3D12_SetCreatePipelineStateOptions (LSS)");
   g_sdk->logger->InfoF(g_handle, "rt swap: %u raygen variant(s) - their libraries %s; libraries without variants %s",
                        g_nvar.load(), g_sub_attached ? "ADDED next to the engine's" : "NOT used (hook failed)",
                        g_sub_attached ? "SWAPPED in the subobject list (no lock)" : "NOT used (hook failed)");
@@ -1311,6 +2204,12 @@ bool attach() {
 }
 
 void detach() {
+  if (g_pso_attached) {
+    if (g_driver_pso) g_sdk->hooking->Detach(g_handle, g_driver_pso);
+    else detach_hook(kNvSetCreatePsoOptions);
+  }
+  g_pso_attached = false;
+  g_driver_pso = nullptr;
   if (g_sub_attached) detach_hook(kSubobjectAdd);
   if (g_attached) detach_hook(kCreateStateObject);
   g_attached = g_sub_attached = false;

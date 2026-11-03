@@ -78,6 +78,8 @@ add_library(redgraph SHARED
   src/core/rt_lib.cpp
   src/core/blas_census.cpp
   src/core/mesh_proxy.cpp
+  src/core/bvh_probe.cpp
+  src/core/bvh_probe.hpp
   src/core/passes.cpp
   src/core/graph_probe.cpp
   src/core/graph_debug.cpp
@@ -135,6 +137,8 @@ if(RG_BUILD_SELFTEST)
     selftest/hlsl_test.cpp
     selftest/reload_test.cpp
     selftest/readback_test.cpp
+selftest/bvh_swap_test.cpp
+selftest/hit_records_test.cpp
     selftest/sky_paint_shader.hpp
     selftest/lease_tex_shader.hpp
     selftest/draw_lease_shader.hpp

@@ -203,8 +203,9 @@ struct DrawSub {
 DrawSub g_dsubs[kMaxDrawSubs];
 std::atomic<uint32_t> g_ndsubs{0};
 
-// The draw being reported on this thread, while its subscriptions run (requests are accepted only then).
-constexpr uint32_t kMaxDrawRequests = 4;
+// The draw being reported on this thread, while its subscriptions run (requests are accepted only then). Every draw
+// companion one engine PSO carries must fit here too, or the per-PSO cap would promise more than a draw can record.
+constexpr uint32_t kMaxDrawRequests = pso::kMaxDrawCompsPerPso;
 struct DrawNow {
   uint8_t* ctx;
   ID3D12PipelineState* engine;
@@ -218,6 +219,7 @@ struct DrawNow {
 };
 thread_local DrawNow t_draw{};
 std::atomic<uint64_t> g_draws_seen{0}, g_dcomp_done{0}, g_dafter_done{0}, g_draw_reentry{0};
+std::atomic<uint32_t> g_drawreq_full{0};  // requests refused by kMaxDrawRequests (logged: the first 4)
 
 }  // namespace
 
@@ -522,7 +524,14 @@ bool has_draw_subs() { return g_ndsubs.load() != 0; }
 
 uint32_t draw_companion_request(rg_handle h) {
   DrawNow& d = t_draw;
-  if (!d.active || d.ncomp >= kMaxDrawRequests) return 0;
+  if (!d.active || d.ncomp >= kMaxDrawRequests) {
+    // Silent until 2026-11-01: a companion past the cap was simply not drawn, with no word anywhere.
+    if (d.active && g_drawreq_full.fetch_add(1, std::memory_order_relaxed) < 4)
+      g_sdk->logger->WarnF(g_handle, "pso swap: draw companion #%d NOT recorded - this draw already carries %u, the most "
+                            "one draw can (kMaxDrawRequests)%s", h, d.ncomp,
+                            g_drawreq_full.load(std::memory_order_relaxed) == 4 ? " - further ones not logged" : "");
+    return 0;
+  }
   for (uint32_t i = 0; i < d.ncomp; ++i)
     if (d.comp[i] == h) return 1;  // once per draw
   ID3D12PipelineState* pso = pso::draw_companion_of(d.engine, h);

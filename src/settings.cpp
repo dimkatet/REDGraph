@@ -43,6 +43,10 @@ const Def kDefs[] = {
     // Every skinned mesh render proxy's own chunk table (render mask per chunk, its materials), once per mesh, as
     // [proxy] (core/mesh_proxy_census, docs/plan-mesh-proxy.md). Read only. At the start only.
     {"Diagnostics", "MeshProxyCensus", false, "mesh proxy census"},
+    // A proxy's TLAS instance from both sides (core/bvh_probe): the desc WRITES of the proxies a client gave a BLAS to,
+    // every TLAS BUILD with its instance buffer and its collector, every DispatchRays with its call site - one [bvh] line
+    // a frame while that frame's summary changes. Read only. At the start only.
+    {"Diagnostics", "BvhProbe", false, "BVH / view probe"},
     // The frame time every 10 s as [frame] (core/prof) - an on/off A/B of any feature against its own log's switches.
     {"Diagnostics", "FrameTimer", true, "frame timer"},
     // The A/B profile (core/ab): Game.RG_AB(switches, block, settle, pairs) switches clients' features off / on in

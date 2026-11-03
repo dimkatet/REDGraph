@@ -15,6 +15,7 @@
 
 #include "rg_host.h"
 #include "core/ab.hpp"
+#include "core/bvh_probe.hpp"
 #include "core/engine_blocks.hpp"
 #include "core/crash_log.hpp"
 #include "core/graph_debug.hpp"
@@ -63,6 +64,9 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle handle, RED4ex
     float proxies = 0.0f;
     rg_settings::get("Diagnostics.MeshProxyCensus", &proxies);
     if (proxies > 0.5f) core::mesh_proxy::enable_census();
+    float bvh = 0.0f;
+    rg_settings::get("Diagnostics.BvhProbe", &bvh);
+    if (bvh > 0.5f) core::bvh_probe::enable();  // before attach: rt_lib adds the TLAS hook to its DispatchRays one
     float reload = 0.0f;
     rg_settings::get("Dev.ShaderHotReload", &reload);
     if (reload > 0.5f) core::shader_reload::enable(rg_settings::text("Dev.ShaderReloadDir"));  // before attach

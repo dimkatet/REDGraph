@@ -15,7 +15,7 @@ namespace core::clients {
 
 enum Kind : uint8_t {
   kPatch, kPatchScope, kCompanion, kCompanionScope, kLease, kCbuffer, kFeed, kView, kRtLib, kRtVariant, kPass,
-  kSubscribe, kDeviceReady, kFlow, kNode, kNodeUse, kNodeAlloc, kWrap, kRemove, kPatchState, kWrapUse, kDrawSubscribe, kDrawCompanion, kDrawCompanionScope, kCensusWatch, kEngineBlock, kAbSwitch, kMeshProxy, kKinds
+  kSubscribe, kDeviceReady, kFlow, kNode, kNodeUse, kNodeAlloc, kWrap, kRemove, kPatchState, kWrapUse, kDrawSubscribe, kDrawCompanion, kDrawCompanionScope, kCensusWatch, kEngineBlock, kAbSwitch, kMeshProxy, kRtHitGroup, kKinds
 };
 
 // A client reached the table: rg_host_get from module of `addr`, or the host ran its waiting init `fn`.
@@ -57,12 +57,16 @@ std::string client_of(Kind kind, rg_handle h);
 // One handle space per kind of object (node_alloc returns a flow handle: the flow space).
 enum Space : uint8_t {
   sPatch, sCompanion, sCbuffer, sLease, sView, sRtLib, sRtVariant, sPass, sSubscribe, sFlow, sNode, sWrap, sRemove,
-  sDrawSubscribe, sDrawCompanion, sMeshProxy, kSpaces
+  sDrawSubscribe, sDrawCompanion, sMeshProxy, sRtHitGroup, kSpaces
 };
 // 0 = the call returning to `ret` comes from the client that made handle h; RG_E_FOREIGN = another client's;
 // RG_E_ARG = no such handle. A failure is logged (the first few) with `call` and handed to reason(). Lock-free: cheap
 // enough for the [hot] entries (a scan of the clients' module ranges).
 int32_t owner_check(const void* ret, Space s, rg_handle h, const char* call);
+// The same return-address lookup WITHOUT a handle: the client (index + 1, 0 = a module the host does not know) a call
+// came from - for the entries that hand something OUT per client rather than authorise a handle (rt_hit_records: one
+// range of hit-table records per client, so two of them cannot pick the same indices). Cheap enough for a [hot] entry.
+uint32_t client_at(const void* ret);
 
 // The CET tab (tab-separated lines, format in clients.cpp) and a summary for the log / status report.
 std::string report();

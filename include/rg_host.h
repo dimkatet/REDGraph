@@ -276,6 +276,16 @@ typedef uint32_t (*rg_ab_get_fn)(void* user);  /* 1 = on now (restored at the en
  * mask has the bit it asks for. */
 #define RG_MCF_RENDER_IN_SCENE 1u   /* every scene pass (G-buffer, hair, forward, ...) */
 #define RG_MCF_RENDER_IN_SHADOWS 2u /* the shadow passes */
+/* Not an engine bit: the whole proxy (any chunk in chunk_bits) out of the RAY-TRACED scene - its TLAS instance mask is
+ * 0 from the engine's next instance update (every frame), so no ray (RT / PT shadows, reflections, GI) hits it. Per
+ * proxy, not per chunk: the instance holds every chunk of its LOD. */
+#define RG_MCF_OUT_OF_BVH 0x80000000u
+/* mesh_proxy_subscribe_flags (2026-11-03): what a subscription needs beyond the CREATED / DESTROYED events.
+ * RG_MPF_NEEDS_BVH: the TLAS instance descs of its proxies (RG_MCF_OUT_OF_BVH, mesh_proxy_bvh_swap, mesh_proxy_bvh_desc,
+ * and rg_hit_records.engine_high, which is measured there). The host edits every instance desc of the scene each frame
+ * (~78k calls) to serve those, so a client that only hides chunks leaves the hook off with mesh_proxy_subscribe (the
+ * older call = no flags): its RG_MCF_OUT_OF_BVH hides then apply to nothing and answer RG_E_UNAVAILABLE. */
+#define RG_MPF_NEEDS_BVH 1u
 enum rg_mesh_proxy_event { RG_MESH_PROXY_CREATED = 0, RG_MESH_PROXY_DESTROYED = 1 };
 typedef struct rg_mesh_proxy_info {
   uint32_t struct_size;  /* sizeof(rg_mesh_proxy_info) - fields are only ever appended */
@@ -306,6 +316,9 @@ typedef struct rg_mesh_proxy_frame {
   uint32_t local_to_world[12]; /* the proxy's LocalToWorld as the engine copies it into the instance buffer:
                                   3 float4 columns, .w = the translation as int32, 2^-17 m */
 } rg_mesh_proxy_frame;
+/* struct_size of the 2026-10-31 layout (everything above without local_to_world): mesh_proxy_frame accepts it and
+ * writes no transform - a caller built before the field was appended keeps working. */
+#define RG_MESH_PROXY_FRAME_V1 16u
 
 /* buffer_create flags */
 #define RG_BUFFER_UAV 1u  /* D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS */
@@ -321,7 +334,8 @@ typedef struct rg_vram_stats {
   uint32_t own_buffers;
   uint32_t uploads_pending;        /* copies not submitted yet (the next frames') */
   uint64_t upload_pending_bytes;
-  uint32_t retire_pending;         /* resources waiting for their fence (retire + the copies' staging) */
+  uint32_t retire_pending;         /* resources waiting for their fence (retire + the copies' staging), a BLAS held for a
+                                      live swap's mesh_proxy_bvh_retire included */
   uint32_t pad;
   uint64_t frame;                  /* the host's frame (one per graph execution) */
   uint64_t fence_completed;        /* the host's fence on the direct queue: the last frame the GPU finished */
@@ -387,6 +401,107 @@ typedef struct rg_rt_variant_stats {
   uint32_t on;
   uint32_t pad;
 } rg_rt_variant_stats;
+
+/* ---- 2026-11-01: a client's HIT GROUP in the engine's hit-group COLLECTIONS ----
+ * The engine keeps its closest-hit / any-hit shaders in a few COLLECTIONS (state objects every RT pipeline links), one
+ * per ray payload format. A client's hit group goes into every collection whose payload has payload_bytes: its library
+ * (only the named exports, renamed per collection) and a TRIANGLES hit group after the engine's; the collection's
+ * shader config and global / local root signatures apply to it by default. So the client's shaders declare the ENGINE's
+ * registers - the local ones (cb0 space200: 4 u32; t0 / t1 space200: raw buffers at the record's two addresses) and
+ * any global ones the engine's hit shaders use (t3 HairProfilesGradients, t12 materialParamBuffer, cb6 ...) - and the
+ * payload of that format. */
+#define RG_HIT_GROUP_LSS 1u /* rg_rt_hit_group_desc.flags: the group's geometry is NVAPI linear swept spheres - the
+                               host asks the driver for LSS support in every RT pipeline the engine creates
+                               (rg_rt_hit_group_stats.lss: whether it took) */
+typedef struct rg_rt_hit_group_desc {
+  uint32_t struct_size;    /* sizeof(rg_rt_hit_group_desc) */
+  uint32_t payload_bytes;  /* the target: every engine collection whose ray payload is this many bytes */
+  uint32_t flags;          /* RG_HIT_GROUP_* */
+  uint32_t pad;
+  const char* closest_hit; /* an export of `library` (the unmangled function name), NULL = none */
+  const char* any_hit;     /* NULL = none */
+  rg_blob library;         /* a DXIL library (lib_6_3 or later); only the two exports above are taken */
+} rg_rt_hit_group_desc;
+typedef struct rg_rt_hit_group_stats {
+  uint32_t state;        /* rg_state: OK once in a collection, REFUSED */
+  uint32_t collections;  /* collection creations with it */
+  uint32_t failed;       /* collection creations that failed with it - rebuilt vanilla (without it) */
+  uint32_t pipelines;    /* RT pipeline creations that link a collection with it (its identifier read there) */
+  uint32_t identifiers;  /* engine hit-group identifiers mapped to one of ours (rt_hit_group_identifier) */
+  uint32_t mismatches;   /* an engine identifier seen with two different identifiers of ours - should stay 0 */
+  uint32_t lss;          /* 1 = the driver took LSS support for the engine's RT pipelines (any RG_HIT_GROUP_LSS) */
+  uint32_t uncovered;    /* 2026-11-03: RT pipeline creations that link a collection with payload_bytes WITHOUT the
+                            group (it was not added there, or was rebuilt out) - a ray of such a pipeline that hits a
+                            record with the group's identifier runs no shader of it; should stay 0 */
+} rg_rt_hit_group_stats;
+/* rt_hit_group_pairs: one mapped pair - an ENGINE hit group's identifier and the client group's from the same
+ * collection. */
+typedef struct rg_rt_hit_group_pair {
+  uint8_t engine[32];
+  uint8_t ours[32];
+} rg_rt_hit_group_pair;
+
+/* ---- 2026-11-03: a client's own RECORDS in the engine's HIT TABLES (rt_hit_records) ----
+ * The engine keeps the records its hit shaders read in three tables of 64-byte entries (the buffers bound at a hit
+ * group's t0 / t1 space200), indexed by an instance's InstanceContributionToHitGroupIndex + the ray's own
+ * RayContributionToHitGroupIndex (0..2). A client that shades its own geometry writes records of its own there and
+ * points a swapped instance's contribution at them - and until 2026-11-03 every such client picked the indices ITSELF
+ * (`199999 - 2i` in the first one), so two RT clients in one game overwrite each other with no word. This entry hands
+ * the indices out: from the TOP of the tables downwards, one range per call, never twice, and remembers whose each range
+ * is - `mesh_proxy_bvh_swap` refuses a contribution inside ANOTHER client's range (RG_E_TAKEN).
+ * `capacity`: how many records the tables have (game 2.5: 200001), which the CALLER read off the engine (GetDimensions
+ * of the table buffers it is bound to, in its own shader) - the host never reads the engine's tables and does not guess
+ * them; a call naming another capacity than the first one is refused. */
+typedef struct rg_hit_records {
+  uint32_t struct_size;  /* the caller sets sizeof(rg_hit_records) */
+  uint32_t base;         /* the range's FIRST record index; the last is base + count - 1 */
+  uint32_t count;        /* records in the range, as asked */
+  uint32_t engine_high;  /* the highest contribution the ENGINE's own instance descs carried (0 = not looked: the
+                            instance desc hook is not attached) - a client's records belong above it */
+  uint32_t frame;        /* the render frame engine_high was read in (0 = never) */
+  uint32_t pad;
+} rg_hit_records;
+
+/* ---- 2026-11-01: a proxy's TLAS INSTANCE with the client's geometry (mesh_proxy_bvh_swap) ----
+ * The engine writes every instance desc of the scene on the CPU, every frame (D3D12_RAYTRACING_INSTANCE_DESC). A swap
+ * edits the proxy's desc after the engine wrote it: its BLAS, its hit-group contribution (the first record of the
+ * hit tables a ray that hits it runs), its instance flags, optionally its InstanceMask. Transform and InstanceID stay
+ * the engine's - so the client's BLAS is in the proxy's own object space (rg_bvh_desc.transform says which that is). */
+typedef struct rg_bvh_swap {
+  uint32_t struct_size;   /* sizeof(rg_bvh_swap) */
+  uint32_t contribution;  /* InstanceContributionToHitGroupIndex (24 bits) */
+  uint32_t flags_set;     /* D3D12_RAYTRACING_INSTANCE_FLAGS to set (8 bits; 4 = FORCE_OPAQUE) ... */
+  uint32_t flags_clear;   /* ... and to clear (8 = FORCE_NON_OPAQUE) */
+  uint64_t blas;          /* the BLAS GPU address (a client's, in its RAYTRACING_ACCELERATION_STRUCTURE state) */
+  uint32_t mask;          /* 2026-11-01: 0 = the engine's InstanceMask; RG_BVH_MASK | m = InstanceMask m (0..0xff) */
+  uint32_t reserved;
+} rg_bvh_swap;
+#define RG_BVH_MASK 0x100u
+/* mesh_proxy_bvh_desc: the proxy's instance desc as the ENGINE last wrote it (before any swap or hide). */
+typedef struct rg_bvh_desc {
+  uint32_t struct_size;   /* the caller sets sizeof(rg_bvh_desc) */
+  uint32_t frame;         /* the render frame it was written in (0 = never seen since asked) */
+  uint32_t instance_id;   /* 24 bits */
+  uint32_t mask;          /* InstanceMask */
+  uint32_t contribution;  /* InstanceContributionToHitGroupIndex */
+  uint32_t flags;         /* D3D12_RAYTRACING_INSTANCE_FLAGS */
+  float transform[12];    /* 3x4, row-major, as the desc has it */
+  uint64_t blas;
+  uint64_t swapped;       /* descs written with a swap of this proxy so far */
+  uint32_t applied_mask;  /* 2026-11-03: the InstanceMask the host WRITES into the running desc - `mask` above after a
+                             swap's RG_BVH_MASK override, and 0 while the proxy is OUT OF THE BVH
+                             (RG_MCF_OUT_OF_BVH, which a live swap's own mask overrides). `mask` stays the ENGINE's, as
+                             it always was: a client that swaps needs the engine's to keep it. The OBSERVABLE of both
+                             mechanisms without a GPU readback. */
+  uint32_t applied_flags; /* 2026-11-03: the D3D12_RAYTRACING_INSTANCE_FLAGS the host WRITES into the running desc -
+                             `flags` above with a live swap's flags_set / flags_clear applied (2.5's own 0x02 |
+                             FORCE_OPAQUE, say), and the ENGINE's while no swap is on (out of the BVH the flags stay:
+                             only the mask is zeroed). `flags` stays the ENGINE's, as `mask` does. It was `pad`, so the
+                             layout is unchanged and no client's offsets move (BvhSwapTest reads it). */
+} rg_bvh_desc;
+/* struct_size of the 2026-11-01 layout (everything above without `swapped`): mesh_proxy_bvh_desc accepts it and writes
+ * up to what the caller's size holds, so appending a field never breaks an older client. */
+#define RG_BVH_DESC_V1 80u
 /* ---- M9: an ENGINE node's work, removed (docs/internals.md "Removing an engine node") ---- */
 typedef struct rg_remove_stats {
   uint32_t attached;  /* 1 = the graph-builder hook is live */
@@ -765,12 +880,14 @@ typedef struct rg_host {
   /* Takes `flags` (RG_MCF_*) out of the render masks of the chunks in chunk_bits (bit = rg_mesh_chunk_info.chunk) of a
    * proxy your subscription was told about; 0 bits or 0 flags = back to the engine's own. Per subscription: the
    * proxy's masks = the engine's minus every subscription's flags on its chunks. Lands at the proxy's next
-   * collection (the next frame); kept until changed or the proxy dies. Any thread. 0 = ok, RG_E_ARG (not a live proxy
-   * of yours), RG_E_FOREIGN. [hot] */
+   * collection (the next frame); kept until changed or the proxy dies. RG_MCF_OUT_OF_BVH: the whole proxy out of the
+   * ray-traced scene while any subscription has it on any chunk (RG_E_UNAVAILABLE when that hook is not attached -
+   * the render-mask flags still apply). Any thread. 0 = ok, RG_E_ARG (not a live proxy of yours), RG_E_FOREIGN. [hot] */
   int32_t (*mesh_proxy_hide)(rg_handle subscription, rg_handle proxy, uint64_t chunk_bits, uint32_t flags);
   /* The proxy NOW (rg_mesh_proxy_frame): its transform and whether / in which collections the engine took it into the
-   * scene this frame - per frame, without drawing it. 0 = ok, RG_E_ARG (not a live proxy, struct_size too small).
-   * Any thread. [hot] */
+   * scene this frame - per frame, without drawing it. struct_size RG_MESH_PROXY_FRAME_V1 (or anything up to the current
+   * size) is accepted: the fields it does not cover are left unwritten, so a client built before a field was appended
+   * keeps working. 0 = ok, RG_E_ARG (not a live proxy, struct_size below RG_MESH_PROXY_FRAME_V1). Any thread. [hot] */
   int32_t (*mesh_proxy_frame)(rg_handle proxy, rg_mesh_proxy_frame* out);
 
   /* 2026-10-31: a client's own ASSETS in VRAM, and their lifetime by a GPU fence. The host keeps a fence on the
@@ -802,6 +919,65 @@ typedef struct rg_host {
    * Not AddRef'd: read them at once and guarded (the engine releases a swapped-out material between frames). 0 = ok,
    * RG_E_ARG (not a live proxy, no such chunk), RG_E_UNAVAILABLE. Any thread. Check struct_size. [hot] */
   int32_t (*mesh_proxy_material)(rg_handle proxy, uint32_t chunk, uint32_t lod, void** material, void** params);
+
+  /* 2026-11-01: a client's HIT GROUP in the engine's collections (rg_rt_hit_group_desc). `name`: the group's export
+   * name - "<mod>_<name>", ASCII letters, digits and '_', up to 40; the host appends the collection's tag. A handle,
+   * RG_E_ARG, RG_E_FULL (8 in all), RG_E_TAKEN (the name), RG_E_LATE after registration. Register-time. Check
+   * struct_size before calling any of the three.
+   * rt_hit_group_identifier: the 32-byte shader identifier of the group, from the collection that holds the ENGINE
+   * hit group whose identifier is `engine_identifier` (32 bytes - e.g. read off the engine's hit tables): what to write
+   * into a record the engine filled with that identifier. Identifiers of a collection's exports are the same in every
+   * pipeline that links it (the host counts a mismatch). 0 = *out written; RG_E_ARG; RG_E_UNAVAILABLE = no pipeline
+   * linking such a collection was created yet (or the group is not in it). Any thread. [hot] */
+  rg_handle (*rt_hit_group)(const char* name, const rg_rt_hit_group_desc* desc);
+  int32_t (*rt_hit_group_identifier)(rg_handle group, const void* engine_identifier, void* out);
+  void (*rt_hit_group_stats)(rg_handle group, rg_rt_hit_group_stats* out);
+
+  /* 2026-11-01: every (engine identifier, ours) pair mapped for the group so far (rg_rt_hit_group_pair): fills up to
+   * max, returns the count (max 0 = just the count); RG_E_ARG. Grows as the engine creates pipelines - a client that
+   * hands the pairs to the GPU (to recognise the engine's records there) re-reads when the count changed. Any thread.
+   * Check struct_size before calling any of the three below. */
+  int32_t (*rt_hit_group_pairs)(rg_handle group, rg_rt_hit_group_pair* out, uint32_t max);
+  /* The proxy's TLAS instance with the client's BLAS (rg_bvh_swap) from the engine's next instance update (every
+   * frame), until called with NULL or the proxy dies; wins over RG_MCF_OUT_OF_BVH. BLAS, contribution, flags and mask
+   * go into a desc together, never one call's BLAS with another's records. The client keeps the BLAS built, and the
+   * records at the contribution valid, while the swap is on - a ray that hits the BLAS runs whatever is there - AND
+   * after it: a swap ended (NULL, another BLAS, the proxy's death) is still in the TLAS of the frames already recorded,
+   * so free a BLAS, and anything its records point at, only through mesh_proxy_bvh_retire. One swap per proxy: the
+   * subscription that set it owns it until it ends it (its own calls replace it); another subscription's gets
+   * RG_E_TAKEN. Any thread. 0 = ok, RG_E_ARG (not a live proxy of your subscription, struct_size too small),
+   * RG_E_TAKEN, RG_E_UNAVAILABLE (the instance desc hook is not attached), RG_E_FOREIGN. [hot] */
+  int32_t (*mesh_proxy_bvh_swap)(rg_handle subscription, rg_handle proxy, const rg_bvh_swap* swap);
+  /* The proxy's instance desc as the engine last wrote it (rg_bvh_desc). The first call starts recording it (frame 0
+   * until the next update). struct_size RG_BVH_DESC_V1 or larger is accepted and only the fields the caller's size holds
+   * are written (an older client gets no `swapped`). 0 = ok, RG_E_ARG (not a live proxy, struct_size below
+   * RG_BVH_DESC_V1), RG_E_UNAVAILABLE. Any thread. [hot] */
+  int32_t (*mesh_proxy_bvh_desc)(rg_handle proxy, rg_bvh_desc* out);
+
+  /* 2026-11-03: retire (as `retire` above: the reference is the host's from the call on) a resource a TLAS instance
+   * may still carry - a BLAS whose mesh_proxy_bvh_swap ended, the buffers its hit records read. The engine rewrites
+   * every instance desc each render frame; the host hands the resource to the fence retire once a full frame of descs
+   * was written after the call (none of them carries a swap ended before it), so no TLAS built since or still on the
+   * GPU references it. A buffer that is still some live swap's BLAS is held (and logged) until that swap ends - end the
+   * swap first; the buffers a hit record reads the host cannot see, so their swap must end first too. While no desc is
+   * written (ray tracing off) it waits. Any thread; NULL is ignored. Check struct_size. */
+  void (*mesh_proxy_bvh_retire)(void* d3d12_resource);
+
+  /* 2026-11-03: THIS client's own range of hit-table records (rg_hit_records) - the indices its records may live at,
+   * handed out so two RT clients cannot pick the same ones (the region above the engine's own contributions is shared
+   * by every client that shades its own geometry). One range per call, from the top of the tables downwards, kept for
+   * the session; how a client lays its records out in it (one per geometry, a pair per pool slot, ...) is its own.
+   * `capacity` the caller's own reading of the tables (see rg_hit_records). Any thread, any time (a call after the
+   * device sees rg_hit_records.engine_high; a client asks once). 0 = ok, RG_E_ARG (count 0, bad out, a capacity other
+   * than the first call's, a caller the host cannot name), RG_E_FULL (no room left). */
+  int32_t (*rt_hit_records)(uint32_t count, uint32_t capacity, rg_hit_records* out);
+
+  /* 2026-11-03: as mesh_proxy_subscribe, plus what the subscription NEEDS (RG_MPF_*) - the older call is this one with
+   * flags 0. RG_MPF_NEEDS_BVH is what attaches the instance-desc hook: without it RG_MCF_OUT_OF_BVH hides apply to
+   * nothing, mesh_proxy_bvh_swap / _desc answer RG_E_UNAVAILABLE and rg_hit_records.engine_high stays 0. Same returns
+   * and rules as mesh_proxy_subscribe; an unknown flag bit is RG_E_ARG. Register-time. */
+  rg_handle (*mesh_proxy_subscribe_flags)(const char* name, const uint64_t* mesh_hashes, uint32_t count,
+                                          rg_mesh_proxy_fn fn, void* user, uint32_t flags);
 } rg_host;
 
 RG_HOST_EXPORT const rg_host* rg_host_get(uint32_t version);
