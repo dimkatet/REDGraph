@@ -293,6 +293,11 @@ capability, not a side effect of the engine's own call: the detour adds the bit 
 `NvAPI_D3D12_SetCreatePipelineStateOptions` when it makes one (it does only with OMM on), and when it does not the host
 makes the call itself, once, at the first state object (`lss_apply_once`) - before the first pipeline that carries the
 group. It is device-global: every RT pipeline created afterwards has LSS, and the log says which call turned it on.
+**Only on a GPU that reports LSS** (`lss_check_caps`, 0.6.1): the caps are asked once of the very device the options
+are set on - `NvAPI_D3D12_GetRaytracingCaps` (0x85a6c2a0) through the driver's own `nvapi_QueryInterface`, type
+`LINEAR_SWEPT_SPHERES` (6), bit 0 `STANDARD`. A card without it (or a machine without `nvapi64.dll`) never gets the bit -
+an older card that did crashed with `DRIVER_INTERNAL_ERROR` - and `lss_wanted()` is false for good; the hit groups stay
+registered and are plain triangle groups there.
 `[dev]` flag file `d3d12_debug`: the debug layer, and a failed creation logs the runtime's reasons.
 
 The client shades with the ENGINE's registers (the local cb0 / t0 / t1 space200 of a record, the global tables) and

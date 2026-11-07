@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.1
+
+- Fixed: a GPU crash on cards without linear swept spheres (an alpha tester, an older card: `DEVICE REMOVED
+  0x887a0020 DRIVER_INTERNAL_ERROR`). The LSS pipeline option (`RG_HIT_GROUP_LSS`) was added to every RT pipeline
+  whenever a client had registered an LSS hit group, with no look at what the GPU can do - and a driver that does not
+  report LSS must never get the bit ("behavior is undefined"). The host now asks the device once, through the driver's
+  own `NvAPI_D3D12_GetRaytracingCaps` (`CAPS_TYPE_LINEAR_SWEPT_SPHERES`, `CAP_STANDARD`), at the first call that would
+  set the option (the engine's own, or the host's `lss_apply_once`); on a "no" - or no `nvapi64.dll` at all - the option
+  is never set and the log says so (`this GPU does NOT report linear swept spheres`). The hit groups stay registered
+  as plain triangle groups, so a client may put ordinary triangle geometry through them there (Cyberpunk Hair
+  Overhaul's ribbon BLAS does). `rg_rt_hit_group_stats.lss` stays "the driver took the option" (0 on such a card).
+  No API change.
+
 ## 0.6.0
 
 - For mod developers: `mesh_proxy_subscribe_flags(name, meshes, count, fn, user, flags)` - a mesh-proxy subscription

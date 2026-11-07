@@ -411,7 +411,8 @@ typedef struct rg_rt_variant_stats {
  * any global ones the engine's hit shaders use (t3 HairProfilesGradients, t12 materialParamBuffer, cb6 ...) - and the
  * payload of that format. */
 #define RG_HIT_GROUP_LSS 1u /* rg_rt_hit_group_desc.flags: the group's geometry is NVAPI linear swept spheres - the
-                               host asks the driver for LSS support in every RT pipeline the engine creates
+                               host asks the driver for LSS support in every RT pipeline the engine creates - but
+                               only when the GPU reports LSS (0.6.1; else the group is a plain triangle group)
                                (rg_rt_hit_group_stats.lss: whether it took) */
 typedef struct rg_rt_hit_group_desc {
   uint32_t struct_size;    /* sizeof(rg_rt_hit_group_desc) */

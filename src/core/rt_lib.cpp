@@ -1695,11 +1695,44 @@ bool g_pso_attached = false;
 std::atomic<bool> g_engine_lss{false};  // the ENGINE's call went out with our bit (its own OMM option + LSS)
 std::atomic<bool> g_own_lss{false};     // the host's own call: tried once, `g_lss` says whether the driver took it
 
+// 2026-11-06 (an alpha tester's crash: GPU crash report, DEVICE REMOVED 0x887a0020 DRIVER_INTERNAL_ERROR, an older
+// card): the LSS pipeline option was added to every pipeline whenever a client had registered an LSS hit group, with no
+// look at what the GPU can do. LSS is a Blackwell-era feature (R570+); a driver that does not report it must never get
+// the bit - "behavior is undefined". The caps are asked once, of the very device the options are set on, through the
+// driver's own nvapi_QueryInterface (NvAPI_D3D12_GetRaytracingCaps 0x85a6c2a0, CAPS_TYPE_LINEAR_SWEPT_SPHERES = 6,
+// CAP_STANDARD = bit 0). `lss_wanted()` below is false for good once the answer is "no".
+std::atomic<int> g_lss_caps{0};  // 0 = not asked yet, 1 = the device has LSS, -1 = it does not
+void lss_check_caps(void* device) {
+  if (g_lss_caps.load(std::memory_order_acquire) != 0 || !device) return;
+  using Query_t = void* (*)(uint32_t);
+  using Caps_t = int (*)(void*, int, void*, size_t);
+  HMODULE nv = GetModuleHandleW(L"nvapi64.dll");
+  const auto q = nv ? reinterpret_cast<Query_t>(GetProcAddress(nv, "nvapi_QueryInterface")) : nullptr;
+  const auto caps = q ? reinterpret_cast<Caps_t>(q(0x85a6c2a0)) : nullptr;
+  uint32_t lss = 0;
+  int st = -1;
+  bool ok = false;
+  if (caps) {
+    st = caps(device, 6, &lss, sizeof lss);
+    ok = st == 0 && (lss & 1u);
+  }
+  g_lss_caps.store(ok ? 1 : -1, std::memory_order_release);
+  if (ok)
+    g_sdk->logger->InfoF(g_handle, "rt hit group: the GPU reports linear swept spheres (caps 0x%x) - LSS pipelines allowed",
+                         lss);
+  else
+    g_sdk->logger->WarnF(g_handle, "rt hit group: this GPU does NOT report linear swept spheres (NvAPI %d, caps 0x%x%s) - "
+                         "the LSS pipeline option is NEVER set; strands stay out of the BVH", st, lss,
+                         caps ? "" : ", no GetRaytracingCaps");
+}
+
 int d_pso_options(void* device, uint32_t* params) {
   g_pso_calls.fetch_add(1, std::memory_order_relaxed);
   if (!params || params[0] != kNvPsoOptionsVer ||
       reinterpret_cast<uintptr_t>(_ReturnAddress()) != g_base + kNvSetCreatePsoOptionsRet)
     return g_orig_pso(device, params);
+  lss_check_caps(device);
+  if (g_lss_caps.load(std::memory_order_acquire) < 0) return g_orig_pso(device, params);
   const uint32_t flags = params[1];
   params[1] = flags | kNvPsoLss;
   const int r = g_orig_pso(device, params);
@@ -1751,6 +1784,7 @@ void caller_of(const void* addr, char* out, size_t cap) {
 bool lss_wanted();
 int d_pso_driver(void* device, uint32_t* params) {
   if (!params || params[0] != kNvPsoOptionsVer) return g_orig_pso(device, params);
+  lss_check_caps(device);  // `lss_wanted()` is false from here on a GPU without LSS
   char who[128];
   caller_of(_ReturnAddress(), who, sizeof who);
   const uint32_t flags = params[1];
@@ -1828,6 +1862,11 @@ void lss_apply_once() {
                          "object (the hit group's LSS geometry has no pipeline option)");
     return;
   }
+  lss_check_caps(dev);
+  if (g_lss_caps.load(std::memory_order_acquire) < 0) {
+    dev->Release();
+    return;
+  }
   uint32_t params[2] = {kNvPsoOptionsVer, kNvPsoLss};  // the LSS bit alone: the engine set nothing for us to keep
   const int r = g_orig_pso(dev, params);
   dev->Release();
@@ -1844,6 +1883,7 @@ void lss_apply_once() {
 }
 
 bool lss_wanted() {
+  if (g_lss_caps.load(std::memory_order_acquire) < 0) return false;  // the GPU has no LSS (lss_check_caps)
   for (uint32_t i = 0; i < g_nhg.load(std::memory_order_acquire); ++i)
     if (g_hg[i].flags & RG_HIT_GROUP_LSS) return true;
   return false;
