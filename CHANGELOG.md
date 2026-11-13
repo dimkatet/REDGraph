@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- For mod developers: RenderFlow resources by name are no longer capped (was 16, shared by every client:
+  `flow_register`, and the names `node_alloc` publishes). A client that shows engine buffers as debug views reads one
+  name per buffer and ran into the cap at 17 (`RG_E_FULL`). A handle is an index into the table and nothing walks it
+  per frame, so its length has no cost while rendering; entries are added only while registration is open. No ABI
+  change; API version stays 1 (an older REDGraph still answers `RG_E_FULL` at 16, so a mod can check).
+
 ## 0.6.1
 
 - Fixed: a GPU crash on cards without linear swept spheres (an alpha tester, an older card: `DEVICE REMOVED

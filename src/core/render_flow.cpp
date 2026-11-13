@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <mutex>
 
 #include <RED4ext/CName.hpp>
@@ -143,7 +144,6 @@ uint64_t d_runjob(void* dispatcher, const JobDesc* desc, uint8_t priority, void*
   return g_orig_runjob(dispatcher, desc, priority, waiting, counter);
 }
 
-constexpr uint32_t kMaxRes = 16;
 // origin: what the name is - one the engine's code declares (a 32-bit constant from a census), one a client PUBLISHES
 // (node_alloc, "<mod>/<name>"), or one a client LOOKS UP by that published name (flow_register with hash 0).
 enum Origin : uint8_t { kEngine, kPublished, kByName };
@@ -154,7 +154,10 @@ struct Res {
   std::atomic<uint64_t> hits{0}, misses{0}, outside{0}, changes{0};
   std::atomic<uint32_t> last_id{0};
 };
-Res g_r[kMaxRes];
+// No fixed size: a handle is an index, and the table is walked only at attach, so its length costs nothing per frame.
+// A deque, since an entry holds atomics and must not move. Entries are added only while registration is open
+// (flow_register, node_alloc -> flow_publish), which ends before the first frame; res_of reads them after that.
+std::deque<Res> g_r;
 static_assert(FlowRecord::kSize == kFlowRequestSize);
 std::atomic<uint32_t> g_nr{0};
 
@@ -630,7 +633,7 @@ void clear_stats(uint64_t* cleared, uint64_t* skipped) {
 namespace {
 rg_handle add_res(const char* name, uint32_t hash, Origin origin) {
   const uint32_t n = g_nr.load();
-  if (n >= kMaxRes) return RG_E_FULL;
+  g_r.emplace_back();
   g_r[n].name = name ? name : "?";
   g_r[n].hash = hash;
   g_r[n].origin = origin;
