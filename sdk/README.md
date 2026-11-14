@@ -333,11 +333,17 @@ The log has the same information in one line at startup: `registration CLOSED - 
   a whole-library swap (`rtlib_register` without variants) does not.
 * Leases are space0 registers of the engine's tables: the count is limited, and each depends on the stage.
 * Up to 4 variants per patch and 4 scope nodes per patch.
+* Defaults below are set in `src/core/limits.hpp` (`RG_MAX_*`, overridable with CMake); the host logs the values in force
+  at startup (`limits: ...`). Up to 128 views (buffers / textures; a ring of 8 each), 32 cbuffers (a ring of 16, 4096 B
+  each) and 32 client plugins.
 * Up to 256 patches, 64 leases (8 per patch / companion, 32 owners per lease), and a lease reaches up to 128 different
   engine shaders (one ShaderRef each - the log says when a lease is full).
 * Up to 32 draw companions in all (shared by every client of the process - past that `draw_companion_register` answers
   `RG_E_FULL`), at most 8 of them on one engine PSO and at most 8 requested on one draw; the log names the first overflow.
 * Up to 8 RT hit groups in all, 512 (engine, ours) identifier pairs (the log says when the map is full). One BLAS
   swap per mesh proxy, owned by the subscription that set it.
+* Also in `limits.hpp`: 64 RT libraries, 128 raygen variants, 16 mesh-proxy subscriptions, 8 graph nodes (8 uses each),
+  32 wraps / removals, 8 compute passes. RenderFlow resources by name have no table of their own; they are bounded only
+  by the handle space (1024 per kind, `RG_MAX_HANDLES`).
 * The engine's texture formats in `rg_flow_desc` are its own enum, not DXGI. Only what the header documents is
   decoded.

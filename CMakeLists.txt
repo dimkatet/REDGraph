@@ -44,8 +44,17 @@ else()
   FetchContent_MakeAvailable(red4ext_sdk)
 endif()
 
+# ---- capacity limits (src/core/limits.hpp): defaults live there; -DRG_MAX_VIEWS=256 etc. overrides one ----
+foreach(rg_lim VIEWS VIEW_RING CBUFFERS CB_RING CLIENTS PATCHES LEASES LEASE_OWNERS LEASE_REFS DRAW_COMPANIONS
+               DRAW_COMPANIONS_PER_PSO HANDLES RT_LIBS RT_HIT_GROUPS RT_VARIANTS MESH_SUBS NODES NODE_USES WRAPS PASSES)
+  set(RG_MAX_${rg_lim} "" CACHE STRING "Override RG_MAX_${rg_lim} (empty = the default in src/core/limits.hpp)")
+  if(NOT "${RG_MAX_${rg_lim}}" STREQUAL "")
+    list(APPEND rg_limit_defs RG_MAX_${rg_lim}=${RG_MAX_${rg_lim}})
+  endif()
+endforeach()
+
 set(rg_common_defs WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
-set(rg_msvc_opts /W4 /EHsc /utf-8 /external:anglebrackets /external:W0)
+set(rg_msvc_opts /W4 /EHsc /utf-8 /external:anglebrackets /external:W0 /MP)  # /MP: the host is one project of 30+ TUs - without it cl compiles them one by one
 
 # ---- the API: what a client compiles against ----
 add_library(redgraph_api INTERFACE)
@@ -71,6 +80,8 @@ add_library(redgraph SHARED
   src/core/ab.cpp
   src/core/prof.hpp
   src/core/internal.hpp
+  src/core/limits.hpp
+  src/core/limits.cpp
   src/core/engine_231.hpp
   src/core/dxbc.hpp
   src/core/pso_patch.cpp
@@ -106,6 +117,7 @@ target_compile_definitions(redgraph PRIVATE ${rg_common_defs}
   RG_VERSION_MINOR=${PROJECT_VERSION_MINOR}
   RG_VERSION_PATCH=${PROJECT_VERSION_PATCH}
   RG_NATIVE_HOST=$<BOOL:${RG_NATIVE_HOST}>
+  ${rg_limit_defs}
 )
 target_include_directories(redgraph PRIVATE src src/common)
 target_link_libraries(redgraph PRIVATE REDGraph::api RED4ext::SDK)

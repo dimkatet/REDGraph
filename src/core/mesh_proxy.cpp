@@ -45,7 +45,7 @@ namespace {
 
 using namespace e231;
 
-constexpr uint32_t kMaxSubs = 16;
+constexpr uint32_t kMaxSubs = kMaxMeshSubs;  // RG_MAX_MESH_SUBS (limits.hpp)
 constexpr uint32_t kSlots = 4096;     // live proxies of subscribed meshes
 constexpr uint32_t kMaxLods = 8, kMaxEntries = 64;
 constexpr uint32_t kCensusMax = 4000;  // distinct meshes in the census log (400 was hit while the world was still

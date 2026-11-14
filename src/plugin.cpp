@@ -20,6 +20,7 @@
 #include "core/crash_log.hpp"
 #include "core/graph_debug.hpp"
 #include "core/host.hpp"
+#include "core/limits.hpp"
 #include "settings.hpp"
 #include "ui.hpp"
 
@@ -50,6 +51,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle handle, RED4ex
     sdk->logger->InfoF(handle, "REDGraph %s loaded (host API %u)", RG_VERSION_STRING, RG_HOST_API_VERSION);
     engine_blocks::attach(handle, sdk);
     core::open(handle, sdk);  // rg_host_get answers from here on
+    core::log_limits();
     rg_settings::load();
     float dred = 0.0f, graph = 0.0f, debug = 0.0f;
     rg_settings::get("Diagnostics.Dred", &dred);  // DRED must be on before the engine's D3D12CreateDevice

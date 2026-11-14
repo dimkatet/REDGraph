@@ -17,7 +17,7 @@
 namespace core::clients {
 namespace {
 
-constexpr uint32_t kMaxClients = 32;
+// kMaxClients: limits.hpp (RG_MAX_CLIENTS)
 constexpr uint32_t kMaxEntries = 1024;
 
 const char* const kKindName[kKinds] = {
@@ -53,7 +53,7 @@ thread_local char t_why[120] = "";
 
 // Ownership: the owner of every handle (client index + 1, 0 = none) and each client's module image, readable without
 // the mutex (written under it during registration, published by the release store of g_nranges / the owner byte).
-constexpr uint32_t kMaxHandle = 1024;
+constexpr uint32_t kMaxHandle = kMaxHandles;  // RG_MAX_HANDLES (limits.hpp)
 std::atomic<uint8_t> g_owner[kSpaces][kMaxHandle + 1];
 struct Range {
   uintptr_t lo, hi;

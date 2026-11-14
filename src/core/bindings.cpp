@@ -84,8 +84,7 @@ uint64_t handle_at(uint32_t i) { return g_handle0 + static_cast<uint64_t>(i) * g
 bool in_ring(uint64_t h, uint32_t first, uint32_t ring) { return h >= handle_at(first) && h < handle_at(first + ring); }
 
 // ---- cbuffers ----
-constexpr uint32_t kMaxCb = 8;
-constexpr uint32_t kMaxRing = 16;
+// kMaxCb, kMaxRing: limits.hpp (RG_MAX_CBUFFERS, RG_MAX_CB_RING)
 struct Cb {
   uint32_t bytes = 0, ring = 0;
   uint8_t* shadow = nullptr;  // the CPU copy of the current contents
@@ -102,8 +101,7 @@ Cb g_cb[kMaxCb];
 std::atomic<uint32_t> g_ncb{0};
 
 // ---- views: of client-owned buffers / textures, or of an engine RenderFlow texture (flow) ----
-constexpr uint32_t kMaxViews = 16;
-constexpr uint32_t kMaxViewRing = 8;
+// kMaxViews, kMaxViewRing: limits.hpp (RG_MAX_VIEWS, RG_MAX_VIEW_RING)
 struct View {
   uint32_t kind = 0, stride = 0, ring = 0;
   uint32_t first = 0;
@@ -131,19 +129,16 @@ std::atomic<uint32_t> g_nview{0};
 // array costs memory, not time.
 // Raised 2026-11-01 with the draw companions (8 -> 32 of them): a companion holds one lease per register it reads, so
 // 32 companions alone can want 32 leases, and one lease shared by them all can have 32 owners.
-constexpr uint32_t kMaxLeases = 64;
-constexpr uint32_t kMaxLeaseOwners = 32;
+// kMaxLeases, kMaxLeaseOwners, kMaxRefs: limits.hpp (RG_MAX_LEASES, RG_MAX_LEASE_OWNERS, RG_MAX_LEASE_REFS).
 // ShaderRefs a lease learns - one per engine shader of its owners it is bound with. Past this a shader is NOT staged
-// (logged once), so it must outgrow the owners a lease may have (32) with room for the engine's own variants.
-constexpr uint32_t kMaxRefs = 128;
+// (logged once), so it must outgrow the owners a lease may have with room for the engine's own variants.
 constexpr uint32_t kMaxGroups = 32;
 constexpr uint32_t kMaxPatchHandles = kMaxPatchCount;
 constexpr uint32_t kMaxCompHandles = 8;
 constexpr uint32_t kMaxDrawCompHandles = pso::kMaxDrawComps;  // ONE source of truth: pso_patch.cpp's g_dc
 constexpr uint32_t kMaxLeasesPerOwner = 8;
 static_assert(kMaxGroups <= 32, "FrSave::mask is a uint32_t bit per group");
-static_assert(kMaxLeases <= 127, "g_lease_of_patch / g_lease_of_comp hold a lease index in an int8_t");
-static_assert(pso::kMaxDrawComps <= 1024, "a handle is an index in clients.cpp's per-handle owner table (kMaxHandle)");
+// (the int8_t lease index and the 1024-handle owner table are asserted in limits.hpp)
 
 // The shader owners a lease can have. rg_lease_desc.companions takes compute companions (stage CS) and draw companions
 // (stage VS / PS): the lease's stage tells them apart, so a Lease's comps[] holds one kind or the other.
@@ -1200,7 +1195,7 @@ rg_handle lease_register(const rg_lease_desc* d) {
   if (!d || d->stage > RG_STAGE_CS || d->kind > RG_KIND_UAV) return RG_E_ARG;
   if ((d->patch_count && !d->patches) || (d->companion_count && !d->companions) || (d->rtlib_count && !d->rtlibs) ||
       d->patch_count + d->companion_count + d->rtlib_count == 0 || d->patch_count > kMaxLeaseOwners ||
-      d->companion_count > kMaxLeaseOwners || d->rtlib_count > 64)
+      d->companion_count > kMaxLeaseOwners || d->rtlib_count > kMaxRtLibs)
     return RG_E_ARG;
   if (d->reg >= kKinds[d->kind].regs) return RG_E_ARG;  // the engine's tables cover b0-b13, t0-t127, u0-u18
   if (d->kind == RG_KIND_CBV && d->view) {  // a CBV view of a client buffer

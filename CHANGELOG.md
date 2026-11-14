@@ -7,6 +7,15 @@
   name per buffer and ran into the cap at 17 (`RG_E_FULL`). A handle is an index into the table and nothing walks it
   per frame, so its length has no cost while rendering; entries are added only while registration is open. No ABI
   change; API version stays 1 (an older REDGraph still answers `RG_E_FULL` at 16, so a mod can check).
+- Raised: views (`view_create` / `view_create_texture`) 16 -> 128 (requests for 64-128 buffers) and cbuffers
+  (`cbuffer_create`) 8 -> 32. No API change.
+- RenderFlow resources by name stop at the handle space (`RG_MAX_HANDLES`, 1024) with `RG_E_FULL`: past it a handle
+  would have no owner in the per-handle table.
+- The client-visible capacity limits (views, cbuffers, clients, patches, leases, draw companions, RT libraries / hit
+  groups / variants, mesh-proxy subscriptions, graph nodes, wraps, passes, handles) now live in one file,
+  `src/core/limits.hpp`, as `RG_MAX_*` macros; override one at build time with `-DRG_MAX_VIEWS=256` (a CMake cache
+  variable of the same name). Limits that come from a data type are `static_assert`ed. The values in force are logged
+  once at startup (`limits: ...`).
 
 ## 0.6.1
 

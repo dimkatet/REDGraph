@@ -61,7 +61,7 @@ struct BlobEntry {
   uint32_t size;
 };
 
-constexpr uint32_t kMax = 64;
+constexpr uint32_t kMax = kMaxRtLibs;  // RG_MAX_RT_LIBS (limits.hpp)
 struct Lib {
   const char* name;
   dxil_hash::Hash hash;
@@ -112,7 +112,7 @@ struct AddLib {
 // associated explicitly is no default any more (2026-11-01: the shader config associated with ours -> the debug
 // layer's "Export chs_main is missing a required subobject association of type RAYTRACING_SHADER_CONFIG"; the root
 // signatures associated with ours -> creation fine, but the RT reflections hung the GPU at once, three runs).
-constexpr uint32_t kMaxHg = 8;
+constexpr uint32_t kMaxHg = kMaxRtHitGroups;  // RG_MAX_RT_HIT_GROUPS (limits.hpp)
 struct HitGroup {
   char name[48];
   uint32_t payload, flags;
@@ -912,7 +912,7 @@ bool d_create(void* out, const uint32_t* in) {
 }
 
 // ---- M12: raygen variants + the one DispatchRays hook ----
-constexpr uint32_t kMaxVar = 128;  // raygen variants, every client together (64 was full in CRT 2026-10-19)
+constexpr uint32_t kMaxVar = kMaxRtVariants;  // RG_MAX_RT_VARIANTS (limits.hpp): raygen variants, every client together
 struct Var {
   uint32_t lib;
   wchar_t raygen[64], variant[64];

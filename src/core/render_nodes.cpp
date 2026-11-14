@@ -76,8 +76,8 @@ BindCmdList_t g_bind_cl = nullptr;
 RestoreState_t g_restore = nullptr;
 bool g_attached = false;
 
-constexpr uint32_t kMaxNodes = 8;
-constexpr uint32_t kMaxUses = 8;
+constexpr uint32_t kMaxNodes = core::kMaxNodesLimit;  // RG_MAX_NODES (limits.hpp)
+constexpr uint32_t kMaxUses = core::kMaxNodeUses;  // RG_MAX_NODE_USES (limits.hpp)
 struct Use {
   uint32_t hash;    // the RenderFlow name hash (the tag mixes the view in per request)
   uint32_t access;  // RG_FLOW_*
@@ -100,7 +100,7 @@ Node g_n[kMaxNodes];
 std::atomic<uint32_t> g_nn{0};
 std::once_flag g_names_once;
 
-constexpr uint32_t kMaxWraps = 32;  // wraps + removals, every client (the self-tests alone take ~10)
+constexpr uint32_t kMaxWraps = core::kMaxWrapsLimit;  // RG_MAX_WRAPS (limits.hpp): wraps + removals, every client (the self-tests alone take ~10)
 struct Wrap {
   const char* name;
   uint64_t target;  // CName hash of the class / group name

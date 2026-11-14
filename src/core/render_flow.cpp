@@ -156,7 +156,11 @@ struct Res {
 };
 // No fixed size: a handle is an index, and the table is walked only at attach, so its length costs nothing per frame.
 // A deque, since an entry holds atomics and must not move. Entries are added only while registration is open
-// (flow_register, node_alloc -> flow_publish), which ends before the first frame; res_of reads them after that.
+// (flow_register, node_alloc -> flow_publish), which ends before the first frame; res_of reads them after that - a
+// deque, unlike an array, must not be indexed while another thread grows it, so nothing may add an entry once
+// registration is closed (add_res's callers check registration_open()).
+// The one ceiling left is the handle space: kMaxHandles (RG_MAX_HANDLES, limits.hpp), the size of clients.cpp's
+// per-handle owner table - past it a handle would have no owner, so add_res answers RG_E_FULL there.
 std::deque<Res> g_r;
 static_assert(FlowRecord::kSize == kFlowRequestSize);
 std::atomic<uint32_t> g_nr{0};
@@ -633,6 +637,7 @@ void clear_stats(uint64_t* cleared, uint64_t* skipped) {
 namespace {
 rg_handle add_res(const char* name, uint32_t hash, Origin origin) {
   const uint32_t n = g_nr.load();
+  if (n >= kMaxHandles) return RG_E_FULL;
   g_r.emplace_back();
   g_r[n].name = name ? name : "?";
   g_r[n].hash = hash;

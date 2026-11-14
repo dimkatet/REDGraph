@@ -13,13 +13,14 @@
 #include <RED4ext/Api/v1/Sdk.hpp>
 
 #include "rg_host.h"
+#include "core/limits.hpp"
 
 struct ID3D12PipelineState;
 
 namespace core {
 
+// The client-visible capacity limits (kMaxViews, kMaxLeases, kMaxPatchCount, ...): limits.hpp, overridable at build time.
 // Patches (pso_patch.cpp) = the patch handles bindings keeps a lease list for (bindings.cpp).
-constexpr uint32_t kMaxPatchCount = 256;
 
 // host.cpp
 extern RED4ext::v1::PluginHandle g_handle;
@@ -81,10 +82,10 @@ bool owner_target(uint32_t owner, rg_handle h, uint8_t hash16[16]);
 // How many draw companions the host holds, for EVERY client together (a handle is an index + 1). bindings.cpp keeps one
 // lease-table row per handle (kMaxDrawCompHandles = this), so the two can never drift apart. 8 until 2026-11-01: one
 // companion per shader hash means a vehicle paint alone takes 8 (hr glass another 8), and two such mods filled the host.
-constexpr uint32_t kMaxDrawComps = 32;
+constexpr uint32_t kMaxDrawComps = kMaxDrawCompsLimit;  // RG_MAX_DRAW_COMPANIONS (limits.hpp)
 // The most of them ONE engine PSO carries (a Mapping's dc[]): a companion only matches a PSO that carries its hash, so
 // this bites only where several companions share one hash (or one client wants variants of the same shader).
-constexpr uint32_t kMaxDrawCompsPerPso = 8;
+constexpr uint32_t kMaxDrawCompsPerPso = kMaxDrawCompsPerPsoLimit;  // RG_MAX_DRAW_COMPANIONS_PER_PSO
 rg_handle draw_companion_register(const char* name, uint32_t stage, const uint8_t* hash16, rg_blob shader,
                                   const rg_pso_state* state);
 int32_t draw_companion_scope(rg_handle h, const char* node);

@@ -50,7 +50,7 @@ RestoreState_t g_restore = nullptr;
 bool g_attached = false, g_indirect_attached = false;
 GetD3DBuffer_t g_get_d3d_buffer = nullptr;
 
-constexpr uint32_t kMaxPasses = 8;
+constexpr uint32_t kMaxPasses = core::kMaxPassesLimit;  // RG_MAX_PASSES (limits.hpp)
 const char* g_pass_names[kMaxPasses];
 std::atomic<uint32_t> g_npasses{0};
 
