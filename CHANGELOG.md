@@ -1,7 +1,20 @@
 # Changelog
 
-## Unreleased
+## 0.7.0
 
+- For mod developers: `lease_rt_scope(lease, scoped)` - scopes an RT lease (`lease_register` with `rtlibs`) to its
+  owners' raygen variants (`rt_variant`): it is staged only at a `DispatchRays` that runs a variant of one of its
+  rtlibs, never at the engine's own dispatches, and an engine RT library that declares the register no longer refuses
+  it (logged once per library, the first 8). Until now an RT lease was staged at every `DispatchRays` and so needed a
+  register no engine RT library declares - in 2.5 there is no free UAV register in space0 (u3 is a reflection hit
+  collection's, u5 an RTXDI shadow library's). The client asserts that no shader that can run inside its variants'
+  dispatches reads that register. Register-time, right after `lease_register`; `RG_E_ARG` for a non-RT lease or one
+  that is not the caller's, `RG_E_LATE` once registration is closed. One entry appended (the last); API version stays 1.
+- A client RT library that uses the NvAPI shader extensions (SER: `NvTraceRayHitObject` / `NvInvokeHitObject`, through
+  the `g_NvidiaExt` UAV) now gets its extension slot: the host hooks the driver's
+  `NvAPI_D3D12_SetNvShaderExtnSlotSpaceLocalThread` (it is per thread; the engine calls it only around its own SER
+  libraries), keeps the slot it registers (u14 space0 until then), and sets it on the creating thread before a state
+  object that adds such a library. Without it the driver took `g_NvidiaExt` for a real UAV.
 - For mod developers: RenderFlow resources by name are no longer capped (was 16, shared by every client:
   `flow_register`, and the names `node_alloc` publishes). A client that shows engine buffers as debug views reads one
   name per buffer and ran into the cap at 17 (`RG_E_FULL`). A handle is an index into the table and nothing walks it

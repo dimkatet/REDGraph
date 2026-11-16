@@ -176,6 +176,8 @@ struct Lease {
   uint64_t rt_mask = 0;  // RT library owners, bit (handle - 1)
   std::atomic<uint64_t> null_stages{0}, static_skips{0};
   std::atomic<uint32_t> rt_checked{0};
+  std::atomic<bool> rt_scoped{false};       // lease_rt_scope: staged only at dispatches running an owner's variant
+  std::atomic<uint32_t> rt_tolerated{0};    // ... and engine libraries declaring the register, logged (the first 8)
 };
 Lease g_leases[kMaxLeases];
 std::atomic<uint32_t> g_nleases{0};
@@ -502,10 +504,15 @@ uint64_t d_update_root_params(void* fr_v, void* ctx_v, uint8_t rays) {
       }
       Lease* hit = nullptr;
       if (rays) {
-        // DispatchRays: an RT lease with a baked owner, whatever the state object (see the header)
+        // DispatchRays: an RT lease with a baked owner, whatever the state object (see the header) - a SCOPED one
+        // (lease_rt_scope) only when this dispatch runs a variant of an owner (armed before the engine's
+        // UpdateRootParams, on this thread)
+        const uint64_t armed = rtlib::armed_mask();
         for (uint32_t k = 0; k < g.nleases && !hit; ++k) {
           Lease& l = g_leases[g.leases[k]];
-          if ((l.rt_mask & baked) && l.state.load(std::memory_order_relaxed) != RG_STATE_REFUSED) hit = &l;
+          if ((l.rt_mask & baked) && l.state.load(std::memory_order_relaxed) != RG_STATE_REFUSED &&
+              (!l.rt_scoped.load(std::memory_order_relaxed) || (l.rt_mask & armed)))
+            hit = &l;
         }
         if (!hit) {
           restore(fr, gi, idx);
@@ -1379,6 +1386,16 @@ void on_rt_library(const void* code, size_t size, const char* name) {
     Lease& l = g_leases[i];
     if (!l.rt_mask || l.state.load() == RG_STATE_REFUSED) continue;
     const dxbc::Bound b = dxbc::lib_binds(code, size, l.kind, 0, l.reg);
+    if (b == dxbc::Bound::kYes && l.rt_scoped.load()) {
+      // scoped: staged only inside its owners' variant dispatches, where this library's shaders that read the
+      // register do not run (the client's assertion, rg_host.h lease_rt_scope)
+      if (l.state.load() == RG_STATE_PENDING) l.state.store(RG_STATE_OK);
+      if (l.rt_tolerated.fetch_add(1) < 8)
+        g_sdk->logger->InfoF(g_handle, "host: lease '%s' CS %c%u (SCOPED to its variants) - engine RT library '%s' "
+                             "declares it too; tolerated, our descriptor is never staged at its dispatches", l.name,
+                             letter(l.kind), l.reg, name ? name : "?");
+      continue;
+    }
     if (b == dxbc::Bound::kNo) {
       if (l.rt_checked.fetch_add(1) == 0) {
         l.state.store(RG_STATE_OK);
@@ -1397,6 +1414,18 @@ void on_rt_library(const void* code, size_t size, const char* name) {
                           "staged, our libraries not baked yet stay vanilla", l.name, letter(l.kind), l.reg,
                           name ? name : "?", b == dxbc::Bound::kYes ? "declares it" : "has no readable RDAT");
   }
+}
+
+int32_t lease_rt_scope(rg_handle h, uint32_t scoped) {
+  const uint32_t n = g_nleases.load(std::memory_order_acquire);
+  if (h <= 0 || static_cast<uint32_t>(h) > n) return RG_E_ARG;
+  Lease& l = g_leases[h - 1];
+  if (!l.rt_mask) return RG_E_ARG;
+  l.rt_scoped.store(scoped != 0);
+  g_sdk->logger->InfoF(g_handle, "host: lease '%s' CS %c%u %s", l.name, letter(l.kind), l.reg,
+                       scoped ? "SCOPED to its owners' raygen variants (staged only where one runs)"
+                              : "staged at every DispatchRays again");
+  return 0;
 }
 
 bool rtlib_may_bake(rg_handle lib) {

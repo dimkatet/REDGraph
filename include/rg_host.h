@@ -979,6 +979,17 @@ typedef struct rg_host {
    * and rules as mesh_proxy_subscribe; an unknown flag bit is RG_E_ARG. Register-time. */
   rg_handle (*mesh_proxy_subscribe_flags)(const char* name, const uint64_t* mesh_hashes, uint32_t count,
                                           rg_mesh_proxy_fn fn, void* user, uint32_t flags);
+
+  /* 2026-11-10: SCOPE an RT lease (lease_register with rtlibs) to its owners' raygen VARIANTS (rt_variant): it is
+   * staged only at a DispatchRays that runs - hands out - a variant of one of its rtlibs, never at the engine's own
+   * dispatches; and an engine RT library that DECLARES the register no longer refuses it (logged once a library). Why:
+   * an unscoped RT lease is staged at every DispatchRays, so it needs a register no engine RT library declares - and in
+   * 2.5 there is no such UAV register in space0 (u3 is a reflection hit collection's, u5 an RTXDI shadow library's).
+   * The client asserts that no shader which can RUN inside its variants' dispatches reads that register (a hit group
+   * of another payload in a collection the pipeline links never runs for the variant's rays, so it does not count).
+   * Register-time: right after lease_register, before the engine creates its libraries. 0 = ok, RG_E_ARG (not an RT
+   * lease, not the caller's), RG_E_LATE (registration closed). */
+  int32_t (*lease_rt_scope)(rg_handle lease, uint32_t scoped);
 } rg_host;
 
 RG_HOST_EXPORT const rg_host* rg_host_get(uint32_t version);

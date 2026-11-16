@@ -821,6 +821,9 @@ bool create_with(void* out, const uint32_t* in, uint32_t n, int32_t swap, uint64
   return ok;
 }
 
+bool lib_uses_nv_ext(uint32_t i);                // below, with the NvAPI extension slot
+void ext_slot_for_this_thread(const char* why);  // below
+
 bool create(void* out, const uint32_t* in) {
   const uint32_t n = g_calls.fetch_add(1) + 1;
   uint64_t mask = 0;
@@ -846,6 +849,15 @@ bool create(void* out, const uint32_t* in) {
     if (variant_exports(i, probe, kMaxExports)) add |= 1ull << i;
     else if (swap < 0 || g_libs[i].priority > g_libs[swap].priority) swap = static_cast<int32_t>(i);
   }
+  // A client library that uses the NvAPI shader extensions (SER: NvTraceRayHitObject / NvInvokeHitObject) needs the
+  // extension slot registered ON THIS THREAD before the creation - the engine does that only around its own SER
+  // libraries (NvAPI_D3D12_SetNvShaderExtnSlotSpaceLocalThread, 2026-11-11). Without it the driver treats g_NvidiaExt
+  // as a real UAV.
+  for (uint32_t i = 0; i < nlib; ++i)
+    if ((((add >> i) & 1) || static_cast<int32_t>(i) == swap) && lib_uses_nv_ext(i)) {
+      ext_slot_for_this_thread(g_libs[i].name);
+      break;
+    }
   for (uint32_t i = 0; i < nlib; ++i)
     if ((mask >> i & 1) && !(add >> i & 1) && static_cast<int32_t>(i) != swap &&
         !(g_said_noswap.fetch_or(1ull << i) >> i & 1)) {
@@ -1021,6 +1033,12 @@ void arm_variant(uint32_t so, uint32_t group) {
   }
   if (best) t_ovr = {id, group, best, true};
 }
+
+}  // namespace
+
+uint64_t armed_mask() { return t_ovr.set && t_ovr.v ? 1ull << t_ovr.v->lib : 0; }
+
+namespace {
 
 // GPU timing (gpu_timing kRays*): a DispatchRays of a state object holding a client library - keyed by the raygen's
 // variant registration (whether it runs or not, so switching it compares the two), else by the library. 0 = not.
@@ -1829,6 +1847,73 @@ bool attach_pso_driver() {
   return true;
 }
 
+// The NvAPI shader-extension slot (SER and every other Nv* intrinsic go through a fake UAV, g_NvidiaExt). The engine
+// registers it with NvAPI_D3D12_SetNvShaderExtnSlotSpaceLocalThread - per THREAD - around its own SER libraries (2.5:
+// ReSTIR GI / PT's 4ae913ed declares g_NvidiaExt at u14 space0). The driver's function is hooked to log every call and
+// keep the slot; a creation that adds a CLIENT library using g_NvidiaExt sets that slot on its own thread first.
+constexpr uint32_t kNvExtSlotLocalThreadId = 0x43d867c0;
+using NvExtSlot_t = int (*)(void* device, uint32_t slot, uint32_t space);
+NvExtSlot_t g_orig_ext = nullptr;
+// until the engine calls it: u14 space0, the slot 4ae913ed (ReSTIR GI) declares g_NvidiaExt at (clean 2.5 IR, !46)
+std::atomic<uint32_t> g_ext_slot{14}, g_ext_space{0}, g_ext_calls{0};
+std::atomic<int8_t> g_lib_ext[kMax] = {};  // 0 unknown, 1 uses g_NvidiaExt, -1 does not
+
+int d_ext_slot(void* device, uint32_t slot, uint32_t space) {
+  const int r = g_orig_ext(device, slot, space);
+  if (r == 0 && slot != ~0u) g_ext_slot.store(slot), g_ext_space.store(space);
+  const uint32_t n = g_ext_calls.fetch_add(1) + 1;
+  if (n <= 40) {
+    char who[128];
+    caller_of(_ReturnAddress(), who, sizeof who);
+    g_sdk->logger->InfoF(g_handle, "nv ext slot: call #%u from %s on thread %lu - u%u space%u -> NvAPI %d", n, who,
+                         static_cast<unsigned long>(GetCurrentThreadId()), slot, space, r);
+  }
+  return r;
+}
+
+bool attach_ext_slot_driver() {
+  HMODULE nv = LoadLibraryW(L"nvapi64.dll");
+  using Query_t = void* (*)(uint32_t);
+  const auto q = nv ? reinterpret_cast<Query_t>(GetProcAddress(nv, "nvapi_QueryInterface")) : nullptr;
+  void* fn = q ? q(kNvExtSlotLocalThreadId) : nullptr;
+  const bool ok = fn && g_sdk->hooking->Attach(g_handle, fn, reinterpret_cast<void*>(&d_ext_slot),
+                                               reinterpret_cast<void**>(&g_orig_ext));
+  g_sdk->logger->InfoF(g_handle, "nv ext slot: the driver's SetNvShaderExtnSlotSpaceLocalThread %s", ok ? "HOOKED" :
+                       "NOT hooked - a client's SER library cannot get its extension slot");
+  return ok;
+}
+
+bool lib_uses_nv_ext(uint32_t i) {
+  int8_t v = g_lib_ext[i].load(std::memory_order_relaxed);
+  if (v == 0) {
+    const auto* b = static_cast<const char*>(g_libs[i].lib.bytes);
+    const size_t n = g_libs[i].lib.size;
+    static constexpr char kName[] = "g_NvidiaExt";
+    v = -1;
+    for (size_t k = 0; b && k + sizeof kName - 1 <= n; ++k)
+      if (std::memcmp(b + k, kName, sizeof kName - 1) == 0) {
+        v = 1;
+        break;
+      }
+    g_lib_ext[i].store(v, std::memory_order_relaxed);
+  }
+  return v > 0;
+}
+
+void ext_slot_for_this_thread(const char* why) {
+  const uint32_t slot = g_ext_slot.load(), space = g_ext_space.load();
+  if (!g_orig_ext || slot == ~0u) {
+    g_sdk->logger->WarnF(g_handle, "nv ext slot: %s uses g_NvidiaExt but %s - its Nv* intrinsics will NOT work", why,
+                         !g_orig_ext ? "the slot call is not hooked" : "the engine has not registered a slot yet");
+    return;
+  }
+  const auto* data = *reinterpret_cast<const uint8_t* const*>(g_base + kDeviceData);
+  auto* dev = data ? *reinterpret_cast<IUnknown* const*>(data + kDeviceInData) : nullptr;
+  const int r = dev ? g_orig_ext(dev, slot, space) : -1;
+  g_sdk->logger->InfoF(g_handle, "nv ext slot: u%u space%u set on thread %lu for %s -> NvAPI %d", slot, space,
+                       static_cast<unsigned long>(GetCurrentThreadId()), why, r);
+}
+
 // d_create: one line per PIPELINE (not a collection) - its engine id and the options it was created under.
 void note_pipeline_options(const void* out, const uint32_t* in) {
   const BlobEntry* pe = in ? entry_of(*in) : nullptr;
@@ -2232,6 +2317,7 @@ bool attach() {
     g_pso_attached = attach_pso_driver() ||
                      attach_hook(kNvSetCreatePsoOptions, kNvSetCreatePsoOptionsRet, reinterpret_cast<void*>(&d_pso_options),
                                  reinterpret_cast<void**>(&g_orig_pso), "NvAPI_D3D12_SetCreatePipelineStateOptions (LSS)");
+  if (g_nvar.load()) attach_ext_slot_driver();  // a client's SER variant needs the extension slot on its creating thread
   g_sdk->logger->InfoF(g_handle, "rt swap: %u raygen variant(s) - their libraries %s; libraries without variants %s",
                        g_nvar.load(), g_sub_attached ? "ADDED next to the engine's" : "NOT used (hook failed)",
                        g_sub_attached ? "SWAPPED in the subobject list (no lock)" : "NOT used (hook failed)");

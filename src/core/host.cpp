@@ -199,6 +199,14 @@ int32_t lease_owned(const void* ret, const rg_lease_desc* d) {
   return r;
 }
 
+__declspec(noinline) int32_t w_lease_rt_scope(rg_handle lease, uint32_t scoped) {
+  if (!registration_open()) return RG_E_LATE;
+  int32_t r = clients::owner_check(_ReturnAddress(), clients::sLease, lease, "lease_rt_scope");
+  if (!r) r = bindings::lease_rt_scope(lease, scoped);
+  clients::note(_ReturnAddress(), clients::kLease, r, lease, "lease_rt_scope", scoped ? "scoped" : "every dispatch");
+  return r;
+}
+
 __declspec(noinline) rg_handle w_lease_register(const rg_lease_desc* d) {
   rg_handle r = lease_owned(_ReturnAddress(), d);
   if (!r) r = bindings::lease_register(d);
@@ -575,6 +583,7 @@ const rg_host kHost = {
     &mesh_proxy::bvh_retire,
     &h_rt_hit_records,
     &w_mesh_proxy_subscribe,
+    &w_lease_rt_scope,
 };
 
 }  // namespace

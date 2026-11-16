@@ -173,6 +173,7 @@ bool draw_companion_staged(rg_handle comp, const void* ctx);
 // ours - false = a lease of it is refused, keep the engine's library.
 void on_rt_library(const void* code, size_t size, const char* name);
 bool rtlib_may_bake(rg_handle lib);
+int32_t lease_rt_scope(rg_handle lease, uint32_t scoped);  // rg_host.h lease_rt_scope
 // RT lease delivery, per DispatchRays on the recording thread (bindings.cpp "RT lease delivery"): rt_begin() at its
 // start; after its UpdateRootParams, rt_delivered(bit of a library) = every RT lease of that library holds OUR
 // descriptor (or our NULL one) in the table the dispatch uses - false + why otherwise; rt_state_text = the groups'
@@ -193,6 +194,7 @@ void detach();
 uint32_t claimed(const uint8_t* hash16);
 bool info(rg_handle h, rg_blob* lib);  // the client's library
 uint64_t baked_mask();                   // bit (handle - 1) = baked into a state object at least once
+uint64_t armed_mask();                   // this thread's DispatchRays: bit (handle - 1) of the variant it runs, 0 = none
 void stats(rg_handle h, rg_rtlib_stats* out);
 // M12: raygen variants; the ONE DispatchRays hook (variants + the census's rows) - after render_flow::attach().
 rg_handle variant_add(rg_handle lib, const char* raygen, const char* variant, const char* node);
