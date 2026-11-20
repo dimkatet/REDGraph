@@ -86,7 +86,7 @@ void* api_device() {
   return dev;
 }
 
-constexpr uint32_t kMaxDeviceFns = 8;
+// kMaxDeviceFns: limits.hpp (RG_MAX_DEVICE_FNS)
 struct DeviceFn {
   rg_device_fn fn;
   void* user;
@@ -98,7 +98,11 @@ int32_t api_device_ready(rg_device_fn fn, void* user) {
   if (!registration_open()) return RG_E_LATE;
   if (!fn) return RG_E_ARG;
   const uint32_t n = g_ndevice_fns.load();
-  if (n >= kMaxDeviceFns) return RG_E_FULL;
+  if (n >= kMaxDeviceFns) {
+    clients::reason("device_ready: all RG_MAX_DEVICE_FNS slots are taken (every client shares them) - use host->device() "
+                    "instead, or raise RG_MAX_DEVICE_FNS");
+    return RG_E_FULL;
+  }
   g_device_fns[n] = {fn, user};
   g_ndevice_fns.store(n + 1, std::memory_order_release);
   return static_cast<int32_t>(n + 1);

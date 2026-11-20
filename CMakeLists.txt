@@ -46,7 +46,7 @@ endif()
 
 # ---- capacity limits (src/core/limits.hpp): defaults live there; -DRG_MAX_VIEWS=256 etc. overrides one ----
 foreach(rg_lim VIEWS VIEW_RING CBUFFERS CB_RING CLIENTS PATCHES LEASES LEASE_OWNERS LEASE_REFS DRAW_COMPANIONS
-               DRAW_COMPANIONS_PER_PSO HANDLES RT_LIBS RT_HIT_GROUPS RT_VARIANTS MESH_SUBS NODES NODE_USES WRAPS PASSES)
+               DRAW_COMPANIONS_PER_PSO HANDLES RT_LIBS RT_HIT_GROUPS RT_VARIANTS MESH_SUBS NODES NODE_USES WRAPS PASSES DEVICE_FNS)
   set(RG_MAX_${rg_lim} "" CACHE STRING "Override RG_MAX_${rg_lim} (empty = the default in src/core/limits.hpp)")
   if(NOT "${RG_MAX_${rg_lim}}" STREQUAL "")
     list(APPEND rg_limit_defs RG_MAX_${rg_lim}=${RG_MAX_${rg_lim}})

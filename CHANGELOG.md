@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `device_ready` callbacks (shared by every client) were capped at 8 in host.cpp, outside limits.hpp: with several heavy
+  mods installed later clients got `RG_E_FULL` and silently drew nothing. Now `RG_MAX_DEVICE_FNS` (32, overridable,
+  in the `limits:` log line), and a refused `device_ready` states its reason in the client summary. The SDK guide
+  notes that `device()` needs no slot.
+
 ## 0.7.0
 
 - For mod developers: `lease_rt_scope(lease, scoped)` - scopes an RT lease (`lease_register` with `rtlibs`) to its

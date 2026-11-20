@@ -76,6 +76,9 @@
 #ifndef RG_MAX_PASSES  // compute passes of clients
 #define RG_MAX_PASSES 8
 #endif
+#ifndef RG_MAX_DEVICE_FNS  // device_ready callbacks, every client together
+#define RG_MAX_DEVICE_FNS 32  // 8 until 2026-11-21 (3 heavy mods filled it; later clients got RG_E_FULL)
+#endif
 
 namespace core {
 
@@ -100,12 +103,13 @@ constexpr uint32_t kMaxNodesLimit = RG_MAX_NODES;
 constexpr uint32_t kMaxNodeUses = RG_MAX_NODE_USES;
 constexpr uint32_t kMaxWrapsLimit = RG_MAX_WRAPS;
 constexpr uint32_t kMaxPassesLimit = RG_MAX_PASSES;
+constexpr uint32_t kMaxDeviceFns = RG_MAX_DEVICE_FNS;
 
 static_assert(kMaxViews >= 1 && kMaxViewRing >= 1 && kMaxCb >= 1 && kMaxRing >= 1 && kMaxClients >= 1 &&
                   kMaxPatchCount >= 1 && kMaxLeases >= 1 && kMaxLeaseOwners >= 1 && kMaxRefs >= 1 &&
                   kMaxDrawCompsLimit >= 1 && kMaxDrawCompsPerPsoLimit >= 1 && kMaxHandles >= 1 && kMaxRtLibs >= 1 &&
                   kMaxRtHitGroups >= 1 && kMaxRtVariants >= 1 && kMaxMeshSubs >= 1 && kMaxNodesLimit >= 1 &&
-                  kMaxNodeUses >= 1 && kMaxWrapsLimit >= 1 && kMaxPassesLimit >= 1,
+                  kMaxNodeUses >= 1 && kMaxWrapsLimit >= 1 && kMaxPassesLimit >= 1 && kMaxDeviceFns >= 1,
               "every RG_MAX_* limit is at least 1");
 static_assert(kMaxLeases <= 127, "RG_MAX_LEASES: g_lease_of_patch / g_lease_of_comp hold a lease index in an int8_t");
 static_assert(kMaxClients <= 255, "RG_MAX_CLIENTS: clients.cpp's per-handle owner table holds a client index in a uint8_t");

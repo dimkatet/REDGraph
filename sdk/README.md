@@ -116,7 +116,7 @@ The header documents each call in detail. This table is the map: which call you 
 | ... and its outputs cleared instead of left stale | `node_remove_clear` | the node's own textures, or a named one; the value is yours. See section 7 |
 | HLSL compiled into a blob at load | `compile_hlsl` | `cs/vs/ps_6_x`; needs `dxcompiler.dll` + `dxil.dll` next to REDGraph.dll - **not shipped** with REDGraph, else `RG_E_UNAVAILABLE` |
 | shader-visible descriptors for your own pass | `gpu_descriptors` (M10) | from the engine's per-frame ring: allocate per use, never keep |
-| the engine's `ID3D12Device*` | `device`, `device_ready` | create your objects on THIS device (it is ReShade's proxy when ReShade is loaded) |
+| the engine's `ID3D12Device*` | `device`, `device_ready` | create your objects on THIS device (it is ReShade's proxy when ReShade is loaded). `device_ready` slots are shared by ALL clients (`RG_MAX_DEVICE_FNS`, 32) and a full table returns `RG_E_FULL`; if you can wait until your first frame / dispatch callback, call `device()` there instead and use no slot |
 
 ## 4. Finding your target
 
