@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.1
 
 - `device_ready` callbacks (shared by every client) were capped at 8 in host.cpp, outside limits.hpp: with several heavy
   mods installed later clients got `RG_E_FULL` and silently drew nothing. Now `RG_MAX_DEVICE_FNS` (32, overridable,
